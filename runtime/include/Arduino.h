@@ -9,60 +9,62 @@
 // runtime (runtime/core.S and friends), which is assembled by ardio's own
 // in-process AVR assembler and linked into the sketch.
 //
+// ---------------------------------------------------------------------------
+// WHY THIS HEADER LOOKS THE WAY IT DOES
+//
+// ardio compiles sketches with its own C++ front end, not with avr-gcc, and
+// that front end accepts a subset of C++. This header is written inside that
+// subset so it actually compiles, rather than being faithful but unusable.
+// The deliberate divergences from the published Arduino API are:
+//
+//   * No `extern "C"` blocks. The parser has no notion of linkage
+//     specifications; the assembly runtime already exports plain, unmangled
+//     labels, so C linkage was never doing any work here.
+//   * No typedefs. `typedef` is parsed and discarded, so a name introduced by
+//     one is not a type afterwards. uint8_t, byte, word, size_t and friends
+//     are therefore gone; every declaration below uses a built-in type.
+//     Where the Arduino API says uint8_t, this header says int.
+//   * No function-like macros. Directives are stripped before compilation, so
+//     min/max/abs/constrain/sq/bitRead/... are ordinary functions here. That
+//     costs their type genericity: they are int-typed.
+//   * bitSet/bitClear/bitWrite return the modified value instead of mutating
+//     their argument in place, because the subset has no usable reference
+//     parameters.
+//   * No overloads. Semantic analysis keys functions by name alone, so two
+//     functions sharing a name silently collide. Names that the Arduino API
+//     overloads are split: random() becomes random_max()/random_range(),
+//     attach() becomes attach()/attach_limits(), and so on.
+//   * No floating point. PI, HALF_PI, DEG_TO_RAD and friends are omitted
+//     entirely rather than approximated.
+//   * `long` is accepted and is 4 bytes to the type system, but the code
+//     generator currently evaluates expressions 16 bits wide. Long-typed
+//     runtime entry points (millis, delay, pulseIn) keep their documented
+//     shape; their upper half is not yet meaningful in generated code.
+//
 // Part of ardio. Licensed under the GNU General Public License v3.
 
 #ifndef ARDIO_ARDUINO_H
 #define ARDIO_ARDUINO_H
 
-// ------------------------------------------------------------ integers -----
-//
-// The sketch compiler is freestanding: there is no <stdint.h> to include, so
-// the fixed-width types are spelled out here for the AVR data model
-// (char 1, short 2, int 2, long 4, long long 8, pointer 2).
-
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef signed int         int16_t;
-typedef unsigned int       uint16_t;
-typedef signed long        int32_t;
-typedef unsigned long      uint32_t;
-typedef signed long long   int64_t;
-typedef unsigned long long uint64_t;
-
-typedef uint16_t size_t;
-typedef int16_t  ssize_t;
-typedef uint16_t uintptr_t;
-typedef int16_t  intptr_t;
-
-typedef uint8_t  byte;
-typedef uint16_t word;
-typedef uint8_t  boolean;
-
-#ifndef NULL
-#define NULL 0
-#endif
-
 // ----------------------------------------------------------- constants -----
+//
+// Named constants are `const int` rather than macros. The compiler strips
+// preprocessor directives, so a #define here would simply vanish and every use
+// would fail as an undeclared identifier.
 
-#define HIGH 1
-#define LOW  0
+const int HIGH = 1;
+const int LOW = 0;
 
-#define INPUT        0
-#define OUTPUT       1
-#define INPUT_PULLUP 2
+const int INPUT = 0;
+const int OUTPUT = 1;
+const int INPUT_PULLUP = 2;
 
-#define LSBFIRST 0
-#define MSBFIRST 1
+const int LSBFIRST = 0;
+const int MSBFIRST = 1;
 
-#define CHANGE  1
-#define FALLING 2
-#define RISING  3
-
-#define PI         3.1415926535897932384626433832795
-#define HALF_PI    1.5707963267948966192313216916398
-#define TWO_PI     6.283185307179586476925286766559
-#define DEG_TO_RAD 0.017453292519943295769236907684886
-#define RAD_TO_DEG 57.295779513082320876798154814105
+const int CHANGE = 1;
+const int FALLING = 2;
+const int RISING = 3;
 
 // ----------------------------------------------------- pin numbering -------
 //
@@ -71,139 +73,110 @@ typedef uint8_t  boolean;
 // works exactly as on a real board. A6/A7 are analog-input-only on the Nano and
 // have no digital driver.
 
-#define D0  0
-#define D1  1
-#define D2  2
-#define D3  3
-#define D4  4
-#define D5  5
-#define D6  6
-#define D7  7
-#define D8  8
-#define D9  9
-#define D10 10
-#define D11 11
-#define D12 12
-#define D13 13
+const int D0 = 0;
+const int D1 = 1;
+const int D2 = 2;
+const int D3 = 3;
+const int D4 = 4;
+const int D5 = 5;
+const int D6 = 6;
+const int D7 = 7;
+const int D8 = 8;
+const int D9 = 9;
+const int D10 = 10;
+const int D11 = 11;
+const int D12 = 12;
+const int D13 = 13;
 
-#define A0 14
-#define A1 15
-#define A2 16
-#define A3 17
-#define A4 18
-#define A5 19
-#define A6 20
-#define A7 21
+const int A0 = 14;
+const int A1 = 15;
+const int A2 = 16;
+const int A3 = 17;
+const int A4 = 18;
+const int A5 = 19;
+const int A6 = 20;
+const int A7 = 21;
 
-#define LED_BUILTIN 13
+const int LED_BUILTIN = 13;
 
-// Bus pins, for sketches that name them symbolically.
-#define SS   10
-#define MOSI 11
-#define MISO 12
-#define SCK  13
-#define SDA  A4
-#define SCL  A5
+// Bus pins, for sketches that name them symbolically. SDA/SCL repeat the A4/A5
+// numbers rather than aliasing them, since a global cannot be initialised from
+// another global's value in this subset.
+const int SS = 10;
+const int MOSI = 11;
+const int MISO = 12;
+const int SCK = 13;
+const int SDA = 18;
+const int SCL = 19;
 
-#define NUM_DIGITAL_PINS  22
-#define NUM_ANALOG_INPUTS 8
+const int NUM_DIGITAL_PINS = 22;
+const int NUM_ANALOG_INPUTS = 8;
 
 // -------------------------------------------------------- core runtime -----
 //
-// These five bind directly to the symbols exported by runtime/core.S, so they
-// are declared with C linkage: the assembler emits plain, unmangled labels.
+// These bind directly to the symbols exported by runtime/core.S. Pin numbers,
+// modes and levels are plain ints; the runtime narrows them.
 
-extern "C" {
+void pinMode(int pin, int mode);
+void digitalWrite(int pin, int value);
+int digitalRead(int pin);
 
-void pinMode(uint8_t pin, uint8_t mode);
-void digitalWrite(uint8_t pin, uint8_t value);
-int  digitalRead(uint8_t pin);
+void delay(long ms);
+void delayMicroseconds(int us);
 
-void delay(uint32_t ms);
-void delayMicroseconds(uint16_t us);
+int analogRead(int pin);
+void analogWrite(int pin, int value);
+void analogReference(int mode);
 
-// The remaining core entry points also live in the assembly runtime.
-int  analogRead(uint8_t pin);
-void analogWrite(uint8_t pin, int value);
-void analogReference(uint8_t mode);
+long millis();
+long micros();
 
-uint32_t millis(void);
-uint32_t micros(void);
+void shiftOut(int dataPin, int clockPin, int bitOrder, int value);
+int shiftIn(int dataPin, int clockPin, int bitOrder);
+long pulseIn(int pin, int state, long timeout);
 
-void     shiftOut(uint8_t dataPin, uint8_t clockPin, uint8_t bitOrder, uint8_t value);
-uint8_t  shiftIn(uint8_t dataPin, uint8_t clockPin, uint8_t bitOrder);
-uint32_t pulseIn(uint8_t pin, uint8_t state, uint32_t timeout);
+void tone(int pin, int frequency, long duration);
+void noTone(int pin);
 
-void tone(uint8_t pin, uint16_t frequency, uint32_t duration);
-void noTone(uint8_t pin);
+void randomSeed(long seed);
 
-void randomSeed(uint32_t seed);
-long random_range(long min_value, long max_value);
-
-void interrupts(void);
-void noInterrupts(void);
-
-} // extern "C"
+void interrupts();
+void noInterrupts();
 
 // -------------------------------------------------------------- maths -----
 //
-// Arduino specifies min/max/abs/constrain/round as macros, and sketches rely on
-// that (they are applied to mixed types). They are macros here for the same
-// reason, and are guarded so that a host build including <algorithm> first is
-// not broken by them.
+// Arduino specifies these as macros so that they apply to any type. The
+// compiler has no macros, so they are int-typed functions. Divergence: mixed
+// or long arguments are narrowed to int at the call.
 
-#ifndef min
-#define min(a, b) ((a) < (b) ? (a) : (b))
-#endif
+int min(int a, int b);
+int max(int a, int b);
+int abs(int x);
+int constrain(int amt, int low, int high);
+int sq(int x);
 
-#ifndef max
-#define max(a, b) ((a) > (b) ? (a) : (b))
-#endif
+// Byte access. `w` is a 16-bit value.
+int lowByte(int w);
+int highByte(int w);
 
-#ifndef abs
-#define abs(x) ((x) > 0 ? (x) : -(x))
-#endif
-
-#ifndef constrain
-#define constrain(amt, low, high) \
-    ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
-#endif
-
-#ifndef round
-#define round(x) ((x) >= 0 ? (long)((x) + 0.5) : (long)((x) - 0.5))
-#endif
-
-#ifndef sq
-#define sq(x) ((x) * (x))
-#endif
-
-#define lowByte(w)  ((uint8_t)((w) & 0xFF))
-#define highByte(w) ((uint8_t)(((w) >> 8) & 0xFF))
-
-#define bitRead(value, bit)    (((value) >> (bit)) & 0x01)
-#define bitSet(value, bit)     ((value) |= (1UL << (bit)))
-#define bitClear(value, bit)   ((value) &= ~(1UL << (bit)))
-#define bit(b)                 (1UL << (b))
+// Bit access. bitSet/bitClear/bitWrite return the modified value rather than
+// writing through their argument: `flags = bitSet(flags, 3);`
+int bitRead(int value, int bit_index);
+int bitSet(int value, int bit_index);
+int bitClear(int value, int bit_index);
+int bitWrite(int value, int bit_index, int bit_value);
+int bit(int bit_index);
 
 // Re-map a value from one integer range to another, as documented for the
-// Arduino map(). Integer arithmetic throughout, truncating toward zero.
-inline long map(long value, long from_low, long from_high, long to_low, long to_high)
-{
-    long from_span = from_high - from_low;
-    if (from_span == 0)
-        return to_low;
-    return (value - from_low) * (to_high - to_low) / from_span + to_low;
-}
+// Arduino map(). Integer arithmetic throughout, truncating toward zero. This
+// lives in the runtime rather than being an inline definition here, because the
+// code generator has no division yet.
+long map(long value, long from_low, long from_high, long to_low, long to_high);
 
-// Both documented forms of random(). Written as two overloads rather than one
-// function with a default argument, so the sketch compiler never has to fill in
-// a missing parameter.
-inline long random(long max_value)            { return random_range(0, max_value); }
-inline long random(long lo, long hi)          { return random_range(lo, hi); }
-
-// -------------------------------------------------------------- String -----
-
-#include "WString.h"
+// Both documented forms of random(), under distinct names. Divergence: the
+// Arduino API spells both `random`, which would collide here.
+long random_max(long max_value);
+long random_range(long lo, long hi);
 
 // ------------------------------------------------------- sketch shape ------
 //

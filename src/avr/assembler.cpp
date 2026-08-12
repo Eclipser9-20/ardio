@@ -7,6 +7,13 @@
 // Most AVR instructions are one 16-bit word, but CALL, JMP, LDS and STS are
 // two, so pass 1 asks instruction_words() for each mnemonic rather than
 // assuming a fixed size.
+//
+// Directives complicate that: .byte, .ascii and .space emit an arbitrary
+// number of BYTES, so neither pass can count in whole words. Both passes
+// therefore track the position in bytes and round up to a word boundary
+// wherever a word has to start (before an instruction, at a label, at .org
+// and at the end of the image), padding the gap with 0xFF -- the erased
+// value of AVR flash.
 
 #include "ardio/avr/assembler.h"
 
@@ -27,9 +34,22 @@ std::string_view trim(std::string_view s) {
     return s;
 }
 
+// A comment runs to the end of the line, but ';' and '#' are ordinary
+// characters inside the string of a .ascii/.asciz directive, so quoted runs
+// are skipped over rather than searched.
 std::string_view strip_comment(std::string_view s) {
-    for (size_t i = 0; i < s.size(); ++i)
-        if (s[i] == ';' || s[i] == '#') return s.substr(0, i);
+    char quote = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (quote) {
+            if (c == '\\' && i + 1 < s.size()) ++i;
+            else if (c == quote) quote = 0;
+        } else if (c == '"' || c == '\'') {
+            quote = c;
+        } else if (c == ';' || c == '#') {
+            return s.substr(0, i);
+        }
+    }
     return s;
 }
 
@@ -46,10 +66,30 @@ struct Line {
     size_t number = 0;
 };
 
+// Finds the next character `want` that is not inside a quoted string or a
+// parenthesised group. Returns npos if there is none.
+size_t find_top_level(std::string_view s, char want, size_t from = 0) {
+    char quote = 0;
+    int depth = 0;
+    for (size_t i = from; i < s.size(); ++i) {
+        char c = s[i];
+        if (quote) {
+            if (c == '\\' && i + 1 < s.size()) ++i;
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c == '(') { ++depth; continue; }
+        if (c == ')') { if (depth > 0) --depth; continue; }
+        if (c == want && depth == 0) return i;
+    }
+    return std::string_view::npos;
+}
+
 std::vector<std::string> split_operands(std::string_view s) {
     std::vector<std::string> out;
     while (!s.empty()) {
-        size_t comma = s.find(',');
+        size_t comma = find_top_level(s, ',');
         std::string_view piece = comma == std::string_view::npos ? s : s.substr(0, comma);
         piece = trim(piece);
         if (!piece.empty()) out.emplace_back(piece);
@@ -74,7 +114,7 @@ std::vector<Line> split_lines(std::string_view src) {
         Line line;
         line.number = n;
 
-        size_t colon = raw.find(':');
+        size_t colon = find_top_level(raw, ':');
         if (colon != std::string_view::npos) {
             line.label = std::string(trim(raw.substr(0, colon)));
             raw = trim(raw.substr(colon + 1));
@@ -211,6 +251,231 @@ bool parse_number(const std::string& s, long& out) {
     return true;
 }
 
+// ----------------------------------------------------------- expressions ---
+
+// Named constants (.equ/.set) and labels share one table. Label values are
+// word addresses, matching what call/jmp/rjmp expect.
+using Symbols = std::map<std::string, long>;
+
+bool ident_char(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.' || c == '$';
+}
+
+// Decodes the escape after a backslash. Unknown escapes stand for themselves,
+// which is what a reader expects from "\%" or "\ ".
+char decode_escape(char c) {
+    switch (c) {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case '0': return '\0';
+        case 'a': return '\a';
+        case 'b': return '\b';
+        case 'f': return '\f';
+        case 'v': return '\v';
+        default:  return c;
+    }
+}
+
+// Unquotes a "..." operand. Returns false if the operand is not a string.
+bool parse_string(const std::string& s, std::string& out) {
+    if (s.size() < 2 || s.front() != '"' || s.back() != '"') return false;
+    out.clear();
+    for (size_t i = 1; i + 1 < s.size(); ++i) {
+        if (s[i] == '\\' && i + 2 < s.size()) out.push_back(decode_escape(s[++i]));
+        else out.push_back(s[i]);
+    }
+    return true;
+}
+
+// A small recursive-descent evaluator over constants, labels and literals.
+// Precedence, loosest first: | ^ ; + - ; * / % & << >> ; unary - ~ ! ; atoms.
+// lo8()/hi8() take the low and high byte of a value, which is how a 16-bit
+// address is loaded into a register pair with two ldi instructions.
+class ExprParser {
+public:
+    ExprParser(const std::string& text, const Symbols& syms) : t_(text), syms_(syms) {}
+
+    bool run(long& out) {
+        long v = 0;
+        if (!parse_or(v)) return false;
+        skip();
+        if (i_ != t_.size()) return fail("unexpected '" + t_.substr(i_) + "'");
+        out = v;
+        return true;
+    }
+
+    const std::string& error() const { return error_; }
+
+private:
+    const std::string& t_;
+    const Symbols& syms_;
+    size_t i_ = 0;
+    std::string error_;
+
+    bool fail(const std::string& m) {
+        if (error_.empty()) error_ = m;
+        return false;
+    }
+    void skip() {
+        while (i_ < t_.size() && std::isspace(static_cast<unsigned char>(t_[i_]))) ++i_;
+    }
+    bool eat(char c) {
+        skip();
+        if (i_ < t_.size() && t_[i_] == c) { ++i_; return true; }
+        return false;
+    }
+    bool eat2(char a, char b) {
+        skip();
+        if (i_ + 1 < t_.size() && t_[i_] == a && t_[i_ + 1] == b) { i_ += 2; return true; }
+        return false;
+    }
+
+    bool parse_or(long& out) {
+        if (!parse_add(out)) return false;
+        for (;;) {
+            skip();
+            if (i_ < t_.size() && t_[i_] == '|' && !(i_ + 1 < t_.size() && t_[i_ + 1] == '|')) {
+                ++i_;
+                long r = 0;
+                if (!parse_add(r)) return false;
+                out |= r;
+            } else if (i_ < t_.size() && t_[i_] == '^') {
+                ++i_;
+                long r = 0;
+                if (!parse_add(r)) return false;
+                out ^= r;
+            } else {
+                return true;
+            }
+        }
+    }
+
+    bool parse_add(long& out) {
+        if (!parse_mul(out)) return false;
+        for (;;) {
+            skip();
+            if (i_ < t_.size() && (t_[i_] == '+' || t_[i_] == '-')) {
+                char op = t_[i_++];
+                long r = 0;
+                if (!parse_mul(r)) return false;
+                out = op == '+' ? out + r : out - r;
+            } else {
+                return true;
+            }
+        }
+    }
+
+    bool parse_mul(long& out) {
+        if (!parse_unary(out)) return false;
+        for (;;) {
+            long r = 0;
+            skip();
+            if (eat2('<', '<')) {
+                if (!parse_unary(r)) return false;
+                out = long(static_cast<unsigned long>(out) << (r & 63));
+            } else if (eat2('>', '>')) {
+                if (!parse_unary(r)) return false;
+                out >>= (r & 63);
+            } else if (i_ < t_.size() && (t_[i_] == '*' || t_[i_] == '/' ||
+                                          t_[i_] == '%' || t_[i_] == '&')) {
+                char op = t_[i_++];
+                if (!parse_unary(r)) return false;
+                if ((op == '/' || op == '%') && r == 0) return fail("division by zero");
+                out = op == '*' ? out * r
+                    : op == '/' ? out / r
+                    : op == '%' ? out % r
+                                : (out & r);
+            } else {
+                return true;
+            }
+        }
+    }
+
+    bool parse_unary(long& out) {
+        skip();
+        if (i_ < t_.size() && (t_[i_] == '-' || t_[i_] == '~' || t_[i_] == '+' ||
+                               t_[i_] == '!')) {
+            char op = t_[i_++];
+            if (!parse_unary(out)) return false;
+            if (op == '-') out = -out;
+            else if (op == '~') out = ~out;
+            else if (op == '!') out = !out;
+            return true;
+        }
+        return parse_atom(out);
+    }
+
+    bool parse_number_literal(long& out) {
+        size_t start = i_;
+        int base = 10;
+        if (t_.compare(i_, 2, "0x") == 0 || t_.compare(i_, 2, "0X") == 0) {
+            base = 16;
+            i_ += 2;
+        } else if (t_.compare(i_, 2, "0b") == 0 || t_.compare(i_, 2, "0B") == 0) {
+            base = 2;
+            i_ += 2;
+        }
+        size_t digits = i_;
+        while (i_ < t_.size() && std::isalnum(static_cast<unsigned char>(t_[i_]))) ++i_;
+        if (i_ == digits) return fail("expected a number");
+        std::string body = t_.substr(digits, i_ - digits);
+        char* end = nullptr;
+        long v = std::strtol(body.c_str(), &end, base);
+        if (!end || *end != '\0') return fail("bad number '" + t_.substr(start, i_ - start) + "'");
+        out = v;
+        return true;
+    }
+
+    bool parse_atom(long& out) {
+        skip();
+        if (i_ >= t_.size()) return fail("expected a value");
+        char c = t_[i_];
+
+        if (c == '(') {
+            ++i_;
+            if (!parse_or(out)) return false;
+            if (!eat(')')) return fail("expected ')'");
+            return true;
+        }
+        if (c == '\'') {                       // character literal, e.g. 'A'
+            ++i_;
+            if (i_ >= t_.size()) return fail("unterminated character literal");
+            char v = t_[i_++];
+            if (v == '\\' && i_ < t_.size()) v = decode_escape(t_[i_++]);
+            if (i_ >= t_.size() || t_[i_] != '\'') return fail("unterminated character literal");
+            ++i_;
+            out = long(static_cast<unsigned char>(v));
+            return true;
+        }
+        if (std::isdigit(static_cast<unsigned char>(c))) return parse_number_literal(out);
+
+        if (ident_char(c) && !std::isdigit(static_cast<unsigned char>(c))) {
+            size_t start = i_;
+            while (i_ < t_.size() && ident_char(t_[i_])) ++i_;
+            std::string name = t_.substr(start, i_ - start);
+            size_t save = i_;
+            if (eat('(')) {
+                std::string fn = lower(name);
+                if (fn != "lo8" && fn != "hi8" && fn != "lo" && fn != "hi") {
+                    i_ = save;
+                    return fail("unknown function '" + name + "'");
+                }
+                long v = 0;
+                if (!parse_or(v)) return false;
+                if (!eat(')')) return fail("expected ')'");
+                out = (fn == "lo8" || fn == "lo") ? (v & 0xFF) : ((v >> 8) & 0xFF);
+                return true;
+            }
+            auto it = syms_.find(name);
+            if (it == syms_.end()) return fail("undefined label '" + name + "'");
+            out = it->second;
+            return true;
+        }
+        return fail("unexpected '" + t_.substr(i_) + "'");
+    }
+};
+
 // Parses "Y+6" / "Z+0" into the displacement. Returns false if not that form.
 bool parse_displacement(const std::string& s, char& base, long& q) {
     if (s.size() < 1) return false;
@@ -230,14 +495,19 @@ int need_register(Ctx& ctx, const std::vector<std::string>& ops, size_t idx,
     return r;
 }
 
-long need_number(Ctx& ctx, const std::vector<std::string>& ops, size_t idx,
-                 const char* what) {
+// Evaluates an expression operand, reporting through ctx on failure.
+bool eval(Ctx& ctx, const Symbols& syms, const std::string& text, long& out) {
+    ExprParser p(text, syms);
+    if (p.run(out)) return true;
+    ctx.fail(p.error().empty() ? ("bad expression '" + text + "'") : p.error());
+    return false;
+}
+
+long need_number(Ctx& ctx, const Symbols& syms, const std::vector<std::string>& ops,
+                 size_t idx, const char* what) {
     if (idx >= ops.size()) { ctx.fail(std::string("missing ") + what); return 0; }
     long v = 0;
-    if (!parse_number(ops[idx], v)) {
-        ctx.fail("expected a number, got '" + ops[idx] + "'");
-        return 0;
-    }
+    if (!eval(ctx, syms, ops[idx], v)) return 0;
     return v;
 }
 
@@ -315,50 +585,203 @@ bool immediate_base(const std::string& m, uint16_t& base) {
     return false;
 }
 
+// ------------------------------------------------------------ directives ---
+
+// Holds the output image and the current position, counted in BYTES so that
+// data directives can be sized exactly. Pass 1 runs with emit = false: nothing
+// is stored, but the position advances identically, so both passes agree on
+// every address.
+struct Emitter {
+    std::vector<uint8_t> bytes;
+    long pc = 0;
+    bool emit = false;
+
+    void put(uint8_t b) {
+        if (emit) bytes.push_back(b);
+        ++pc;
+    }
+    void put_word(uint16_t w) {
+        put(uint8_t(w & 0xFF));
+        put(uint8_t((w >> 8) & 0xFF));
+    }
+    // Rounds up to the next word, padding with the erased flash value.
+    void align_word() {
+        if (pc & 1) put(0xFF);
+    }
+    long word_pc() const { return pc / 2; }
+};
+
+bool is_directive(const std::string& m) { return m.size() > 1 && m[0] == '.'; }
+
+// Executes one directive. Errors are reported through ctx.
+bool run_directive(const Line& line, Ctx& ctx, Emitter& e, Symbols& syms) {
+    const std::string& d = line.mnemonic;
+    const std::vector<std::string>& ops = line.operands;
+
+    if (d == ".equ" || d == ".set") {
+        if (ops.size() != 2) { ctx.fail(d + " needs a name and a value"); return false; }
+        if (ops[0].empty() || std::isdigit(static_cast<unsigned char>(ops[0][0]))) {
+            ctx.fail("'" + ops[0] + "' is not a usable constant name");
+            return false;
+        }
+        long v = 0;
+        if (!eval(ctx, syms, ops[1], v)) return false;
+        syms[ops[0]] = v;
+        return true;
+    }
+
+    // There is no linker yet, so visibility directives are accepted and
+    // ignored; source written for one stays portable.
+    if (d == ".global" || d == ".globl" || d == ".extern") {
+        if (ops.empty()) { ctx.fail(d + " needs a name"); return false; }
+        return true;
+    }
+
+    if (d == ".org") {
+        if (ops.size() != 1) { ctx.fail(".org needs one address"); return false; }
+        long addr = 0;
+        if (!eval(ctx, syms, ops[0], addr)) return false;
+        if (addr < 0) { ctx.fail(".org address cannot be negative"); return false; }
+        long target = addr * 2;
+        if (target < e.pc) {
+            ctx.fail(".org cannot move backwards, from word " +
+                     std::to_string(e.word_pc()) + " to " + std::to_string(addr));
+            return false;
+        }
+        while (e.pc < target) e.put(0xFF);
+        return true;
+    }
+
+    if (d == ".byte" || d == ".db") {
+        if (ops.empty()) { ctx.fail(d + " needs at least one value"); return false; }
+        for (const std::string& op : ops) {
+            std::string text;
+            if (parse_string(op, text)) {            // "abc" is shorthand for its bytes
+                for (char c : text) e.put(uint8_t(c));
+                continue;
+            }
+            long v = 0;
+            if (!eval(ctx, syms, op, v)) return false;
+            check_range(ctx, v, -128, 255, "byte value");
+            if (ctx.failed()) return false;
+            e.put(uint8_t(v & 0xFF));
+        }
+        return true;
+    }
+
+    if (d == ".word" || d == ".dw") {
+        if (ops.empty()) { ctx.fail(d + " needs at least one value"); return false; }
+        e.align_word();
+        for (const std::string& op : ops) {
+            long v = 0;
+            if (!eval(ctx, syms, op, v)) return false;
+            check_range(ctx, v, -32768, 65535, "word value");
+            if (ctx.failed()) return false;
+            e.put_word(uint16_t(v & 0xFFFF));
+        }
+        return true;
+    }
+
+    if (d == ".ascii" || d == ".asciz" || d == ".string") {
+        if (ops.empty()) { ctx.fail(d + " needs a quoted string"); return false; }
+        for (const std::string& op : ops) {
+            std::string text;
+            if (!parse_string(op, text)) {
+                ctx.fail(d + " expects a quoted string, got '" + op + "'");
+                return false;
+            }
+            for (char c : text) e.put(uint8_t(c));
+            if (d != ".ascii") e.put(0);
+        }
+        return true;
+    }
+
+    if (d == ".space" || d == ".skip") {
+        if (ops.empty() || ops.size() > 2) {
+            ctx.fail(d + " needs a byte count and an optional fill value");
+            return false;
+        }
+        long n = 0;
+        if (!eval(ctx, syms, ops[0], n)) return false;
+        if (n < 0) { ctx.fail(d + " count cannot be negative"); return false; }
+        long fill = 0;
+        if (ops.size() == 2) {
+            if (!eval(ctx, syms, ops[1], fill)) return false;
+            check_range(ctx, fill, -128, 255, "fill value");
+            if (ctx.failed()) return false;
+        }
+        for (long k = 0; k < n; ++k) e.put(uint8_t(fill & 0xFF));
+        return true;
+    }
+
+    ctx.fail("unknown directive '" + d + "'");
+    return false;
+}
+
 } // namespace
 
 AssembleResult assemble(std::string_view source) {
     AssembleResult result;
     std::vector<Line> lines = split_lines(source);
 
-    // ---- pass 1: label addresses, in words ---------------------------------
-    std::map<std::string, long> labels;
+    // ---- pass 1: symbol addresses ------------------------------------------
+    //
+    // Sizing happens in bytes, because .byte/.ascii/.space runs are not
+    // word-sized. A label always names a word address, so the position is
+    // rounded up to a word before one is recorded -- that is what keeps a
+    // label following an odd-length .byte run pointing at a real instruction.
+    Symbols syms;
     {
-        long pc = 0;
+        Ctx ctx;
+        Emitter e;                       // e.emit stays false: sizing only
+        std::map<std::string, long> labels;
         for (const Line& line : lines) {
+            ctx.line = line.number;
             if (!line.label.empty()) {
+                e.align_word();
                 if (labels.count(line.label)) {
                     result.error = "line " + std::to_string(line.number) +
                                    ": duplicate label '" + line.label + "'";
                     return result;
                 }
-                labels[line.label] = pc;
+                labels[line.label] = e.word_pc();
+                syms[line.label] = e.word_pc();
             }
-            if (!line.mnemonic.empty()) pc += instruction_words(line.mnemonic);
+            if (line.mnemonic.empty()) continue;
+            if (is_directive(line.mnemonic)) {
+                if (!run_directive(line, ctx, e, syms)) { result.error = ctx.error; return result; }
+            } else {
+                e.align_word();
+                e.pc += 2 * instruction_words(line.mnemonic);
+            }
         }
     }
 
     // ---- pass 2: encode ----------------------------------------------------
     Ctx ctx;
-    long pc = 0;
-    std::vector<uint16_t> words;
+    Emitter img;
+    img.emit = true;
+    long pc = 0;                          // current word address
 
-    // Resolves an operand that may be a label or a literal.
-    auto resolve_target = [&](const std::string& op, bool relative, long& out) {
-        auto it = labels.find(op);
-        if (it != labels.end()) { out = it->second; return true; }
+    // Resolves a jump or branch target. A bare number is an offset when the
+    // instruction is PC-relative; anything else (label, constant, expression)
+    // is an address.
+    auto resolve_target = [&](const std::string& op, bool relative, long& out_addr) {
         long n = 0;
-        if (!parse_number(op, n)) {
-            ctx.fail("undefined label '" + op + "'");
-            return false;
-        }
-        out = relative ? pc + n : n;
-        return true;
+        if (relative && parse_number(op, n)) { out_addr = pc + n; return true; }
+        return eval(ctx, syms, op, out_addr);
     };
 
     for (const Line& line : lines) {
-        if (line.mnemonic.empty()) continue;
         ctx.line = line.number;
+        if (!line.label.empty()) img.align_word();
+        if (line.mnemonic.empty()) continue;
+        if (is_directive(line.mnemonic)) {
+            if (!run_directive(line, ctx, img, syms)) { result.error = ctx.error; return result; }
+            continue;
+        }
+        img.align_word();
+        pc = img.word_pc();
         const std::string& m = line.mnemonic;
         const auto& ops = line.operands;
         uint16_t word = 0, extra = 0;
@@ -391,7 +814,7 @@ AssembleResult assemble(std::string_view source) {
             }
         } else if (m == "bst" || m == "bld") {
             int d = need_register(ctx, ops, 0, "register");
-            long b = need_number(ctx, ops, 1, "bit number");
+            long b = need_number(ctx, syms, ops, 1, "bit number");
             if (!ctx.failed()) check_range(ctx, b, 0, 7, "bit number");
             if (!ctx.failed()) {
                 word = uint16_t((m == "bst" ? 0xFA00 : 0xF800) | (d << 4) | b);
@@ -400,7 +823,7 @@ AssembleResult assemble(std::string_view source) {
         } else if (m == "cbr" || m == "sbr") {
             // Aliases for andi with the complement, and ori.
             int d = need_register(ctx, ops, 0, "destination register");
-            long k = need_number(ctx, ops, 1, "bit mask");
+            long k = need_number(ctx, syms, ops, 1, "bit mask");
             if (!ctx.failed() && d < 16)
                 ctx.fail(m + " can only target r16-r31, not r" + std::to_string(d));
             if (!ctx.failed()) {
@@ -415,7 +838,7 @@ AssembleResult assemble(std::string_view source) {
             if (!ctx.failed() && encode_two_reg(m, d, d, word)) encoded = true;
         } else if (immediate_base(m, base)) {
             int d = need_register(ctx, ops, 0, "destination register");
-            long k = need_number(ctx, ops, 1, "immediate");
+            long k = need_number(ctx, syms, ops, 1, "immediate");
             if (!ctx.failed()) {
                 if (d < 16)
                     ctx.fail(m + " can only target r16-r31, not r" + std::to_string(d));
@@ -437,7 +860,7 @@ AssembleResult assemble(std::string_view source) {
             }
         } else if (m == "adiw" || m == "sbiw") {
             int d = need_register(ctx, ops, 0, "register pair");
-            long k = need_number(ctx, ops, 1, "immediate");
+            long k = need_number(ctx, syms, ops, 1, "immediate");
             if (!ctx.failed()) {
                 if (d != 24 && d != 26 && d != 28 && d != 30)
                     ctx.fail(m + " only works on r24, r26, r28 or r30");
@@ -452,11 +875,11 @@ AssembleResult assemble(std::string_view source) {
             long a = 0;
             int r = 0;
             if (m == "out") {
-                a = need_number(ctx, ops, 0, "I/O address");
+                a = need_number(ctx, syms, ops, 0, "I/O address");
                 r = need_register(ctx, ops, 1, "source register");
             } else {
                 r = need_register(ctx, ops, 0, "destination register");
-                a = need_number(ctx, ops, 1, "I/O address");
+                a = need_number(ctx, syms, ops, 1, "I/O address");
             }
             if (!ctx.failed()) check_range(ctx, a, 0, 0x3F, "I/O address");
             if (!ctx.failed()) {
@@ -465,8 +888,8 @@ AssembleResult assemble(std::string_view source) {
                 encoded = true;
             }
         } else if (m == "sbi" || m == "cbi" || m == "sbic" || m == "sbis") {
-            long a = need_number(ctx, ops, 0, "I/O address");
-            long b = need_number(ctx, ops, 1, "bit number");
+            long a = need_number(ctx, syms, ops, 0, "I/O address");
+            long b = need_number(ctx, syms, ops, 1, "bit number");
             if (!ctx.failed()) {
                 check_range(ctx, a, 0, 0x1F, "I/O address");
                 check_range(ctx, b, 0, 7, "bit number");
@@ -479,7 +902,7 @@ AssembleResult assemble(std::string_view source) {
             }
         } else if (m == "sbrc" || m == "sbrs") {
             int r = need_register(ctx, ops, 0, "register");
-            long b = need_number(ctx, ops, 1, "bit number");
+            long b = need_number(ctx, syms, ops, 1, "bit number");
             if (!ctx.failed()) check_range(ctx, b, 0, 7, "bit number");
             if (!ctx.failed()) {
                 word = uint16_t((m == "sbrc" ? 0xFC00 : 0xFE00) | (r << 4) | b);
@@ -490,9 +913,9 @@ AssembleResult assemble(std::string_view source) {
             long addr = 0;
             if (m == "lds") {
                 r = need_register(ctx, ops, 0, "destination register");
-                addr = need_number(ctx, ops, 1, "address");
+                addr = need_number(ctx, syms, ops, 1, "address");
             } else {
-                addr = need_number(ctx, ops, 0, "address");
+                addr = need_number(ctx, syms, ops, 0, "address");
                 r = need_register(ctx, ops, 1, "source register");
             }
             if (!ctx.failed()) check_range(ctx, addr, 0, 0xFFFF, "address");
@@ -572,16 +995,12 @@ AssembleResult assemble(std::string_view source) {
             return result;
         }
 
-        words.push_back(word);
-        if (two_words) words.push_back(extra);
-        pc += two_words ? 2 : 1;
+        img.put_word(word);                    // little-endian
+        if (two_words) img.put_word(extra);
     }
 
-    result.code.reserve(words.size() * 2);
-    for (uint16_t w : words) {                 // little-endian
-        result.code.push_back(uint8_t(w & 0xFF));
-        result.code.push_back(uint8_t((w >> 8) & 0xFF));
-    }
+    img.align_word();                          // never end mid-word
+    result.code = std::move(img.bytes);
     result.ok = true;
     return result;
 }

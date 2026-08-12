@@ -406,3 +406,384 @@ TEST(parser_full_sketch_round_trip) {
     CHECK(find_global(program, "blinker") != nullptr);
     CHECK(find_function(program, "main") != nullptr);
 }
+
+// ------------------------------------------------------------------ switch ---
+//
+// A switch is lowered into nodes the AST already has: a block that binds the
+// controlling expression to a compiler-generated local, followed by an
+// if/else-if chain over that local.
+
+namespace {
+
+// Returns the body of the only function in `source`, which must parse cleanly.
+const Stmt* body_of(const Program& program, const std::string& name) {
+    const Function* fn = find_function(program, name);
+    if (!fn) return nullptr;
+    return fn->body.get();
+}
+
+// The lowered form of a switch: statement `index` of f's body must be the block
+// holding the temporary declaration and the chain.
+const Stmt* lowered_switch(const Program& program, size_t index = 0) {
+    const Stmt* fn_body = body_of(program, "f");
+    if (!fn_body || fn_body->body.size() <= index) return nullptr;
+    return fn_body->body[index].get();
+}
+
+std::string first_statement_text(const Stmt* block) {
+    if (!block || block->body.empty()) return "<empty>";
+    const Stmt* first = block->body[0].get();
+    if (!first) return "<null>";
+    if (first->kind == StmtKind::Expression) return render(first->expr.get());
+    if (first->kind == StmtKind::Return) return "return " + render(first->expr.get());
+    if (first->kind == StmtKind::Continue) return "continue";
+    if (first->kind == StmtKind::Break) return "break";
+    return "<other>";
+}
+
+} // namespace
+
+TEST(parser_switch_lowers_to_an_if_chain) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    switch (state) {\n"
+        "        case 1: a(); break;\n"
+        "        case 2: b(); break;\n"
+        "    }\n"
+        "}\n");
+    const Stmt* outer = lowered_switch(program);
+    CHECK(outer != nullptr);
+    CHECK(outer->kind == StmtKind::Block);
+    // A plain variable needs no temporary: it is simply named again.
+    CHECK_EQ(outer->body.size(), size_t(1));
+
+    const Stmt* chain = outer->body[0].get();
+    CHECK(chain->kind == StmtKind::If);
+    CHECK(render(chain->expr.get()) == std::string("(state == 1)"));
+    CHECK(first_statement_text(chain->then_branch.get()) == std::string("call a()"));
+
+    const Stmt* second = chain->else_branch.get();
+    CHECK(second != nullptr);
+    CHECK(second->kind == StmtKind::If);
+    CHECK(render(second->expr.get()) == std::string("(state == 2)"));
+    CHECK(first_statement_text(second->then_branch.get()) == std::string("call b()"));
+    CHECK(second->else_branch == nullptr);
+}
+
+TEST(parser_switch_on_a_member_repeats_the_member_access) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    switch (machine->state) {\n"
+        "        case 1: a(); break;\n"
+        "    }\n"
+        "}\n");
+    const Stmt* outer = lowered_switch(program);
+    CHECK_EQ(outer->body.size(), size_t(1));
+    CHECK(render(outer->body[0]->expr.get()) == std::string("((machine->state) == 1)"));
+}
+
+TEST(parser_switch_evaluates_the_controlling_expression_once) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    switch (read()) {\n"
+        "        case 1: a(); break;\n"
+        "        case 2: b(); break;\n"
+        "    }\n"
+        "}\n");
+    const Stmt* outer = lowered_switch(program);
+    CHECK(outer != nullptr);
+    CHECK_EQ(outer->body.size(), size_t(2));
+    const Stmt* decl = outer->body[0].get();
+    CHECK(decl->kind == StmtKind::VarDecl);
+    CHECK(decl->var_type->kind == TypeKind::Int);
+    CHECK(render(decl->var_init.get()) == std::string("call read()"));
+    // Every test compares the temporary, never the call again.
+    const Stmt* chain = outer->body[1].get();
+    CHECK(render(chain->expr.get()) == "(" + decl->var_name + " == 1)");
+    CHECK(render(chain->else_branch->expr.get()) == "(" + decl->var_name + " == 2)");
+}
+
+TEST(parser_switch_shares_one_branch_between_adjacent_labels) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    switch (state) {\n"
+        "        case 1:\n"
+        "        case 2:\n"
+        "        case 3: a(); break;\n"
+        "    }\n"
+        "}\n");
+    const Stmt* outer = lowered_switch(program);
+    CHECK(outer != nullptr);
+    const Stmt* chain = outer->body[0].get();
+    CHECK(chain->kind == StmtKind::If);
+    CHECK(render(chain->expr.get()) ==
+          std::string("(((state == 1) || (state == 2)) || (state == 3))"));
+    CHECK(first_statement_text(chain->then_branch.get()) == std::string("call a()"));
+    CHECK(chain->else_branch == nullptr);
+}
+
+TEST(parser_switch_default_becomes_the_final_else) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    switch (state) {\n"
+        "        case 1: a(); break;\n"
+        "        default: d(); break;\n"
+        "    }\n"
+        "}\n");
+    const Stmt* chain = lowered_switch(program)->body[0].get();
+    CHECK(chain->kind == StmtKind::If);
+    const Stmt* fallback = chain->else_branch.get();
+    CHECK(fallback != nullptr);
+    CHECK(fallback->kind == StmtKind::Block);
+    CHECK(first_statement_text(fallback) == std::string("call d()"));
+}
+
+TEST(parser_switch_default_written_first_still_runs_last) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    switch (state) {\n"
+        "        default: d(); break;\n"
+        "        case 1: a(); break;\n"
+        "    }\n"
+        "}\n");
+    const Stmt* outer = lowered_switch(program);
+    const Stmt* chain = outer->body[0].get();
+    CHECK(chain->kind == StmtKind::If);
+    CHECK(render(chain->expr.get()) == std::string("(state == 1)"));
+    CHECK(first_statement_text(chain->then_branch.get()) == std::string("call a()"));
+    CHECK(chain->else_branch->kind == StmtKind::Block);
+    CHECK(first_statement_text(chain->else_branch.get()) == std::string("call d()"));
+}
+
+TEST(parser_switch_accepts_a_case_ended_by_return) {
+    Program program = parse_ok(
+        "int f() {\n"
+        "    switch (state) {\n"
+        "        case 1: return 7;\n"
+        "        case 2: return 8;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n");
+    const Stmt* chain = lowered_switch(program)->body[0].get();
+    CHECK(first_statement_text(chain->then_branch.get()) == std::string("return 7"));
+    CHECK(first_statement_text(chain->else_branch->then_branch.get()) ==
+          std::string("return 8"));
+}
+
+TEST(parser_switch_accepts_a_braced_case_body_ending_in_break) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    switch (state) {\n"
+        "        case 1: { int n = 2; a(n); break; }\n"
+        "        case 2: b(); break;\n"
+        "    }\n"
+        "}\n");
+    const Stmt* chain = lowered_switch(program)->body[0].get();
+    const Stmt* branch = chain->then_branch.get();
+    CHECK(branch->kind == StmtKind::Block);
+    CHECK_EQ(branch->body.size(), size_t(1));
+    const Stmt* inner = branch->body[0].get();
+    CHECK(inner->kind == StmtKind::Block);
+    // The trailing break has been consumed: only the declaration and the call
+    // remain, and reaching the end of the block leaves the chain.
+    CHECK_EQ(inner->body.size(), size_t(2));
+    CHECK(inner->body[0]->kind == StmtKind::VarDecl);
+    CHECK(inner->body[1]->kind == StmtKind::Expression);
+}
+
+TEST(parser_switch_last_case_needs_no_break) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    switch (state) {\n"
+        "        case 1: a(); break;\n"
+        "        case 2: b();\n"
+        "    }\n"
+        "}\n");
+    const Stmt* chain = lowered_switch(program)->body[0].get();
+    CHECK(first_statement_text(chain->else_branch->then_branch.get()) ==
+          std::string("call b()"));
+}
+
+TEST(parser_switch_body_may_be_empty) {
+    Program program = parse_ok("void f() { switch (read()) { } }");
+    const Stmt* outer = lowered_switch(program);
+    CHECK(outer->kind == StmtKind::Block);
+    // The controlling expression still runs; there is nothing left to test.
+    CHECK_EQ(outer->body.size(), size_t(1));
+    CHECK(outer->body[0]->kind == StmtKind::VarDecl);
+}
+
+TEST(parser_switch_inside_a_loop_keeps_break_bound_to_its_own_construct) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    while (1) {\n"
+        "        switch (state) {\n"
+        "            case 1: a(); break;\n"
+        "            case 2: continue;\n"
+        "        }\n"
+        "        b();\n"
+        "    }\n"
+        "}\n");
+    const Stmt* loop = body_of(program, "f")->body[0].get();
+    CHECK(loop->kind == StmtKind::While);
+    const Stmt* loop_body = loop->then_branch.get();
+    CHECK_EQ(loop_body->body.size(), size_t(2));
+
+    const Stmt* outer = loop_body->body[0].get();
+    CHECK(outer->kind == StmtKind::Block);
+    const Stmt* chain = outer->body[0].get();
+    // The 'break' left the switch, so it must not survive as a loop break.
+    const Stmt* first_branch = chain->then_branch.get();
+    CHECK_EQ(first_branch->body.size(), size_t(1));
+    CHECK(first_branch->body[0]->kind == StmtKind::Expression);
+    // 'continue' means the same thing in both constructs and is kept.
+    CHECK(chain->else_branch->then_branch->body[0]->kind == StmtKind::Continue);
+    // The statement after the switch is untouched.
+    const Stmt* after = loop_body->body[1].get();
+    CHECK(after->kind == StmtKind::Expression);
+    CHECK(render(after->expr.get()) == std::string("call b()"));
+}
+
+TEST(parser_switch_keeps_a_break_that_belongs_to_a_nested_loop) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    switch (state) {\n"
+        "        case 1:\n"
+        "            while (1) { break; }\n"
+        "            break;\n"
+        "        case 2: b(); break;\n"
+        "    }\n"
+        "}\n");
+    const Stmt* chain = lowered_switch(program)->body[0].get();
+    const Stmt* branch = chain->then_branch.get();
+    CHECK_EQ(branch->body.size(), size_t(1));
+    const Stmt* inner_loop = branch->body[0].get();
+    CHECK(inner_loop->kind == StmtKind::While);
+    CHECK(inner_loop->then_branch->body[0]->kind == StmtKind::Break);
+}
+
+TEST(parser_nested_switches_use_distinct_temporaries) {
+    Program program = parse_ok(
+        "void f() {\n"
+        "    switch (outerRead()) {\n"
+        "        case 1:\n"
+        "            switch (innerRead()) {\n"
+        "                case 2: a(); break;\n"
+        "            }\n"
+        "            break;\n"
+        "    }\n"
+        "}\n");
+    const Stmt* outer = lowered_switch(program);
+    CHECK_EQ(outer->body.size(), size_t(2));
+    const std::string outer_temp = outer->body[0]->var_name;
+    CHECK(!outer_temp.empty());
+    CHECK(render(outer->body[1]->expr.get()) == "(" + outer_temp + " == 1)");
+
+    const Stmt* inner = outer->body[1]->then_branch->body[0].get();
+    CHECK(inner->kind == StmtKind::Block);
+    CHECK_EQ(inner->body.size(), size_t(2));
+    const std::string inner_temp = inner->body[0]->var_name;
+    CHECK(!inner_temp.empty());
+    CHECK(outer_temp != inner_temp);
+    CHECK(render(inner->body[0]->var_init.get()) == std::string("call innerRead()"));
+    CHECK(render(inner->body[1]->expr.get()) == "(" + inner_temp + " == 2)");
+}
+
+TEST(parser_switch_rejects_fall_through_between_cases) {
+    ParseResult result = parse_text(
+        "void f() {\n"
+        "    switch (state) {\n"
+        "        case 1: a();\n"
+        "        case 2: b(); break;\n"
+        "    }\n"
+        "}\n");
+    CHECK(!result.ok);
+    CHECK(result.error.rfind("line 3:", 0) == 0);
+    CHECK(result.error.find("falls through") != std::string::npos);
+}
+
+TEST(parser_switch_rejects_fall_through_into_default) {
+    ParseResult result = parse_text(
+        "void f() {\n"
+        "    switch (state) {\n"
+        "        case 1: a();\n"
+        "        default: d();\n"
+        "    }\n"
+        "}\n");
+    CHECK(!result.ok);
+    CHECK(result.error.find("falls through") != std::string::npos);
+}
+
+TEST(parser_switch_rejects_a_break_that_is_not_the_last_statement) {
+    ParseResult result = parse_text(
+        "void f() {\n"
+        "    switch (state) {\n"
+        "        case 1:\n"
+        "            if (x) break;\n"
+        "            a();\n"
+        "            break;\n"
+        "    }\n"
+        "}\n");
+    CHECK(!result.ok);
+    CHECK(result.error.rfind("line 4:", 0) == 0);
+    CHECK(result.error.find("'break' inside a switch") != std::string::npos);
+}
+
+TEST(parser_switch_rejects_a_duplicate_default) {
+    ParseResult result = parse_text(
+        "void f() { switch (state) { default: a(); break; default: b(); break; } }");
+    CHECK(!result.ok);
+    CHECK(result.error.find("duplicate 'default'") != std::string::npos);
+}
+
+TEST(parser_switch_rejects_a_statement_before_the_first_label) {
+    ParseResult result = parse_text("void f() { switch (state) { a(); case 1: b(); } }");
+    CHECK(!result.ok);
+    CHECK(result.error.find("must follow a 'case'") != std::string::npos);
+}
+
+TEST(parser_case_label_outside_a_switch_is_an_error) {
+    ParseResult result = parse_text("void f() { case 1: a(); }");
+    CHECK(!result.ok);
+    CHECK(result.error.find("outside of a switch") != std::string::npos);
+}
+
+TEST(parser_switch_requires_a_colon_after_a_label) {
+    ParseResult result = parse_text("void f() { switch (state) { case 1 a(); } }");
+    CHECK(!result.ok);
+    CHECK(result.error.find("expected ':'") != std::string::npos);
+}
+
+TEST(parser_switch_state_machine_round_trip) {
+    Program program = parse_ok(
+        "enum Mode { Idle, Printing, Done };\n"
+        "int mode;\n"
+        "void loop() {\n"
+        "    switch (mode) {\n"
+        "        case Idle:\n"
+        "            if (buttonPressed()) mode = Printing;\n"
+        "            break;\n"
+        "        case Printing:\n"
+        "            for (int i = 0; i < 8; ++i) {\n"
+        "                if (i > 4) break;\n"
+        "                feed(i);\n"
+        "            }\n"
+        "            mode = Done;\n"
+        "            break;\n"
+        "        default:\n"
+        "            mode = Idle;\n"
+        "            break;\n"
+        "    }\n"
+        "}\n");
+    const Stmt* outer = body_of(program, "loop")->body[0].get();
+    CHECK(outer->kind == StmtKind::Block);
+    const Stmt* chain = outer->body[0].get();
+    CHECK(render(chain->expr.get()) == std::string("(mode == Idle)"));
+    const Stmt* printing = chain->else_branch.get();
+    CHECK(render(printing->expr.get()) == std::string("(mode == Printing)"));
+    // The loop's own break is untouched inside the Printing branch.
+    const Stmt* loop = printing->then_branch->body[0].get();
+    CHECK(loop->kind == StmtKind::For);
+    CHECK(loop->then_branch->body[0]->then_branch->kind == StmtKind::Break);
+    CHECK(printing->else_branch->kind == StmtKind::Block);
+}

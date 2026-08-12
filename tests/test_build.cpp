@@ -49,9 +49,9 @@ TEST(build_reports_missing_toolchain_with_every_root_searched) {
     std::string path = std::string(ARDIO_TEST_TMP) + "/unsupported_source.cpp";
     {
         std::ofstream out(path);
-        // Division has no AVR instruction and no runtime helper in tree yet,
-        // so this is a genuine limitation rather than a contrived one.
-        out << "int main() { int a = 10; int b = 2; return a / b; }\n";
+        // The type system has no floating-point kind at all, so this is a
+        // genuine limitation rather than a contrived one.
+        out << "int main() { float f = 1.5; return 0; }\n";
     }
 
     const ardio::Board* nano = ardio::find_board_by_id("nano");

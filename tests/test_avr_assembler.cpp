@@ -283,3 +283,201 @@ TEST(avr_cbr_is_andi_with_the_complemented_mask) {
     CHECK(a.ok && b.ok);
     CHECK_EQ(word_at(a, 0), word_at(b, 0));
 }
+
+// --------------------------------------------------------------- directives ---
+
+namespace {
+// Byte at index `i`, as an int so CHECK_EQ can print it.
+int byte_at(const ardio::AssembleResult& r, size_t i) {
+    return i < r.code.size() ? int(r.code[i]) : -1;
+}
+} // namespace
+
+TEST(avr_equ_defines_a_constant_usable_as_an_immediate) {
+    auto r = asm_ok(".equ MASK, 0xFF\nldi r16, MASK");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0xEF0F);
+}
+
+TEST(avr_equ_constant_works_as_an_io_address) {
+    auto r = asm_ok(".equ PORTB, 0x05\nout PORTB, r16");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0xB905);
+}
+
+TEST(avr_set_can_redefine_a_constant_partway_through) {
+    auto r = asm_ok(".set X, 1\nldi r16, X\n.set X, 2\nldi r16, X");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0xE001);
+    CHECK_EQ(word_at(r, 1), 0xE002);
+}
+
+TEST(avr_constant_expressions_support_arithmetic_and_shifts) {
+    // (3 << 2) | 1 == 13
+    auto r = asm_ok(".equ N, 3\nldi r16, (N << 2) | 1");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0xE00D);
+}
+
+TEST(avr_org_pads_forward_with_erased_flash) {
+    auto r = asm_ok("nop\n.org 3\nnop");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(8));
+    CHECK_EQ(word_at(r, 1), 0xFFFF);
+    CHECK_EQ(word_at(r, 2), 0xFFFF);
+    CHECK_EQ(word_at(r, 3), 0x0000);
+}
+
+TEST(avr_org_rejects_moving_backwards) {
+    auto r = ardio::assemble("nop\nnop\n.org 0");
+    CHECK(!r.ok);
+    CHECK(r.error.find("backwards") != std::string::npos);
+}
+
+TEST(avr_org_places_an_interrupt_vector_table) {
+    // jmp is two words, so vector 1 starts at word 2.
+    const char* src =
+        "        jmp  main\n"
+        "        .org 2\n"
+        "        jmp  isr\n"
+        "main:   nop\n"
+        "isr:    reti\n";
+    auto r = asm_ok(src);
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0x940C);
+    CHECK_EQ(word_at(r, 1), 0x0004);   // main sits right after both vectors
+    CHECK_EQ(word_at(r, 2), 0x940C);
+    CHECK_EQ(word_at(r, 3), 0x0005);   // isr
+}
+
+TEST(avr_byte_emits_raw_bytes_and_pads_to_a_whole_word) {
+    auto r = asm_ok(".byte 1, 2, 3");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(4));
+    CHECK_EQ(byte_at(r, 0), 1);
+    CHECK_EQ(byte_at(r, 2), 3);
+    CHECK_EQ(byte_at(r, 3), 0xFF);     // pad to finish the word
+}
+
+TEST(avr_label_after_an_odd_byte_run_lands_on_the_next_word) {
+    // The critical case: three bytes is one and a half words, so "here" has to
+    // be rounded up to word 2, not left at word 1.5 or miscounted as word 3.
+    auto r = asm_ok(".byte 1, 2, 3\nhere: nop\nrjmp here");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(8));
+    CHECK_EQ(byte_at(r, 3), 0xFF);
+    CHECK_EQ(word_at(r, 2), 0x0000);   // the nop
+    CHECK_EQ(word_at(r, 3), 0xCFFE);   // rjmp back two words to "here"
+}
+
+TEST(avr_byte_rejects_values_that_do_not_fit) {
+    auto r = ardio::assemble(".byte 300");
+    CHECK(!r.ok);
+    CHECK(r.error.find("range") != std::string::npos);
+}
+
+TEST(avr_word_emits_little_endian_words) {
+    auto r = asm_ok(".word 0x1234, 5");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(4));
+    CHECK_EQ(word_at(r, 0), 0x1234);
+    CHECK_EQ(word_at(r, 1), 0x0005);
+    CHECK_EQ(byte_at(r, 0), 0x34);     // low byte first
+}
+
+TEST(avr_ascii_and_asciz_differ_by_the_terminator) {
+    auto a = asm_ok(".ascii \"hi\"");
+    auto z = asm_ok(".asciz \"hi\"");
+    CHECK(a.ok && z.ok);
+    CHECK_EQ(a.code.size(), size_t(2));
+    CHECK_EQ(byte_at(a, 0), 'h');
+    CHECK_EQ(byte_at(a, 1), 'i');
+    CHECK_EQ(z.code.size(), size_t(4));
+    CHECK_EQ(byte_at(z, 2), 0);        // NUL
+    CHECK_EQ(byte_at(z, 3), 0xFF);     // pad
+}
+
+TEST(avr_ascii_keeps_commas_and_comment_characters_inside_the_string) {
+    auto r = asm_ok(".ascii \"a,b; c\"");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(6));
+    CHECK_EQ(byte_at(r, 1), ',');
+    CHECK_EQ(byte_at(r, 3), ';');
+}
+
+TEST(avr_ascii_decodes_escape_sequences) {
+    auto r = asm_ok(".ascii \"a\\nb\\t\"");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(4));
+    CHECK_EQ(byte_at(r, 1), '\n');
+    CHECK_EQ(byte_at(r, 3), '\t');
+}
+
+TEST(avr_space_reserves_bytes_with_an_optional_fill) {
+    auto r = asm_ok(".space 3, 0xAA\nnop");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(6));
+    CHECK_EQ(byte_at(r, 0), 0xAA);
+    CHECK_EQ(byte_at(r, 2), 0xAA);
+    CHECK_EQ(byte_at(r, 3), 0xFF);     // pad before the instruction
+    CHECK_EQ(word_at(r, 2), 0x0000);
+}
+
+TEST(avr_space_defaults_to_zero_fill) {
+    auto r = asm_ok(".space 2");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(2));
+    CHECK_EQ(byte_at(r, 0), 0);
+    CHECK_EQ(byte_at(r, 1), 0);
+}
+
+TEST(avr_global_and_extern_are_accepted_and_ignored) {
+    auto r = asm_ok(".global main\n.extern helper\nmain: nop");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(2));
+    CHECK_EQ(word_at(r, 0), 0x0000);
+}
+
+TEST(avr_lo8_and_hi8_split_a_constant_into_two_immediates) {
+    auto r = asm_ok(".equ ADDR, 0x1234\nldi r16, lo8(ADDR)\nldi r17, hi8(ADDR)");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0xE304);   // 0x34
+    CHECK_EQ(word_at(r, 1), 0xE112);   // 0x12
+}
+
+TEST(avr_lo8_and_hi8_take_the_address_of_a_label) {
+    // The usual way to point Z at a string: msg is at word 2.
+    auto r = asm_ok("ldi r30, lo8(msg)\nldi r31, hi8(msg)\nmsg: .asciz \"hi\"");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0xE0E2);   // r30 <- 2
+    CHECK_EQ(word_at(r, 1), 0xE0F0);   // r31 <- 0
+    CHECK_EQ(byte_at(r, 4), 'h');
+}
+
+TEST(avr_reports_an_unknown_directive) {
+    auto r = ardio::assemble(".frobnicate 1");
+    CHECK(!r.ok);
+    CHECK(r.error.find("directive") != std::string::npos);
+}
+
+TEST(avr_reports_an_undefined_constant_in_an_expression) {
+    auto r = ardio::assemble("ldi r16, NOPE + 1");
+    CHECK(!r.ok);
+    CHECK(r.error.find("NOPE") != std::string::npos);
+}
+
+TEST(avr_data_between_two_routines_keeps_later_labels_correct) {
+    // A five-byte string between two routines: the second routine still has to
+    // start on a word boundary, and call must resolve to that word.
+    const char* src =
+        "        call second\n"
+        "        ret\n"
+        "msg:    .ascii \"hello\"\n"
+        "second: ret\n";
+    auto r = asm_ok(src);
+    CHECK(r.ok);
+    // call(2) + ret(1) = 3 words, then 5 bytes + 1 pad = 3 words -> second at 6.
+    CHECK_EQ(word_at(r, 1), 0x0006);
+    CHECK_EQ(byte_at(r, 11), 0xFF);
+    CHECK_EQ(word_at(r, 6), 0x9508);
+}

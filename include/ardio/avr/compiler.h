@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ardio {
 
@@ -25,5 +26,11 @@ struct CompileResult {
 // Not supported yet: classes, templates, pointers, arrays, floating point,
 // 32-bit types. These are reported as errors rather than silently miscompiled.
 CompileResult compile_avr(std::string_view source);
+
+// As above, but runs the C preprocessor first, resolving #include against
+// `include_paths` and expanding macros. Pass the directory holding ardio's
+// Arduino-compatible headers to compile a sketch that includes them.
+CompileResult compile_avr(std::string_view source,
+                          const std::vector<std::string>& include_paths);
 
 } // namespace ardio

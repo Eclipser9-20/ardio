@@ -40,6 +40,7 @@ add_library(libardio STATIC
     src/avr/codegen_expr.cpp
     src/avr/sketch.cpp
     src/avr/codegen_stmt.cpp
+    src/avr/codegen_class.cpp
     src/avr/compiler.cpp
     src/build/compile.cpp
     src/cli/args.cpp
@@ -100,6 +101,10 @@ add_executable(ardio_tests
     tests/test_runtime_io.cpp
     tests/test_sketch.cpp
     tests/test_compiler.cpp
+    tests/test_codegen_class.cpp
+    tests/test_runtime_headers.cpp
+    tests/test_runtime_ir.cpp
+    tests/test_runtime_serial.cpp
 )
 target_link_libraries(ardio_tests PRIVATE libardio)
 target_include_directories(ardio_tests PRIVATE tests)

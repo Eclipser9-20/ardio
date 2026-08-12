@@ -5,23 +5,26 @@
 // assembly runtime (runtime/servo.S), which drives a hardware timer to emit the
 // standard ~50 Hz RC servo pulse train.
 //
+// Written inside the C++ subset ardio's own compiler accepts. Divergences from
+// the published API, and why, are listed in Arduino.h; the ones that bite here
+// are: no `extern "C"`, no typedefs (uint8_t/uint16_t become int), no macros
+// for the constants, and no overloading — attach() with explicit endpoints is
+// spelled attach_limits().
+//
 // Part of ardio. Licensed under the GNU General Public License v3.
 
 #ifndef ARDIO_SERVO_H
 #define ARDIO_SERVO_H
 
-#include "Arduino.h"
-
 // The pulse widths, in microseconds, that 0 degrees and 180 degrees map to.
-#define SERVO_MIN_PULSE_US 544
-#define SERVO_MAX_PULSE_US 2400
-#define SERVO_MAX_SERVOS   8
+const int SERVO_MIN_PULSE_US = 544;
+const int SERVO_MAX_PULSE_US = 2400;
+const int SERVO_MAX_SERVOS = 8;
 
-extern "C" {
-void servo_attach(uint8_t pin, uint16_t min_us, uint16_t max_us);
-void servo_write(uint8_t pin, uint16_t us);
-void servo_detach(uint8_t pin);
-}
+// Runtime entry points, exported by runtime/servo.S as plain labels.
+void servo_attach(int pin, int min_us, int max_us);
+void servo_write(int pin, int us);
+void servo_detach(int pin);
 
 class Servo {
 public:
@@ -32,7 +35,9 @@ public:
     int attach(int pin);
 
     // As attach(pin), but with explicit endpoint pulse widths in microseconds.
-    int attach(int pin, int min_us, int max_us);
+    // Divergence: the Arduino API overloads attach(); this compiler keys
+    // functions by name alone, so the three-argument form has its own name.
+    int attach_limits(int pin, int min_us, int max_us);
 
     // Angle in degrees, 0..180. Values outside that range are clamped.
     void write(int angle);
@@ -53,11 +58,11 @@ public:
     void detach();
 
 private:
-    uint8_t  pin_;
-    uint8_t  attached_;
-    uint16_t min_us_;
-    uint16_t max_us_;
-    uint16_t pulse_us_;
+    char pin_;
+    char attached_;
+    int min_us_;
+    int max_us_;
+    int pulse_us_;
 };
 
 #endif // ARDIO_SERVO_H

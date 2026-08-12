@@ -506,7 +506,17 @@ private:
         auto block = make_stmt(StmtKind::Block, block_line);
         while (!is_punct("}")) {
             if (at_end()) error("expected '}' to close a block");
-            block->body.push_back(parse_statement());
+            bool was_declaration = starts_declaration();
+            StmtPtr stmt = parse_statement();
+
+            // "int a = 1, b = 2;" parses into a Block of VarDecls, but a Block
+            // opens a scope during semantic analysis, which would hide those
+            // names from the rest of this block. Splice them in directly.
+            if (was_declaration && stmt && stmt->kind == StmtKind::Block) {
+                for (StmtPtr& decl : stmt->body) block->body.push_back(std::move(decl));
+                continue;
+            }
+            block->body.push_back(std::move(stmt));
         }
         expect_punct("}", "to close a block");
         return block;
@@ -522,6 +532,10 @@ private:
         if (is_word("while")) return parse_while();
         if (is_word("for")) return parse_for();
         if (is_word("do")) return parse_do_while();
+        if (is_word("switch")) return parse_switch();
+
+        if (is_word("case") || is_word("default"))
+            error("'" + peek().text + "' label outside of a switch statement");
 
         if (match_word("return")) {
             auto stmt = make_stmt(StmtKind::Return, stmt_line);
@@ -676,6 +690,195 @@ private:
         block->body.push_back(std::move(first_pass));
         block->body.push_back(std::move(loop));
         return block;
+    }
+
+    // True for expressions that can be re-evaluated as often as the lowering
+    // likes: no calls, no assignments, no increments. A switch on one of these
+    // needs no temporary at all, so the controlling expression keeps its own
+    // type instead of being copied through a compiler-chosen one.
+    static bool is_repeatable(const Expr& expr) {
+        switch (expr.kind) {
+            case ExprKind::IntLiteral:
+            case ExprKind::Identifier:
+                return true;
+            case ExprKind::Member:
+                return expr.lhs && is_repeatable(*expr.lhs);
+            default:
+                return false;
+        }
+    }
+
+    static ExprPtr clone_repeatable(const Expr& expr, size_t l) {
+        auto copy = make_expr(expr.kind, l);
+        copy->int_value = expr.int_value;
+        copy->name = expr.name;
+        copy->through_pointer = expr.through_pointer;
+        if (expr.lhs) copy->lhs = clone_repeatable(*expr.lhs, l);
+        return copy;
+    }
+
+    // A run of "case"/"default" labels together with the statements that follow
+    // them, up to the next label or the closing brace.
+    struct SwitchGroup {
+        std::vector<ExprPtr> labels;      // empty when the group is only "default"
+        bool has_default = false;
+        std::vector<StmtPtr> body;
+        size_t line = 0;
+    };
+
+    // True when the statement contains a 'break' that belongs to the enclosing
+    // switch rather than to a loop of its own. Loop bodies are not searched: a
+    // 'break' inside them binds to that loop and is left alone.
+    static bool has_switch_break(const Stmt& stmt) {
+        switch (stmt.kind) {
+            case StmtKind::Break:
+                return true;
+            case StmtKind::Block:
+                for (const auto& child : stmt.body)
+                    if (child && has_switch_break(*child)) return true;
+                return false;
+            case StmtKind::If:
+                if (stmt.then_branch && has_switch_break(*stmt.then_branch)) return true;
+                if (stmt.else_branch && has_switch_break(*stmt.else_branch)) return true;
+                return false;
+            default:
+                return false;
+        }
+    }
+
+    // Removes a trailing 'break' from a case body, reporting whether the body
+    // ends by leaving the switch. A trailing 'break' becomes the end of the
+    // branch, which is exactly where control lands after lowering. 'return' and
+    // 'continue' already leave the switch and are kept as they are.
+    static bool strip_case_terminator(std::vector<StmtPtr>& body) {
+        if (body.empty()) return false;
+        Stmt* last = body.back().get();
+        if (!last) return false;
+        if (last->kind == StmtKind::Break) {
+            body.pop_back();
+            return true;
+        }
+        if (last->kind == StmtKind::Return || last->kind == StmtKind::Continue) return true;
+        if (last->kind == StmtKind::Block) return strip_case_terminator(last->body);
+        return false;
+    }
+
+    // "switch (E) { case A: ... }" is lowered to a block that evaluates E once
+    // into a compiler-generated local and then tests it with an if/else-if
+    // chain. 'default' becomes the final else, wherever it was written.
+    //
+    // The AST has no label or goto node, so a case that falls through into the
+    // next one cannot be expressed and is rejected rather than miscompiled.
+    StmtPtr parse_switch() {
+        size_t stmt_line = line();
+        ++pos_;
+        expect_punct("(", "after 'switch'");
+        ExprPtr control = parse_expression();
+        expect_punct(")", "after a switch condition");
+        expect_punct("{", "to open a switch body");
+
+        std::vector<SwitchGroup> groups;
+        bool seen_default = false;
+        while (!is_punct("}")) {
+            if (at_end()) error("expected '}' to close a switch body");
+            if (is_word("case") || is_word("default")) {
+                size_t label_line = line();
+                bool is_default = is_word("default");
+                ++pos_;
+                ExprPtr value;
+                if (!is_default) value = parse_conditional();
+                expect_punct(":", is_default ? "after 'default'" : "after a case label");
+                // Consecutive labels with nothing between them share one group;
+                // that is the only fall-through C allows without a statement.
+                if (groups.empty() || !groups.back().body.empty()) {
+                    SwitchGroup fresh;
+                    fresh.line = label_line;
+                    groups.push_back(std::move(fresh));
+                }
+                if (is_default) {
+                    if (seen_default) error("duplicate 'default' label in a switch");
+                    seen_default = true;
+                    groups.back().has_default = true;
+                } else {
+                    groups.back().labels.push_back(std::move(value));
+                }
+                continue;
+            }
+            if (groups.empty())
+                error("a statement in a switch body must follow a 'case' or 'default' label");
+            groups.back().body.push_back(parse_statement());
+        }
+        expect_punct("}", "to close a switch body");
+
+        for (size_t i = 0; i < groups.size(); ++i) {
+            SwitchGroup& group = groups[i];
+            bool terminated = strip_case_terminator(group.body);
+            if (!terminated && !group.body.empty() && i + 1 < groups.size())
+                throw ParseError("line " + std::to_string(group.line) +
+                                 ": a 'case' that falls through into the next label is not "
+                                 "supported; end it with 'break' or 'return'");
+            for (const auto& stmt : group.body) {
+                if (stmt && has_switch_break(*stmt))
+                    throw ParseError("line " + std::to_string(stmt->line) +
+                                     ": 'break' inside a switch is only supported as the last "
+                                     "statement of a case");
+            }
+        }
+
+        auto outer = make_stmt(StmtKind::Block, stmt_line);
+
+        // A variable or member can simply be named again in every comparison.
+        // Anything else may have side effects, so it is evaluated once into a
+        // compiler-generated local and the chain tests that.
+        const Expr* subject = control.get();
+        std::string temp;
+        if (!is_repeatable(*control)) {
+            temp = "__ardio_switch" + std::to_string(switch_temps_++);
+            auto decl = make_stmt(StmtKind::VarDecl, stmt_line);
+            decl->var_name = temp;
+            decl->var_type = make_type(TypeKind::Int);
+            decl->var_init = std::move(control);
+            outer->body.push_back(std::move(decl));
+            subject = nullptr;
+        }
+
+        // The default group becomes the tail else; the rest chain in order.
+        StmtPtr tail;
+        for (auto& group : groups) {
+            if (!group.has_default) continue;
+            tail = make_stmt(StmtKind::Block, group.line);
+            tail->body = std::move(group.body);
+            break;
+        }
+
+        for (size_t i = groups.size(); i-- > 0;) {
+            SwitchGroup& group = groups[i];
+            if (group.has_default) continue;
+            auto branch = make_stmt(StmtKind::If, group.line);
+            ExprPtr cond;
+            for (auto& label : group.labels) {
+                ExprPtr value;
+                if (subject) {
+                    value = clone_repeatable(*subject, group.line);
+                } else {
+                    value = make_expr(ExprKind::Identifier, group.line);
+                    value->name = temp;
+                }
+                ExprPtr test =
+                    make_binary("==", std::move(value), std::move(label), group.line);
+                cond = cond ? make_binary("||", std::move(cond), std::move(test), group.line)
+                            : std::move(test);
+            }
+            branch->expr = std::move(cond);
+            auto body = make_stmt(StmtKind::Block, group.line);
+            body->body = std::move(group.body);
+            branch->then_branch = std::move(body);
+            branch->else_branch = std::move(tail);
+            tail = std::move(branch);
+        }
+
+        if (tail) outer->body.push_back(std::move(tail));
+        return outer;
     }
 
     // ------------------------------------------------------- expressions ---
@@ -954,6 +1157,7 @@ private:
     const std::vector<Token>& toks_;
     Program& program_;
     size_t pos_ = 0;
+    size_t switch_temps_ = 0;
     std::set<std::string> classes_;
 };
 

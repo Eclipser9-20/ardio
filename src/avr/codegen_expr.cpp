@@ -12,6 +12,8 @@
 
 #include "ardio/avr/codegen.h"
 
+#include <map>
+
 namespace ardio {
 namespace {
 
@@ -28,6 +30,37 @@ bool is_comparison(const std::string& op) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------- class layout ---
+//
+// Member access needs the byte offset the layout pass computed, but a Type
+// carries only the class name, exactly as it carries only the name for
+// Type::size(). The offsets therefore live in a table beside the code
+// generator, populated from the analysed program before generation, mirroring
+// how set_class_size() feeds Type::size().
+
+namespace {
+
+std::map<std::string, std::map<std::string, int>>& class_layouts() {
+    static std::map<std::string, std::map<std::string, int>> layouts;
+    return layouts;
+}
+
+} // namespace
+
+void set_class_layout(const ClassDecl& c) {
+    auto& fields = class_layouts()[c.name];
+    for (const Field& f : c.fields) fields[f.name] = f.offset;
+}
+
+int class_field_offset(const std::string& class_name, const std::string& field) {
+    auto cls = class_layouts().find(class_name);
+    if (cls == class_layouts().end()) return -1;
+    auto it = cls->second.find(field);
+    return it == cls->second.end() ? -1 : it->second;
+}
+
+void clear_class_layouts() { class_layouts().clear(); }
 
 // ------------------------------------------------------------- plumbing ----
 
@@ -184,6 +217,216 @@ Compare comparison_branch(const std::string& op, bool is_signed) {
     return {is_signed ? "brge" : "brsh", true};   // "<="
 }
 
+// ------------------------------------------------------------ addresses ----
+//
+// Subscripts, member access and '&' all need the address of an object rather
+// than its value. gen_address() leaves that address in r24:r25; the caller
+// then either hands it straight back (for '&') or moves it into Z and reads or
+// writes through it. Z is chosen over X because only Y and Z have the
+// displacement forms ldd/std, and Y is the frame pointer.
+
+bool gen_address(CodeGen& g, const Expr& e);
+
+bool is_array(const Expr& e) {
+    return e.type && e.type->kind == TypeKind::Array;
+}
+
+// An expression used as the base of a subscript: an array names its own
+// storage, anything else is a pointer whose value is the address.
+bool gen_base_pointer(CodeGen& g, const Expr& base) {
+    if (is_array(base)) return gen_address(g, base);
+    g.gen_expr(base);
+    return !g.failed();
+}
+
+// Multiplies the index in r24:r25 by the element size. Powers of two shift;
+// anything else goes through MUL, which dirties r0 and r1, so r1 is put back.
+void scale_index(CodeGen& g, int element) {
+    if (element <= 1) return;
+    if ((element & (element - 1)) == 0) {
+        for (int n = element; n > 1; n >>= 1) {
+            g.emit("lsl r24");
+            g.emit("rol r25");
+        }
+        return;
+    }
+    g.emit("ldi r22, " + imm(element));
+    g.emit("mul r24, r22");
+    g.emit("movw r18, r0");
+    g.emit("mul r25, r22");
+    g.emit("add r19, r0");
+    g.emit("clr r1");
+    g.emit("movw r24, r18");
+}
+
+// Adds a constant byte offset to the address in r24:r25.
+void add_offset(CodeGen& g, int offset) {
+    if (offset == 0) return;
+    if (offset > 0 && offset <= 63) { g.emit("adiw r24, " + imm(offset)); return; }
+    g.emit("subi r24, " + lo_byte(-offset));
+    g.emit("sbci r25, " + hi_byte(-offset));
+}
+
+// Reads `size` bytes from the address in r24:r25 back into r24:r25.
+void load_through_address(CodeGen& g, int size, bool is_signed) {
+    g.emit("movw r30, r24");
+    g.emit("ld r24, Z");
+    if (size == 2) g.emit("ldd r25, Z+1");
+    else g.widen_to_16(is_signed);
+}
+
+// The class a member expression's object belongs to, or "" if it has none.
+std::string member_class(const Expr& e) {
+    if (!e.lhs || !e.lhs->type) return {};
+    const TypePtr& t = e.lhs->type;
+    if (e.through_pointer)
+        return t->pointee ? t->pointee->class_name : std::string();
+    return t->class_name;
+}
+
+bool gen_address(CodeGen& g, const Expr& e) {
+    if (g.failed()) return false;
+
+    switch (e.kind) {
+    case ExprKind::Identifier: {
+        int off = g.local_offset(e.name);
+        if (off >= 0) {
+            g.emit("movw r24, r28");            // Y, the frame pointer
+            add_offset(g, off);
+        } else {
+            int addr = g.global_address(e.name);
+            if (addr < 0) addr = g.add_global(e.name, e.type ? e.type->size() : 2);
+            g.emit("ldi r24, " + lo_byte(addr));
+            g.emit("ldi r25, " + hi_byte(addr));
+        }
+        return true;
+    }
+
+    case ExprKind::Index: {
+        if (!e.lhs || !e.rhs) { g.fail("malformed subscript"); return false; }
+        if (!gen_base_pointer(g, *e.lhs)) return false;
+        g.emit("push r24");
+        g.emit("push r25");
+        g.gen_expr(*e.rhs);                     // the subscript
+        if (g.failed()) return false;
+        scale_index(g, e.type ? e.type->size() : 1);
+        g.emit("movw r22, r24");
+        g.emit("pop r25");
+        g.emit("pop r24");
+        g.emit("add r24, r22");
+        g.emit("adc r25, r23");
+        return true;
+    }
+
+    case ExprKind::Member: {
+        if (!e.lhs) { g.fail("member access without an object"); return false; }
+        std::string cls = member_class(e);
+        if (cls.empty()) {
+            g.fail("member '" + e.name + "' accessed on a non-class value");
+            return false;
+        }
+        if (e.through_pointer) {
+            g.gen_expr(*e.lhs);                 // the pointer is the address
+            if (g.failed()) return false;
+        } else if (!gen_address(g, *e.lhs)) {
+            return false;
+        }
+        int offset = class_field_offset(cls, e.name);
+        if (offset < 0) {
+            g.fail("class '" + cls + "' has no field '" + e.name +
+                   "' in the generator's layout table");
+            return false;
+        }
+        add_offset(g, offset);
+        return true;
+    }
+
+    case ExprKind::Unary:
+        if (e.op == "*") {
+            if (!e.lhs) { g.fail("'*' without an operand"); return false; }
+            g.gen_expr(*e.lhs);                 // the pointer value is the address
+            return !g.failed();
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    g.fail("this expression does not have an address");
+    return false;
+}
+
+// Reads an lvalue that is not a plain named variable.
+void gen_indirect_load(CodeGen& g, const Expr& e) {
+    if (is_array(e)) { gen_address(g, e); return; }   // an array decays
+    int size = e.type ? e.type->size() : 2;
+    if (size < 1 || size > 2) {
+        g.fail("only 8- and 16-bit values can be loaded indirectly");
+        return;
+    }
+    if (!gen_address(g, e)) return;
+    load_through_address(g, size, CodeGen::expr_is_signed(e));
+}
+
+// -------------------------------------------------------------- strings ----
+//
+// The bytes of a string literal cannot simply be laid down in flash after the
+// code: reading them back would need LPM, and the labels the assembler hands
+// out are word addresses while LPM wants a byte address, so a flash string
+// could not be handed to a routine that reads it with a plain LD. There is
+// also no linker and no startup copy loop to move a .rodata image into SRAM.
+//
+// So a literal gets a fixed SRAM block, allocated once per distinct string,
+// and the code that evaluates the literal fills that block before yielding its
+// address. The cost is two instructions per character at each evaluation site;
+// the gain is that the result is an ordinary data pointer that every existing
+// runtime routine can already read.
+
+// A globals-table key that is unique to the contents, so equal literals share
+// one block. The name never reaches the assembler.
+std::string string_symbol(const std::string& text) {
+    static const char digits[] = "0123456789abcdef";
+    std::string name = "__str_";
+    for (unsigned char c : text) {
+        name += digits[c >> 4];
+        name += digits[c & 0x0F];
+    }
+    return name;
+}
+
+void gen_string_literal(CodeGen& g, const Expr& e) {
+    const std::string& text = e.str_value;
+    int addr = g.add_global(string_symbol(text), int(text.size()) + 1);
+
+    g.emit("ldi r30, " + lo_byte(addr));
+    g.emit("ldi r31, " + hi_byte(addr));
+    long previous = -1;
+    for (size_t i = 0; i <= text.size(); ++i) {
+        long byte = i == text.size() ? 0 : long(static_cast<unsigned char>(text[i]));
+        if (byte != previous) {                 // r18 already holds a run's value
+            g.emit("ldi r18, " + imm(byte));
+            previous = byte;
+        }
+        g.emit("st Z+, r18");
+    }
+    g.emit("ldi r24, " + lo_byte(addr));
+    g.emit("ldi r25, " + hi_byte(addr));
+}
+
+// Writes r24:r25 (or r24 alone) to the lvalue `target`, whose address is
+// computed after the value, so the value is parked on the stack meanwhile.
+void gen_indirect_store(CodeGen& g, const Expr& target, int size) {
+    g.emit("push r24");
+    g.emit("push r25");
+    if (!gen_address(g, target)) return;
+    g.emit("movw r30, r24");
+    g.emit("pop r25");
+    g.emit("pop r24");
+    g.emit("st Z, r24");
+    if (size == 2) g.emit("std Z+1, r25");
+}
+
 } // namespace
 
 void CodeGen::gen_expr(const Expr& e) {
@@ -198,13 +441,29 @@ void CodeGen::gen_expr(const Expr& e) {
         return;
     }
 
+    // A string literal evaluates to the address of its bytes. There is no
+    // linker and no .data copy loop, so the bytes are materialised into a
+    // fixed SRAM block by the code that evaluates the literal: the block is
+    // allocated once per distinct string, then filled and its address
+    // returned. See the note in gen_string_literal().
     case ExprKind::StringLiteral:
-        fail("string literals are not supported in expressions yet");
+        gen_string_literal(*this, e);
         return;
 
     // ---- names ------------------------------------------------------------
     case ExprKind::Identifier:
+        // An array names its storage; using it as a value yields its address.
+        if (e.type && e.type->kind == TypeKind::Array) {
+            gen_address(*this, e);
+            return;
+        }
         load_from_variable(e.name, expr_size(e), expr_is_signed(e));
+        return;
+
+    // ---- subscripts and members -------------------------------------------
+    case ExprKind::Index:
+    case ExprKind::Member:
+        gen_indirect_load(*this, e);
         return;
 
     // ---- casts ------------------------------------------------------------
@@ -227,22 +486,28 @@ void CodeGen::gen_expr(const Expr& e) {
     // ---- assignment -------------------------------------------------------
     case ExprKind::Assign: {
         if (!e.lhs || !e.rhs) { fail("malformed assignment"); return; }
-        if (e.lhs->kind != ExprKind::Identifier) {
-            fail("only simple variables can be assigned so far");
+        const Expr& target = *e.lhs;
+        const bool named = target.kind == ExprKind::Identifier;
+        const bool indirect = target.kind == ExprKind::Index ||
+                              target.kind == ExprKind::Member ||
+                              (target.kind == ExprKind::Unary && target.op == "*");
+        if (!named && !indirect) {
+            fail("this expression cannot be assigned to");
             return;
         }
-        int size = expr_size(*e.lhs);
+        int size = expr_size(target);
         if (e.op.empty() || e.op == "=") {
             gen_expr(*e.rhs);
             if (failed()) return;
         } else {
             // Compound assignment: run the plain binary operation with the
             // destination as its left operand.
-            gen_binary(e.op.substr(0, e.op.size() - 1), *e.lhs, *e.rhs, size,
-                       expr_is_signed(*e.lhs));
+            gen_binary(e.op.substr(0, e.op.size() - 1), target, *e.rhs, size,
+                       expr_is_signed(target));
             if (failed()) return;
         }
-        store_to_variable(e.lhs->name, size);
+        if (named) store_to_variable(target.name, size);
+        else gen_indirect_store(*this, target, size);
         return;
     }
 
@@ -250,6 +515,17 @@ void CodeGen::gen_expr(const Expr& e) {
     case ExprKind::Unary: {
         if (!e.lhs) { fail("unary operator without an operand"); return; }
         const std::string& op = e.op;
+
+        // '&' wants the operand's address, never its value.
+        if (op == "&") {
+            gen_address(*this, *e.lhs);
+            return;
+        }
+        // '*' reads through the pointer the operand evaluates to.
+        if (op == "*") {
+            gen_indirect_load(*this, e);
+            return;
+        }
 
         if (op == "++" || op == "--") {
             if (e.lhs->kind != ExprKind::Identifier) {
@@ -405,6 +681,18 @@ void CodeGen::gen_binary(const std::string& op, const Expr& lhs, const Expr& rhs
             emit("clr r1");
             emit("movw r24, r18");
         }
+        return;
+    }
+    if (op == "/" || op == "%") {
+        // The AVR has no divide instruction, so both operators call the
+        // restoring shift-subtract routine in runtime/math.S. It takes the
+        // dividend in r24:r25 and the divisor in r22:r23 -- exactly where the
+        // operands already are -- and returns the quotient in r24:r25 and the
+        // remainder in r18:r19. Everything it touches is call-clobbered.
+        const bool operands_signed = expr_is_signed(lhs) && expr_is_signed(rhs);
+        emit(operands_signed ? "call __ardio_divmod16" : "call __ardio_udivmod16");
+        if (op == "%") emit("movw r24, r18");
+        if (size == 1) widen_to_16(is_signed);
         return;
     }
     if (op == "&" || op == "|" || op == "^") {

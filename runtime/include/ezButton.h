@@ -5,19 +5,21 @@
 // (runtime/button.S). The pin is configured with its internal pull-up enabled,
 // so a button is wired between the pin and ground and reads LOW when pressed.
 //
+// Written inside the C++ subset ardio's own compiler accepts; see Arduino.h for
+// the full list. Here: no `extern "C"`, no typedefs, and getCount() returns a
+// plain int rather than unsigned long, since the code generator evaluates
+// expressions 16 bits wide and a 32-bit return would be truncated silently.
+//
 // Part of ardio. Licensed under the GNU General Public License v3.
 
 #ifndef ARDIO_EZBUTTON_H
 #define ARDIO_EZBUTTON_H
 
-#include "Arduino.h"
-
-extern "C" {
 // Registers a pin as a debounced button and returns its slot index.
-uint8_t button_init(uint8_t pin, uint16_t debounce_ms);
+int button_init(int pin, int debounce_ms);
+
 // Current debounced level for a registered pin: 1 while held, 0 otherwise.
-uint8_t button_pressed(uint8_t pin);
-}
+int button_pressed(int pin);
 
 class ezButton {
 public:
@@ -27,9 +29,9 @@ public:
     // Debounce window in milliseconds.
     void setDebounceTime(int ms);
 
-    // Sample the pin. Call this once per iteration of loop(), before asking any
-    // of the query methods anything — they report what the most recent loop()
-    // observed, not the live pin.
+    // Sample the pin. Call this once per iteration of the sketch's loop(),
+    // before asking any of the query methods anything — they report what the
+    // most recent call observed, not the live pin.
     void loop();
 
     // Edge queries: true for exactly one loop() iteration, on the iteration
@@ -44,18 +46,19 @@ public:
     // The level seen on the previous loop() iteration.
     int getStateRaw();
 
-    // Number of press events since construction.
-    unsigned long getCount();
+    // Number of press events since construction. Divergence: unsigned long in
+    // the published API; int here, so the count wraps at 32767.
+    int getCount();
     void resetCount();
 
 private:
-    uint8_t  pin_;
-    uint16_t debounce_ms_;
-    uint8_t  state_;
-    uint8_t  last_state_;
-    uint8_t  pressed_edge_;
-    uint8_t  released_edge_;
-    uint32_t count_;
+    char pin_;
+    int debounce_ms_;
+    char state_;
+    char last_state_;
+    char pressed_edge_;
+    char released_edge_;
+    int count_;
 };
 
 #endif // ARDIO_EZBUTTON_H

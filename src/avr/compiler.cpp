@@ -8,10 +8,23 @@
 
 #include "ardio/avr/codegen.h"
 #include "ardio/avr/parser.h"
+#include "ardio/avr/preprocess.h"
 #include "ardio/avr/sema.h"
 #include "ardio/avr/token.h"
 
 namespace ardio {
+
+// Implemented in codegen_class.cpp: emits constructor calls for globals of
+// class type. Declared here rather than in codegen.h so that the class
+// generator owns its own surface.
+void gen_global_object_init(CodeGen& gen, const Program& program);
+
+// Implemented in codegen_expr.cpp: publishes a class's field offsets to the
+// generator, which needs them for obj.field because a Type carries only the
+// class name.
+void set_class_layout(const ClassDecl& decl);
+void clear_class_layouts();
+
 namespace {
 
 // Preprocessor directives are not handled by this compiler yet: there is a
@@ -49,6 +62,17 @@ bool has_function(const Program& p, const std::string& name) {
 
 } // namespace
 
+CompileResult compile_avr(std::string_view source,
+                          const std::vector<std::string>& include_paths) {
+    PreprocessResult pp = preprocess(std::string(source), include_paths);
+    if (!pp.ok) {
+        CompileResult result;
+        result.error = pp.error;
+        return result;
+    }
+    return compile_avr(pp.text);
+}
+
 CompileResult compile_avr(std::string_view source) {
     CompileResult result;
 
@@ -67,6 +91,11 @@ CompileResult compile_avr(std::string_view source) {
     }
 
     CodeGen gen;
+
+    // Field offsets are computed by semantic analysis; hand them to the
+    // generator before any code refers to a member.
+    clear_class_layouts();
+    for (const ClassDecl& c : parsed.program.classes) set_class_layout(c);
 
     // Reserve SRAM for globals before any code refers to them.
     for (const Global& g : parsed.program.globals) {
@@ -109,6 +138,12 @@ CompileResult compile_avr(std::string_view source) {
         }
     }
 
+    gen_global_object_init(gen, parsed.program);
+    if (gen.failed()) {
+        result.error = gen.error;
+        return result;
+    }
+
     if (arduino_style) {
         gen.emit("    call setup");
         gen.emit_label(".Lmainloop");
@@ -118,6 +153,16 @@ CompileResult compile_avr(std::string_view source) {
         gen.emit("    call main");
         gen.emit_label(".Lhalt");
         gen.emit("    rjmp .Lhalt");
+    }
+
+    for (const ClassDecl& c : parsed.program.classes) {
+        for (const Function& m : c.methods) {
+            gen.gen_class_method(c, m);
+            if (gen.failed()) {
+                result.error = gen.error;
+                return result;
+            }
+        }
     }
 
     for (const Function& f : parsed.program.functions) {

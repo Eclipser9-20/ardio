@@ -9,6 +9,20 @@
 
 #include "ardio/avr/assembler.h"
 #include "ardio/avr/codegen.h"
+#include "ardio/avr/sema.h"
+
+#include <fstream>
+#include <sstream>
+
+namespace ardio {
+// Field offsets reach the code generator through a table beside it, the same
+// way class sizes reach Type::size(). The generator owns these; they are
+// declared here rather than in codegen.h so the header keeps its current
+// shape.
+void set_class_layout(const ClassDecl& c);
+int  class_field_offset(const std::string& class_name, const std::string& field);
+void clear_class_layouts();
+} // namespace ardio
 
 using namespace ardio;
 
@@ -16,6 +30,7 @@ namespace {
 
 TypePtr int_type() { return make_type(TypeKind::Int); }
 TypePtr char_type() { return make_type(TypeKind::Char); }
+TypePtr uint_type() { return make_type(TypeKind::UInt); }
 
 ExprPtr literal(long v, TypePtr t = int_type()) {
     auto e = std::make_unique<Expr>();
@@ -68,10 +83,86 @@ bool contains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
+ExprPtr index(ExprPtr base, ExprPtr subscript, TypePtr element = int_type()) {
+    auto e = std::make_unique<Expr>();
+    e->kind = ExprKind::Index;
+    e->lhs = std::move(base);
+    e->rhs = std::move(subscript);
+    e->type = element;                       // the element type, as sema fills it
+    return e;
+}
+
+ExprPtr member(ExprPtr object, const std::string& field, bool through_pointer,
+               TypePtr t = int_type()) {
+    auto e = std::make_unique<Expr>();
+    e->kind = ExprKind::Member;
+    e->lhs = std::move(object);
+    e->name = field;
+    e->through_pointer = through_pointer;
+    e->type = t;
+    return e;
+}
+
+ExprPtr string_literal(const std::string& text) {
+    auto e = std::make_unique<Expr>();
+    e->kind = ExprKind::StringLiteral;
+    e->str_value = text;
+    e->type = make_array(char_type(), static_cast<long>(text.size()) + 1);
+    return e;
+}
+
 // Runs one expression and hands back the assembly.
 std::string gen(const Expr& e, CodeGen& cg) {
     cg.gen_expr(e);
     return cg.out;
+}
+
+// The tests below assemble what they generate, which for division means the
+// helper routines have to be there too. The test binary may run from the build
+// directory or from the source root.
+bool read_runtime(const char* relative, std::string& out) {
+    static const char* const prefixes[] = {"", "../", "../../", "../../../"};
+    for (const char* prefix : prefixes) {
+        std::ifstream in(std::string(prefix) + relative, std::ios::binary);
+        if (!in) continue;
+        std::ostringstream buf;
+        buf << in.rdbuf();
+        out = buf.str();
+        return true;
+    }
+    return false;
+}
+
+// Assembles `text`, appending runtime/math.S so calls into it resolve. Returns
+// false only when the assembler rejects the result; a missing runtime file
+// makes the caller skip instead.
+bool assembles_with_math(const std::string& text, std::string& error) {
+    std::string math;
+    if (!read_runtime("runtime/math.S", math)) {
+        std::printf("  skip runtime/math.S not found relative to the cwd\n");
+        return true;
+    }
+    AssembleResult r = assemble(text + "\nrjmp __ardio_math_end\n" + math +
+                                "\n__ardio_math_end:\n");
+    error = r.error;
+    return r.ok;
+}
+
+// A two-field class the member tests share: { char flag; int value; }.
+ClassDecl point_class() {
+    ClassDecl c;
+    c.name = "Point";
+    c.fields.push_back({"flag", char_type(), 0});
+    c.fields.push_back({"value", int_type(), 1});
+    c.size = 3;
+    set_class_size(c.name, c.size);
+    return c;
+}
+
+TypePtr point_type() {
+    auto t = make_type(TypeKind::Class);
+    t->class_name = "Point";
+    return t;
 }
 
 } // namespace
@@ -336,13 +427,340 @@ TEST(codegen_conditional_expression) {
     CHECK(contains(text, "rjmp"));
 }
 
-TEST(codegen_string_literal_is_rejected) {
+// ---- division and modulo ----------------------------------------------------
+
+TEST(codegen_division_calls_the_signed_helper) {
     CodeGen cg;
-    auto e = std::make_unique<Expr>();
-    e->kind = ExprKind::StringLiteral;
-    e->str_value = "hi";
-    cg.gen_expr(*e);
+    std::string text = gen(*binary("/", literal(100), literal(7)), cg);
+    CHECK(cg.error.empty());
+    // The operands are already where the helper wants them.
+    CHECK(contains(text, "movw r22, r24"));
+    CHECK(contains(text, "call __ardio_divmod16"));
+    CHECK(!contains(text, "movw r24, r18"));      // '/' keeps the quotient
+}
+
+TEST(codegen_modulo_takes_the_remainder) {
+    CodeGen cg;
+    std::string text = gen(*binary("%", literal(100), literal(7)), cg);
+    CHECK(contains(text, "call __ardio_divmod16"));
+    CHECK(contains(text, "movw r24, r18"));
+}
+
+TEST(codegen_unsigned_division_calls_the_unsigned_helper) {
+    CodeGen cg;
+    std::string text = gen(*binary("/", literal(100, uint_type()),
+                                   literal(7, uint_type()), uint_type()), cg);
+    CHECK(contains(text, "call __ardio_udivmod16"));
+    CHECK(!contains(text, "call __ardio_divmod16"));
+}
+
+TEST(codegen_char_division_rewidens_the_result) {
+    CodeGen cg;
+    std::string text = gen(*binary("/", literal(9, char_type()),
+                                   literal(2, char_type()), char_type()), cg);
+    CHECK(contains(text, "call __ardio_divmod16"));
+    CHECK(contains(text, "sbrc r24, 7"));         // sign-extend back to 16 bits
+}
+
+TEST(codegen_division_output_assembles) {
+    CodeGen cg;
+    cg.gen_expr(*binary("%", binary("/", literal(1000), literal(3)), literal(7)));
+    CHECK(cg.error.empty());
+    std::string error;
+    bool ok = assembles_with_math(cg.out, error);
+    if (!ok) std::printf("    assembler said: %s\n", error.c_str());
+    CHECK(ok);
+}
+
+TEST(runtime_math_assembles_on_its_own) {
+    std::string math;
+    if (!read_runtime("runtime/math.S", math)) {
+        std::printf("  skip runtime/math.S not found relative to the cwd\n");
+        return;
+    }
+    AssembleResult r = assemble(math);
+    if (!r.ok) std::printf("    assembler said: %s\n", r.error.c_str());
+    CHECK(r.ok);
+    CHECK(r.error.empty());
+    CHECK(!r.code.empty());
+    CHECK_EQ(r.code.size() % 2, size_t(0));
+}
+
+// ---- subscripts -------------------------------------------------------------
+
+TEST(codegen_index_of_local_array_scales_by_element_size) {
+    CodeGen cg;
+    cg.set_local_offset("a", 4);
+    TypePtr array = make_array(int_type(), 8);
+    std::string text = gen(*index(identifier("a", array), literal(2)), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "movw r24, r28"));       // the frame pointer
+    CHECK(contains(text, "adiw r24, 4"));         // ... plus the array's slot
+    CHECK(contains(text, "lsl r24"));             // index * 2
+    CHECK(contains(text, "rol r25"));
+    CHECK(contains(text, "add r24, r22"));
+    CHECK(contains(text, "movw r30, r24"));       // read through Z
+    CHECK(contains(text, "ld r24, Z"));
+    CHECK(contains(text, "ldd r25, Z+1"));
+}
+
+TEST(codegen_index_of_char_array_does_not_scale) {
+    CodeGen cg;
+    cg.set_global_address("buf", 0x0300);
+    TypePtr array = make_array(char_type(), 16);
+    std::string text = gen(*index(identifier("buf", array), identifier("i"),
+                                  char_type()), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "ldi r24, 0"));          // low byte of 0x0300
+    CHECK(contains(text, "ldi r25, 3"));          // high byte
+    CHECK(!contains(text, "lsl r24"));
+    CHECK(contains(text, "ld r24, Z"));
+    CHECK(!contains(text, "ldd r25, Z+1"));       // one byte only
+    CHECK(contains(text, "sbrc r24, 7"));         // sign-extended for the caller
+}
+
+TEST(codegen_index_through_a_pointer_loads_the_pointer) {
+    CodeGen cg;
+    cg.set_local_offset("p", 2);
+    TypePtr pointer = make_pointer(int_type());
+    std::string text = gen(*index(identifier("p", pointer), literal(1)), cg);
+    CHECK(cg.error.empty());
+    // A pointer's value is the base address; no frame arithmetic at all.
+    CHECK(contains(text, "ldd r24, Y+2"));
+    CHECK(!contains(text, "movw r24, r28"));
+}
+
+TEST(codegen_index_with_odd_element_size_multiplies) {
+    CodeGen cg;
+    clear_class_layouts();
+    ClassDecl c = point_class();
+    set_class_layout(c);
+    cg.set_local_offset("pts", 1);
+    TypePtr array = make_array(point_type(), 4);
+    // pts[2].value -- an array of three-byte objects, so the subscript is
+    // scaled by MUL rather than by shifts.
+    std::string text = gen(*member(index(identifier("pts", array), literal(2),
+                                         point_type()), "value", false), cg);
+    CHECK(cg.error.empty());
+    CHECK_EQ(c.size, 3);
+    CHECK(contains(text, "ldi r22, 3"));
+    CHECK(contains(text, "mul r24, r22"));
+    CHECK(contains(text, "clr r1"));              // the zero register is restored
+    CHECK(contains(text, "adiw r24, 1"));         // the field within the element
+    CHECK(contains(text, "ld r24, Z"));
+}
+
+TEST(codegen_assignment_to_array_element) {
+    CodeGen cg;
+    cg.set_local_offset("a", 0);
+    TypePtr array = make_array(int_type(), 4);
+    auto e = assign("=", index(identifier("a", array), literal(3)), literal(9));
+    std::string text = gen(*e, cg);
+    CHECK(cg.error.empty());
+    // The value is computed first and parked while the address is worked out.
+    CHECK(contains(text, "ldi r24, 9"));
+    CHECK(contains(text, "movw r30, r24"));
+    CHECK(contains(text, "pop r25\npop r24\nst Z, r24\nstd Z+1, r25\n"));
+}
+
+TEST(codegen_array_name_decays_to_its_address) {
+    CodeGen cg;
+    cg.set_local_offset("a", 6);
+    TypePtr array = make_array(int_type(), 4);
+    std::string text = gen(*identifier("a", array), cg);
+    CHECK(text == "movw r24, r28\nadiw r24, 6\n");
+}
+
+TEST(codegen_index_output_assembles) {
+    CodeGen cg;
+    cg.set_local_offset("a", 2);
+    cg.set_local_offset("i", 10);
+    TypePtr array = make_array(int_type(), 8);
+    cg.gen_expr(*assign("=", index(identifier("a", array), identifier("i")),
+                        index(identifier("a", array), literal(0))));
+    CHECK(cg.error.empty());
+    AssembleResult r = assemble(cg.out);
+    if (!r.ok) std::printf("    assembler said: %s\n", r.error.c_str());
+    CHECK(r.ok);
+}
+
+// ---- address-of and dereference ---------------------------------------------
+
+TEST(codegen_address_of_local) {
+    CodeGen cg;
+    cg.set_local_offset("x", 5);
+    std::string text = gen(*unary("&", identifier("x"), false,
+                                  make_pointer(int_type())), cg);
+    CHECK(text == "movw r24, r28\nadiw r24, 5\n");
+}
+
+TEST(codegen_address_of_global) {
+    CodeGen cg;
+    cg.set_global_address("g", 0x0104);
+    std::string text = gen(*unary("&", identifier("g"), false,
+                                  make_pointer(int_type())), cg);
+    CHECK(text == "ldi r24, 4\nldi r25, 1\n");
+}
+
+TEST(codegen_dereference_reads_through_z) {
+    CodeGen cg;
+    cg.set_local_offset("p", 0);
+    auto e = unary("*", identifier("p", make_pointer(int_type())));
+    std::string text = gen(*e, cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "ldd r24, Y+0"));
+    CHECK(contains(text, "movw r30, r24"));
+    CHECK(contains(text, "ld r24, Z"));
+    CHECK(contains(text, "ldd r25, Z+1"));
+}
+
+TEST(codegen_assignment_through_a_dereference) {
+    CodeGen cg;
+    cg.set_local_offset("p", 0);
+    auto target = unary("*", identifier("p", make_pointer(char_type())), false,
+                        char_type());
+    std::string text = gen(*assign("=", std::move(target), literal(65)), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "st Z, r24"));
+    CHECK(!contains(text, "std Z+1, r25"));       // a char is one byte
+}
+
+TEST(codegen_address_of_a_literal_is_rejected) {
+    CodeGen cg;
+    cg.gen_expr(*unary("&", literal(7), false, make_pointer(int_type())));
     CHECK(!cg.error.empty());
+}
+
+TEST(codegen_pointer_output_assembles) {
+    CodeGen cg;
+    cg.set_local_offset("x", 1);
+    cg.set_local_offset("p", 3);
+    cg.gen_expr(*assign("=", unary("*", identifier("p", make_pointer(int_type()))),
+                        unary("&", identifier("x"), false,
+                              make_pointer(int_type()))));
+    CHECK(cg.error.empty());
+    AssembleResult r = assemble(cg.out);
+    if (!r.ok) std::printf("    assembler said: %s\n", r.error.c_str());
+    CHECK(r.ok);
+}
+
+// ---- members ----------------------------------------------------------------
+
+TEST(codegen_member_of_a_local_object) {
+    CodeGen cg;
+    clear_class_layouts();
+    set_class_layout(point_class());
+    cg.set_local_offset("p", 4);
+    std::string text = gen(*member(identifier("p", point_type()), "value", false), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "movw r24, r28"));
+    CHECK(contains(text, "adiw r24, 4"));         // the object
+    CHECK(contains(text, "adiw r24, 1"));         // the field's offset
+    CHECK(contains(text, "ld r24, Z"));
+}
+
+TEST(codegen_member_through_a_pointer_uses_the_pointer_value) {
+    CodeGen cg;
+    clear_class_layouts();
+    set_class_layout(point_class());
+    cg.set_local_offset("p", 0);
+    std::string text = gen(*member(identifier("p", make_pointer(point_type())),
+                                   "value", true), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "ldd r24, Y+0"));
+    CHECK(!contains(text, "movw r24, r28"));
+    CHECK(contains(text, "adiw r24, 1"));
+}
+
+TEST(codegen_first_field_needs_no_offset) {
+    CodeGen cg;
+    clear_class_layouts();
+    set_class_layout(point_class());
+    cg.set_local_offset("p", 0);
+    std::string text = gen(*member(identifier("p", point_type()), "flag", false,
+                                   char_type()), cg);
+    CHECK(contains(text, "movw r24, r28"));
+    CHECK(!contains(text, "adiw r24"));
+    CHECK_EQ(class_field_offset("Point", "flag"), 0);
+    CHECK_EQ(class_field_offset("Point", "value"), 1);
+}
+
+TEST(codegen_assignment_to_a_member) {
+    CodeGen cg;
+    clear_class_layouts();
+    set_class_layout(point_class());
+    cg.set_local_offset("p", 2);
+    std::string text = gen(*assign("=", member(identifier("p", point_type()),
+                                               "value", false), literal(12)), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "ldi r24, 12"));
+    CHECK(contains(text, "st Z, r24"));
+    CHECK(contains(text, "std Z+1, r25"));
+}
+
+TEST(codegen_unknown_member_is_rejected) {
+    CodeGen cg;
+    clear_class_layouts();
+    set_class_layout(point_class());
+    cg.set_local_offset("p", 0);
+    cg.gen_expr(*member(identifier("p", point_type()), "missing", false));
+    CHECK(!cg.error.empty());
+    CHECK_EQ(class_field_offset("Point", "missing"), -1);
+}
+
+TEST(codegen_member_output_assembles) {
+    CodeGen cg;
+    clear_class_layouts();
+    set_class_layout(point_class());
+    cg.set_local_offset("p", 1);
+    cg.gen_expr(*assign("=", member(identifier("p", point_type()), "value", false),
+                        member(identifier("p", point_type()), "flag", false,
+                               char_type())));
+    CHECK(cg.error.empty());
+    AssembleResult r = assemble(cg.out);
+    if (!r.ok) std::printf("    assembler said: %s\n", r.error.c_str());
+    CHECK(r.ok);
+}
+
+// ---- string literals --------------------------------------------------------
+
+TEST(codegen_string_literal_yields_an_address) {
+    CodeGen cg;
+    cg.next_global_address = 0x0200;
+    std::string text = gen(*string_literal("hi"), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "ldi r30, 0\nldi r31, 2\n"));   // Z = 0x0200
+    CHECK(contains(text, "ldi r18, 104\nst Z+, r18\n")); // 'h'
+    CHECK(contains(text, "ldi r18, 105\nst Z+, r18\n")); // 'i'
+    CHECK(contains(text, "ldi r18, 0\nst Z+, r18\n"));   // the terminator
+    CHECK(contains(text, "ldi r24, 0\nldi r25, 2\n"));   // the value: 0x0200
+}
+
+TEST(codegen_equal_string_literals_share_storage) {
+    CodeGen cg;
+    cg.next_global_address = 0x0200;
+    cg.gen_expr(*string_literal("ab"));
+    cg.gen_expr(*string_literal("ab"));
+    cg.gen_expr(*string_literal("cd"));
+    CHECK(cg.error.empty());
+    // "ab" is three bytes, so the second distinct literal starts after it.
+    CHECK_EQ(cg.next_global_address, 0x0206);
+}
+
+TEST(codegen_string_literal_as_a_call_argument_assembles) {
+    CodeGen cg;
+    auto call = std::make_unique<Expr>();
+    call->kind = ExprKind::Call;
+    call->name = "print";
+    call->type = int_type();
+    call->args.push_back(string_literal("hello, world"));
+    cg.gen_expr(*call);
+    cg.emit("print:");
+    cg.emit("ret");
+    CHECK(cg.error.empty());
+    AssembleResult r = assemble(cg.out);
+    if (!r.ok) std::printf("    assembler said: %s\n", r.error.c_str());
+    CHECK(r.ok);
 }
 
 TEST(codegen_unknown_operator_is_rejected) {
