@@ -335,7 +335,9 @@ int run_command(const Args& args) {
             }
         }
 
-        auto result = build_sketch(args.positional, *board, roots_for(cfg), "build/ardio");
+        // Deliberately not "build/" -- that is a common CMake output directory
+        // and "build/ardio" would collide with the ardio binary itself.
+        auto result = build_sketch(args.positional, *board, roots_for(cfg), ".ardio-build");
         if (!result.ok) {
             std::fprintf(stderr, "error: %s\n", result.error.c_str());
             return 1;

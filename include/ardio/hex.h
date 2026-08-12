@@ -16,4 +16,7 @@ struct HexImage {
 // Returns nullopt and sets `error` on malformed input.
 std::optional<HexImage> parse_intel_hex(std::string_view text, std::string& error);
 
+// Renders a flash image as Intel HEX, 16 bytes per record.
+std::string write_intel_hex(const std::vector<uint8_t>& data);
+
 } // namespace ardio

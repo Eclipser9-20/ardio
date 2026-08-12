@@ -7,6 +7,15 @@ Arduino boards.
 that `ardio` did not construct — there is no `arduino-cli`, `avrdude`, `esptool`, or
 `bossac` under the hood, and no third-party libraries anywhere in the build.
 
+It also ships its own **AVR assembler**, so `.S` sources are built entirely in-process:
+
+```sh
+ardio push examples/blink.S     # no external toolchain required
+```
+
+C and C++ sketches still need an AVR compiler, which `ardio toolchain` can fetch or
+build for you. Assembly needs nothing at all.
+
 **Status:** early. The AVR upload path (ATmega328P over STK500v1) works end to end.
 See [Roadmap](#roadmap).
 

@@ -35,3 +35,25 @@ TEST(hex_rejects_missing_eof_record) {
     auto img = ardio::parse_intel_hex(":03000000C0FFEE50\n", err);
     CHECK(!img.has_value());
 }
+
+TEST(hex_writer_round_trips_through_the_parser) {
+    std::vector<uint8_t> data;
+    for (int i = 0; i < 300; ++i) data.push_back(uint8_t(i * 7));
+
+    std::string text = ardio::write_intel_hex(data);
+    std::string err;
+    auto back = ardio::parse_intel_hex(text, err);
+
+    CHECK(back.has_value());
+    CHECK(err.empty());
+    CHECK_EQ(back->data.size(), data.size());
+    bool identical = back->data == data;
+    CHECK(identical);
+}
+
+TEST(hex_writer_emits_a_valid_first_record_and_eof) {
+    // 4 bytes at address 0: ":04000000" + data + checksum
+    std::string text = ardio::write_intel_hex({0x25, 0x9A, 0x2D, 0x98});
+    CHECK(text.rfind(":04000000259A2D98", 0) == 0);
+    CHECK(text.find(":00000001FF") != std::string::npos);
+}

@@ -31,6 +31,7 @@ add_library(libardio STATIC
     src/toolchain/search.cpp
     src/toolchain/fetch.cpp
     src/toolchain/build_toolchain.cpp
+    src/avr/assembler.cpp
     src/build/compile.cpp
     src/cli/args.cpp
     src/cli/commands.cpp
@@ -78,6 +79,7 @@ add_executable(ardio_tests
     tests/test_cli_args.cpp
     tests/test_fetch.cpp
     tests/test_toolchain_build.cpp
+    tests/test_avr_assembler.cpp
 )
 target_link_libraries(ardio_tests PRIVATE libardio)
 target_include_directories(ardio_tests PRIVATE tests)

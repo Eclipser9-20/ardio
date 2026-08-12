@@ -94,4 +94,34 @@ std::optional<HexImage> parse_intel_hex(std::string_view text, std::string& erro
     return img;
 }
 
+std::string write_intel_hex(const std::vector<uint8_t>& data) {
+    static const char* digits = "0123456789ABCDEF";
+    auto emit = [&](std::string& s, uint8_t b) {
+        s += digits[b >> 4];
+        s += digits[b & 0x0F];
+    };
+
+    std::string out;
+    const size_t per_record = 16;
+    for (size_t offset = 0; offset < data.size(); offset += per_record) {
+        size_t len = data.size() - offset;
+        if (len > per_record) len = per_record;
+
+        out += ':';
+        int sum = int(len) + int((offset >> 8) & 0xFF) + int(offset & 0xFF);  // type 00 adds 0
+        emit(out, uint8_t(len));
+        emit(out, uint8_t((offset >> 8) & 0xFF));
+        emit(out, uint8_t(offset & 0xFF));
+        emit(out, 0x00);
+        for (size_t i = 0; i < len; ++i) {
+            emit(out, data[offset + i]);
+            sum += data[offset + i];
+        }
+        emit(out, uint8_t((-sum) & 0xFF));  // two's-complement checksum
+        out += '\n';
+    }
+    out += ":00000001FF\n";
+    return out;
+}
+
 } // namespace ardio
