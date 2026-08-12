@@ -16,14 +16,14 @@ add_compile_options(-Wno-unused-command-line-argument)
 add_library(libardio STATIC)
 set_target_properties(libardio PROPERTIES OUTPUT_NAME ardio)
 target_include_directories(libardio PUBLIC include)
-target_sources(libardio PRIVATE src/hex.cpp src/board.cpp src/protocol/stk500v1.cpp)
+target_sources(libardio PRIVATE src/hex.cpp src/board.cpp src/protocol/stk500v1.cpp src/protocol/programmer.cpp)
 
 if(APPLE)
     target_sources(libardio PRIVATE src/platform/macos/serial_macos.cpp)
     target_link_libraries(libardio PUBLIC "-framework IOKit" "-framework CoreFoundation")
 endif()
 
-add_executable(ardio_tests tests/main.cpp tests/test_harness.cpp tests/test_hex.cpp tests/test_board.cpp tests/test_stk500v1.cpp tests/test_serial_fake.cpp)
+add_executable(ardio_tests tests/main.cpp tests/test_harness.cpp tests/test_hex.cpp tests/test_board.cpp tests/test_stk500v1.cpp tests/test_serial_fake.cpp tests/test_programmer.cpp)
 target_link_libraries(ardio_tests PRIVATE libardio)
 target_include_directories(ardio_tests PRIVATE tests)
 
