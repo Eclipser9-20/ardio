@@ -2,6 +2,8 @@
 #include "ardio/build.h"
 #include "ardio/board.h"
 #include <algorithm>
+#include <cstdio>
+#include <fstream>
 #include <string>
 
 namespace {
@@ -42,11 +44,55 @@ TEST(objcopy_command_produces_ihex) {
 }
 
 TEST(build_reports_missing_toolchain_with_every_root_searched) {
+    // A source ardio's own compiler cannot handle falls through to an external
+    // toolchain; when that is absent too, the error must name every root.
+    std::string path = std::string(ARDIO_TEST_TMP) + "/unsupported_source.cpp";
+    {
+        std::ofstream out(path);
+        // Division has no AVR instruction and no runtime helper in tree yet,
+        // so this is a genuine limitation rather than a contrived one.
+        out << "int main() { int a = 10; int b = 2; return a / b; }\n";
+    }
+
     const ardio::Board* nano = ardio::find_board_by_id("nano");
-    auto result = ardio::build_sketch("blink.cpp", *nano,
-                                      {"/nonexistent-a", "/nonexistent-b"}, "/tmp");
+    auto result = ardio::build_sketch(path, *nano,
+                                      {"/nonexistent-a", "/nonexistent-b"},
+                                      ARDIO_TEST_TMP);
+    std::remove(path.c_str());
+
     CHECK(!result.ok);
     CHECK(result.error.find("avr-g++") != std::string::npos);
     CHECK(result.error.find("/nonexistent-a") != std::string::npos);
     CHECK(result.error.find("/nonexistent-b") != std::string::npos);
+    // The message must also say why ardio's own compiler declined, which is
+    // the more useful half of the diagnosis.
+    CHECK(result.error.find("could not build") != std::string::npos);
+}
+
+TEST(build_compiles_a_c_source_with_the_in_house_compiler) {
+    // No external toolchain involved: ardio compiles, assembles and writes hex.
+    std::string path = std::string(ARDIO_TEST_TMP) + "/tiny_program.cpp";
+    {
+        std::ofstream out(path);
+        out << "int main() {\n"
+               "  int total = 0;\n"
+               "  for (int i = 0; i < 4; i = i + 1) { total = total + i; }\n"
+               "  return total;\n"
+               "}\n";
+    }
+
+    const ardio::Board* nano = ardio::find_board_by_id("nano");
+    auto result = ardio::build_sketch(path, *nano, {"/nonexistent-root"}, ARDIO_TEST_TMP);
+    std::remove(path.c_str());
+
+    if (!result.ok) std::printf("    (build said: %s)\n", result.error.c_str());
+    CHECK(result.ok);
+    CHECK(result.hex_path.find(".hex") != std::string::npos);
+
+    std::ifstream hex(result.hex_path);
+    CHECK(hex.good());
+    std::string first;
+    std::getline(hex, first);
+    CHECK(!first.empty());
+    CHECK(first[0] == ':');          // a real Intel HEX record
 }

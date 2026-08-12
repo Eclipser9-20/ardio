@@ -215,9 +215,11 @@ delayMicroseconds_done:
         ret
 
 
+; ARDIO_FALLBACK_BEGIN
 ; -------------------------------------------------------------- sketch ---
-; Fallback definitions so this file assembles and links on its own. A sketch
-; provides its own setup/loop; when it does, these two are replaced.
+; Fallback definitions so this file assembles on its own. Everything below the
+; ARDIO_FALLBACK_BEGIN marker is dropped when this file is linked against a
+; sketch, which supplies its own setup and loop.
 setup:
         ret
 loop:

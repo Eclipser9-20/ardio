@@ -45,6 +45,11 @@ public:
     // Implemented in the statement generator.
     void gen_stmt(const Stmt& s);
 
+    // Emits a complete function: label, prologue, body, epilogue. Assigns
+    // frame slots for parameters and locals, and spills incoming argument
+    // registers into the frame.
+    void gen_function(const Function& f);
+
     // Implemented in the class/method generator.
     void gen_class_method(const ClassDecl& c, const Function& f);
 

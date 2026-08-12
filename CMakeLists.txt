@@ -39,6 +39,8 @@ add_library(libardio STATIC
     src/avr/sema.cpp
     src/avr/codegen_expr.cpp
     src/avr/sketch.cpp
+    src/avr/codegen_stmt.cpp
+    src/avr/compiler.cpp
     src/build/compile.cpp
     src/cli/args.cpp
     src/cli/commands.cpp
@@ -97,9 +99,11 @@ add_executable(ardio_tests
     tests/test_runtime_motors.cpp
     tests/test_runtime_io.cpp
     tests/test_sketch.cpp
+    tests/test_compiler.cpp
 )
 target_link_libraries(ardio_tests PRIVATE libardio)
 target_include_directories(ardio_tests PRIVATE tests)
+target_compile_definitions(ardio_tests PRIVATE ARDIO_TEST_TMP="${CMAKE_BINARY_DIR}")
 
 enable_testing()
 add_test(NAME unit COMMAND ardio_tests)
