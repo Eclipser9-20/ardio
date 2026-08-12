@@ -95,11 +95,12 @@ int cmd_doctor() {
     for (const PortInfo& p : ports)
         std::printf("  %-28s %s\n", p.device.c_str(), usb_id_string(p).c_str());
 
+    std::printf("\ncompiler:\n  ardio's own AVR compiler handles .S, .c, .cpp and .ino\n");
     if (missing)
-        std::printf("\n%d tool(s) missing. ardio can flash prebuilt .hex files, "
-                    "but cannot compile sketches until an AVR toolchain is installed.\n",
-                    missing);
-    return missing == 0 ? 0 : 1;
+        std::printf("  an external toolchain is used only for sources ardio cannot\n"
+                    "  compile yet (floating point, 32-bit arithmetic); install one\n"
+                    "  with 'ardio toolchain fetch avr' if you need those.\n");
+    return 0;
 }
 
 std::string tools_dir() {
