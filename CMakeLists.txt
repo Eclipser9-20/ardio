@@ -92,6 +92,7 @@ add_executable(ardio_tests
     tests/test_avr_assembler.cpp
     tests/test_lexer.cpp
     tests/test_preprocess.cpp
+    tests/test_include.cpp
     tests/test_runtime_core.cpp
     tests/test_parser.cpp
     tests/test_type.cpp

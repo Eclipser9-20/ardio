@@ -1,5 +1,7 @@
 #include "ardio/avr/parser.h"
+#include "ardio/avr/sema.h"
 
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -111,9 +113,13 @@ private:
             return true;
         if (t.kind == Tok::Identifier) {
             if (is_base_type_word(t.text) || is_type_qualifier(t.text)) return true;
-            return classes_.count(t.text) != 0;
+            return classes_.count(t.text) != 0 || enums_.count(t.text) != 0;
         }
         return false;
+    }
+
+    bool is_named_type(const std::string& w) const {
+        return classes_.count(w) != 0 || enums_.count(w) != 0;
     }
 
     // True when the tokens at the cursor begin a declaration rather than an
@@ -153,6 +159,16 @@ private:
             if (!seen_base && (w == "void" || w == "bool" || w == "char" || w == "int")) {
                 seen_base = true;
                 class_name = w;
+                ++pos_;
+                continue;
+            }
+            if (!seen_base && !seen_unsigned && !seen_signed && !seen_long && !seen_short &&
+                enums_.count(w)) {
+                // An enumeration has no distinct kind in this AST; it behaves as
+                // a plain int, which is the size its enumerators are stored in.
+                seen_base = true;
+                class_name = w;
+                base = make_type(TypeKind::Int);
                 ++pos_;
                 continue;
             }
@@ -278,6 +294,7 @@ private:
                 fn.line = decl_line;
                 expect_punct("(", "to open a parameter list");
                 fn.params = parse_params();
+                register_defaults(fn);
                 skip_member_init_list();
                 finish_function_body(fn);
                 owner->methods.push_back(std::move(fn));
@@ -311,6 +328,7 @@ private:
                 else if (owner) fn.owner_class = owner->name;
                 ++pos_;
                 fn.params = parse_params();
+                register_defaults(fn);
                 while (is_word("const") || is_word("override") || is_word("noexcept")) ++pos_;
                 skip_member_init_list();
                 finish_function_body(fn);
@@ -332,8 +350,12 @@ private:
                 Field field;
                 field.name = name;
                 field.type = type;
-                // A member initialiser is parsed and discarded; layout owns fields.
-                if (match_punct("=")) parse_assignment();
+                // A member initialiser is parsed and discarded; layout owns
+                // fields. It can still fix an unsized array's length.
+                if (match_punct("=")) {
+                    ExprPtr init = parse_initialiser();
+                    apply_initialiser(field.type, init, decl_line);
+                }
                 owner->fields.push_back(std::move(field));
             } else {
                 Global g;
@@ -342,6 +364,7 @@ private:
                 g.line = decl_line;
                 if (match_punct("=")) {
                     g.init = parse_initialiser();
+                    apply_initialiser(g.type, g.init, decl_line);
                 } else if (match_punct("(")) {
                     if (!is_punct(")")) {
                         for (;;) {
@@ -376,7 +399,7 @@ private:
             return true;
         if (t.kind == Tok::Identifier && (is_base_type_word(t.text) || is_type_qualifier(t.text)))
             return true;
-        if (t.kind == Tok::Identifier && classes_.count(t.text)) {
+        if (t.kind == Tok::Identifier && is_named_type(t.text)) {
             size_t k = 2;
             while (is_punct("*", k) || is_punct("&", k)) ++k;
             if (k > 2) return true;
@@ -385,7 +408,19 @@ private:
         return false;
     }
 
+    // Filled by parse_params(), consumed by register_defaults() once the
+    // owning function's name and parameter count are known.
+    std::vector<std::pair<size_t, long>> pending_defaults_;
+
+    void register_defaults(const Function& fn) {
+        for (const auto& d : pending_defaults_)
+            set_default_argument(fn.owner_class, fn.name, fn.params.size(),
+                                 d.first, d.second);
+        pending_defaults_.clear();
+    }
+
     std::vector<Param> parse_params() {
+        pending_defaults_.clear();
         std::vector<Param> params;
         if (match_punct(")")) return params;
         if (is_word("void") && is_punct(")", 1)) {
@@ -397,7 +432,18 @@ private:
             p.type = parse_type();
             if (peek().kind == Tok::Identifier) p.name = advance().text;
             p.type = parse_array_suffix(p.type);
-            if (match_punct("=")) parse_assignment();   // default argument: ignored
+            if (match_punct("=")) {
+                // Default arguments are recorded in semantic analysis's side
+                // table: `Param` has no field for one, and dropping them here
+                // made every parameter mandatory, which the Arduino API relies
+                // on not being the case (attach(pin, min, max), print(v, base)).
+                ExprPtr value = parse_initialiser();
+                long folded = 0;
+                if (value && fold_constant(*value, folded))
+                    pending_defaults_.push_back({params.size(), folded});
+                else
+                    error("a default argument must be a constant integer");
+            }
             params.push_back(std::move(p));
             if (match_punct(",")) continue;
             break;
@@ -463,16 +509,65 @@ private:
         program.classes.push_back(std::move(decl));
     }
 
+    // Evaluates the small constant expressions an enumerator may use: literals,
+    // earlier enumerators of any enumeration seen so far, and the usual integer
+    // operators over those. Anything else is not a constant here.
+    bool fold_constant(const Expr& e, long& out) const {
+        switch (e.kind) {
+            case ExprKind::IntLiteral:
+                out = e.int_value;
+                return true;
+            case ExprKind::Identifier: {
+                auto it = enum_values_.find(e.name);
+                if (it == enum_values_.end()) return false;
+                out = it->second;
+                return true;
+            }
+            case ExprKind::Unary: {
+                long v = 0;
+                if (e.is_postfix || !e.lhs || !fold_constant(*e.lhs, v)) return false;
+                if (e.op == "-") { out = -v; return true; }
+                if (e.op == "+") { out = v; return true; }
+                if (e.op == "~") { out = ~v; return true; }
+                if (e.op == "!") { out = v ? 0 : 1; return true; }
+                return false;
+            }
+            case ExprKind::Binary: {
+                long a = 0, b = 0;
+                if (!e.lhs || !e.rhs) return false;
+                if (!fold_constant(*e.lhs, a) || !fold_constant(*e.rhs, b)) return false;
+                const std::string& op = e.op;
+                if (op == "+") { out = a + b; return true; }
+                if (op == "-") { out = a - b; return true; }
+                if (op == "*") { out = a * b; return true; }
+                if (op == "/") { if (b == 0) return false; out = a / b; return true; }
+                if (op == "%") { if (b == 0) return false; out = a % b; return true; }
+                if (op == "<<") { if (b < 0 || b > 62) return false; out = a << b; return true; }
+                if (op == ">>") { if (b < 0 || b > 62) return false; out = a >> b; return true; }
+                if (op == "&") { out = a & b; return true; }
+                if (op == "|") { out = a | b; return true; }
+                if (op == "^") { out = a ^ b; return true; }
+                return false;
+            }
+            default:
+                return false;
+        }
+    }
+
     // Enumerators become integer globals so the rest of the compiler can treat
     // them as ordinary named constants.
     void parse_enum(Program& program) {
         ++pos_;                                             // enum
-        if (is_word("class") || is_word("struct")) ++pos_;
-        if (peek().kind == Tok::Identifier && !is_punct("{")) ++pos_;
+        if (is_word("class") || is_word("struct")) ++pos_;  // scoped enum
+        if (peek().kind == Tok::Identifier) {
+            // The tag names a usable type from here on: "State s = Idle;".
+            enums_.insert(advance().text);
+        }
         if (is_punct(":")) {                                // fixed underlying type
             ++pos_;
             parse_type();
         }
+        if (match_punct(";")) return;                       // opaque declaration
         expect_punct("{", "to open an enum body");
         long next = 0;
         while (!is_punct("}")) {
@@ -481,10 +576,12 @@ private:
             std::string name = expect_identifier("an enumerator name");
             if (match_punct("=")) {
                 ExprPtr value = parse_assignment();
-                if (value->kind != ExprKind::IntLiteral)
+                long folded = 0;
+                if (!fold_constant(*value, folded))
                     error("expected a constant integer enumerator value");
-                next = value->int_value;
+                next = folded;
             }
+            enum_values_[name] = next;
             Global g;
             g.name = name;
             g.type = make_type(TypeKind::Int);
@@ -579,6 +676,7 @@ private:
             stmt->var_type = parse_array_suffix(type);
             if (match_punct("=")) {
                 stmt->var_init = parse_initialiser();
+                apply_initialiser(stmt->var_type, stmt->var_init, decl_line);
             } else if (match_punct("(")) {
                 if (!is_punct(")")) {
                     for (;;) {
@@ -599,24 +697,73 @@ private:
         return block;
     }
 
-    // Brace initialisers are accepted for arrays and aggregates; only the first
-    // element survives, which is all this AST can express.
+    // A brace initialiser becomes an InitList whose elements are in `args`, so a
+    // nested aggregate such as "{{1,2},{3,4}}" keeps every element.
     ExprPtr parse_initialiser() {
         if (!is_punct("{")) return parse_assignment();
         size_t brace_line = line();
         ++pos_;
-        ExprPtr first;
+        auto list = make_expr(ExprKind::InitList, brace_line);
         if (!is_punct("}")) {
             for (;;) {
-                ExprPtr element = parse_initialiser();
-                if (!first) first = std::move(element);
+                if (at_end()) error("expected '}' to close a brace initialiser");
+                list->args.push_back(parse_initialiser());
                 if (!match_punct(",")) break;
-                if (is_punct("}")) break;
+                if (is_punct("}")) break;              // trailing comma
             }
         }
         expect_punct("}", "to close a brace initialiser");
-        if (!first) first = make_int(0, brace_line);
-        return first;
+        return list;
+    }
+
+    // Fills in an array length written as "[]" from the initialiser, and checks
+    // that a written length is large enough to hold every element. Nested
+    // dimensions are deduced from the first sub-list, as in C++.
+    void apply_initialiser(TypePtr& type, ExprPtr& init, size_t decl_line) {
+        if (!type || !init) return;
+
+        if (type->kind == TypeKind::Array) {
+            if (init->kind == ExprKind::StringLiteral) {
+                long needed = static_cast<long>(init->str_value.size()) + 1;
+                if (type->array_length == 0) type->array_length = needed;
+                else if (type->array_length < needed - 1)
+                    error_at(decl_line, "string initialiser is longer than the array");
+                return;
+            }
+            if (init->kind != ExprKind::InitList)
+                error_at(decl_line, "an array needs a brace initialiser");
+            long count = static_cast<long>(init->args.size());
+            if (type->array_length == 0) type->array_length = count;
+            else if (count > type->array_length)
+                error_at(decl_line, "too many initialisers for an array of " +
+                                        std::to_string(type->array_length));
+            if (type->pointee && !init->args.empty()) {
+                // Deduce inner dimensions from the first row; the elements are
+                // checked one by one so a short or long row is reported.
+                TypePtr element = type->pointee;
+                for (auto& row : init->args) apply_initialiser(element, row, decl_line);
+            }
+            return;
+        }
+
+        if (init->kind != ExprKind::InitList) return;
+
+        if (type->kind == TypeKind::Class) return;   // aggregate member init: left as is
+
+        // A scalar written as "int x = {1};" holds exactly one value.
+        if (init->args.empty()) {
+            init = make_int(0, init->line);
+            return;
+        }
+        if (init->args.size() > 1)
+            error_at(decl_line, "too many initialisers for a scalar variable");
+        if (init->args[0]->kind == ExprKind::InitList)
+            error_at(decl_line, "a scalar variable cannot take a nested brace initialiser");
+        init = std::move(init->args[0]);
+    }
+
+    [[noreturn]] void error_at(size_t l, const std::string& what) const {
+        throw ParseError("line " + std::to_string(l) + ": " + what);
     }
 
     StmtPtr parse_if() {
@@ -1005,6 +1152,12 @@ private:
                 ++k;
                 continue;
             }
+            if (!saw_builtin && t.kind == Tok::Identifier && enums_.count(t.text)) {
+                // "(State)x" casts to an int-sized value, like any builtin.
+                saw_builtin = true;
+                ++k;
+                break;
+            }
             if (!saw_builtin && t.kind == Tok::Identifier && classes_.count(t.text)) {
                 ++k;
                 // A class-typed cast must be to a pointer: "(Foo*)p".
@@ -1166,6 +1319,8 @@ private:
     size_t pos_ = 0;
     size_t switch_temps_ = 0;
     std::set<std::string> classes_;
+    std::set<std::string> enums_;
+    std::map<std::string, long> enum_values_;
 };
 
 } // namespace

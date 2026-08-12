@@ -11,7 +11,20 @@
 #include <vector>
 
 namespace ardio {
+
+// Defined beside the expression generator: conversion between the 8/16-bit
+// home (r24:r25) and the 32-bit one (r22..r25), and the width-aware test that
+// sets Z from a value without destroying it.
+void gen_convert(CodeGen& g, int from, int to, bool from_signed, bool to_signed);
+void gen_test_value(CodeGen& g, int size);
+
 namespace {
+
+// The width and signedness of the function currently being generated, so a
+// `return` can convert its value to the declared return type rather than
+// handing back whatever width the expression happened to have.
+int& current_return_size() { static int size = 2; return size; }
+bool& current_return_signed() { static bool is_signed = true; return is_signed; }
 
 // Breaks and continues need to know where the enclosing loop starts and ends.
 struct LoopLabels {
@@ -29,6 +42,15 @@ std::vector<LoopLabels>& loop_stack() {
 std::string& current_epilogue() {
     static std::string label;
     return label;
+}
+
+// The register width a declared type occupies, matching CodeGen::expr_size():
+// a long is four bytes, everything else is one or two.
+int type_width(const TypePtr& t) {
+    if (!t) return 2;
+    if (t->kind == TypeKind::Long || t->kind == TypeKind::ULong) return 4;
+    int n = t->size();
+    return n < 1 ? 1 : (n > 2 ? 2 : n);
 }
 
 // Walks a statement tree assigning frame slots to every local declaration.
@@ -99,9 +121,18 @@ void CodeGen::gen_stmt(const Stmt& s) {
         // initialiser needs code here.
         if (s.var_init) {
             gen_expr(*s.var_init);
-            int size = s.var_type ? s.var_type->size() : 2;
-            if (size > 2) { fail("line " + std::to_string(s.line) +
-                                 ": only 8- and 16-bit locals are supported"); return; }
+            if (failed()) return;
+            int size = type_width(s.var_type);
+            int declared = s.var_type ? s.var_type->size() : 2;
+            if (declared != size) {
+                fail("line " + std::to_string(s.line) +
+                     ": only 8-, 16- and 32-bit locals are supported");
+                return;
+            }
+            int from = expr_size(*s.var_init);
+            if (from == 4 || size == 4)
+                gen_convert(*this, from, size, expr_is_signed(*s.var_init),
+                            s.var_type ? s.var_type->is_signed : true);
             store_to_variable(s.var_name, size);
         }
         break;
@@ -110,10 +141,9 @@ void CodeGen::gen_stmt(const Stmt& s) {
     case StmtKind::If: {
         std::string else_label = new_label("else");
         std::string end_label = new_label("endif");
-        if (s.expr) gen_expr(*s.expr);
         // A value of zero is false; anything else is true.
-        emit("    cp   r24, r1");
-        emit("    cpc  r25, r1");
+        if (s.expr) { gen_expr(*s.expr); gen_test_value(*this, expr_size(*s.expr)); }
+        else gen_test_value(*this, 2);
         emit("    breq " + (s.else_branch ? else_label : end_label));
         if (s.then_branch) gen_stmt(*s.then_branch);
         if (s.else_branch) {
@@ -129,9 +159,8 @@ void CodeGen::gen_stmt(const Stmt& s) {
         std::string top = new_label("while");
         std::string done = new_label("endwhile");
         emit_label(top);
-        if (s.expr) gen_expr(*s.expr);
-        emit("    cp   r24, r1");
-        emit("    cpc  r25, r1");
+        if (s.expr) { gen_expr(*s.expr); gen_test_value(*this, expr_size(*s.expr)); }
+        else gen_test_value(*this, 2);
         emit("    breq " + done);
         loop_stack().push_back({top, done});
         if (s.then_branch) gen_stmt(*s.then_branch);
@@ -149,8 +178,7 @@ void CodeGen::gen_stmt(const Stmt& s) {
         emit_label(top);
         if (s.expr) {                       // an absent condition means "true"
             gen_expr(*s.expr);
-            emit("    cp   r24, r1");
-            emit("    cpc  r25, r1");
+            gen_test_value(*this, expr_size(*s.expr));
             emit("    breq " + done);
         }
         loop_stack().push_back({step_label, done});
@@ -164,7 +192,14 @@ void CodeGen::gen_stmt(const Stmt& s) {
     }
 
     case StmtKind::Return:
-        if (s.expr) gen_expr(*s.expr);      // value is already in r24:r25
+        if (s.expr) {
+            gen_expr(*s.expr);                  // value is already in its ABI home
+            if (failed()) return;
+            int from = expr_size(*s.expr);
+            if (from == 4 || current_return_size() == 4)
+                gen_convert(*this, from, current_return_size(),
+                            expr_is_signed(*s.expr), current_return_signed());
+        }
         emit("    rjmp " + current_epilogue());
         break;
 
@@ -208,6 +243,8 @@ void CodeGen::gen_function(const Function& f) {
 
     std::string epilogue = new_label("epilogue");
     current_epilogue() = epilogue;
+    current_return_size() = f.return_type ? type_width(f.return_type) : 2;
+    current_return_signed() = f.return_type ? f.return_type->is_signed : true;
 
     emit("");
     emit("; ---- " + f.name + " ----");
@@ -238,15 +275,22 @@ void CodeGen::gen_function(const Function& f) {
             return;
         }
         int size = f.params[i].type ? f.params[i].type->size() : 2;
-        if (size > 2) {
-            fail("function '" + f.name + "': only 8- and 16-bit parameters are supported");
+        if (size != type_width(f.params[i].type)) {
+            fail("function '" + f.name +
+                 "': only 8-, 16- and 32-bit parameters are supported");
             return;
         }
         int offset = local_offset(f.params[i].name);
-        emit("    std  Y+" + std::to_string(offset) + ", r" + std::to_string(reg));
-        if (size == 2)
-            emit("    std  Y+" + std::to_string(offset + 1) + ", r" +
-                 std::to_string(reg + 1));
+        if (offset + size - 1 > 63) {
+            fail("function '" + f.name + "': parameter '" + f.params[i].name +
+                 "' lies beyond the frame pointer's reach");
+            return;
+        }
+        // A 32-bit argument arrives in four consecutive registers, low byte
+        // first, and is spilled into four consecutive frame bytes.
+        for (int b = 0; b < size; ++b)
+            emit("    std  Y+" + std::to_string(offset + b) + ", r" +
+                 std::to_string(reg + b));
     }
 
     gen_stmt(*f.body);

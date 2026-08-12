@@ -12,7 +12,9 @@
 #include "ardio/avr/sema.h"
 #include "ardio/avr/token.h"
 
+#include <cctype>
 #include <map>
+#include <string>
 
 namespace ardio {
 
@@ -29,12 +31,15 @@ void clear_class_layouts();
 
 namespace {
 
-// Preprocessor directives are not handled by this compiler yet: there is a
-// full preprocessor in tree, but ardio's own Arduino headers use C++ features
-// the code generator cannot compile, so including them would fail later and
-// less clearly. Directives are blanked here, preserving line numbers, and a
-// sketch that actually depended on a header then fails with an honest
-// "undeclared identifier" naming the symbol it was missing.
+// Blanks preprocessor directives, preserving line numbers.
+//
+// This is the fallback path only. Normally compile_avr() is handed include
+// paths and runs the real preprocessor, so #include and #define work. When
+// preprocessing cannot even be attempted -- a header that is nowhere on the
+// include path, a malformed directive -- the source is compiled once more with
+// directives blanked, so a sketch that named a header but never used anything
+// from it still builds. If that attempt fails too, the preprocessor's own
+// error leads the diagnostic, because it names the header.
 std::string blank_directives(std::string_view source) {
     std::string out;
     out.reserve(source.size());
@@ -54,6 +59,83 @@ std::string blank_directives(std::string_view source) {
         i = end + 1;
     }
     return out;
+}
+
+// The names of every header the source #includes directly, in source order.
+// Used only to sharpen a diagnostic, so conditionals are not evaluated here:
+// a header is reported on only if it genuinely fails to compile on its own.
+std::vector<std::string> included_headers(std::string_view source) {
+    std::vector<std::string> names;
+    size_t i = 0;
+    while (i <= source.size()) {
+        size_t end = source.find('\n', i);
+        if (end == std::string_view::npos) end = source.size();
+        std::string_view line = source.substr(i, end - i);
+        i = end + 1;
+
+        size_t p = line.find_first_not_of(" \t");
+        if (p == std::string_view::npos || line[p] != '#') continue;
+        p = line.find_first_not_of(" \t", p + 1);
+        if (p == std::string_view::npos) continue;
+        if (line.compare(p, 7, "include") != 0) continue;
+        p = line.find_first_not_of(" \t", p + 7);
+        if (p == std::string_view::npos) continue;
+
+        char close = line[p] == '<' ? '>' : (line[p] == '"' ? '"' : '\0');
+        if (close == '\0') continue;
+        size_t stop = line.find(close, p + 1);
+        if (stop == std::string_view::npos) continue;
+        names.emplace_back(line.substr(p + 1, stop - p - 1));
+    }
+    return names;
+}
+
+// Compiles one header on its own, with a trivial entry point supplied, to find
+// out whether it is the reason a sketch failed to build.
+bool header_compiles(const std::string& name,
+                     const std::vector<std::string>& include_paths,
+                     std::string& error) {
+    std::string probe = "#include <" + name + ">\nvoid setup() {}\nvoid loop() {}\n";
+    PreprocessResult pp = preprocess(probe, include_paths);
+    if (!pp.ok) return true;   // not found here: not this header's fault to report
+    CompileResult r = compile_avr(pp.text);
+    if (r.ok) return true;
+    error = r.error;
+    return false;
+}
+
+// Quotes the line an error points at. After preprocessing, line numbers count
+// lines of the whole translation unit -- sketch plus every header pulled into
+// it -- so the number alone can be misleading. Showing the line itself makes
+// the diagnostic self-explanatory regardless.
+std::string quote_error_line(const std::string& error, const std::string& unit) {
+    const std::string tag = "line ";
+    size_t p = error.find(tag);
+    if (p != 0) return {};
+    p += tag.size();
+    size_t n = 0;
+    size_t digits = 0;
+    while (p + digits < error.size() &&
+           std::isdigit(static_cast<unsigned char>(error[p + digits]))) {
+        n = n * 10 + size_t(error[p + digits] - '0');
+        ++digits;
+    }
+    if (digits == 0 || n == 0) return {};
+
+    size_t start = 0;
+    for (size_t i = 1; i < n; ++i) {
+        start = unit.find('\n', start);
+        if (start == std::string::npos) return {};
+        ++start;
+    }
+    size_t end = unit.find('\n', start);
+    std::string text = unit.substr(start, end == std::string::npos ? end : end - start);
+    size_t first = text.find_first_not_of(" \t");
+    if (first == std::string::npos) return {};
+    text = text.substr(first);
+    return "\n  " + std::to_string(n) + " | " + text +
+           "\n(line numbers count the whole translation unit: the sketch plus "
+           "every header it includes)";
 }
 
 // Folds a global's initialiser to a constant. Globals are stored before the
@@ -115,12 +197,38 @@ bool has_function(const Program& p, const std::string& name) {
 CompileResult compile_avr(std::string_view source,
                           const std::vector<std::string>& include_paths) {
     PreprocessResult pp = preprocess(std::string(source), include_paths);
+
     if (!pp.ok) {
+        // Preprocessing did not even get off the ground. Try once more with
+        // directives blanked, so a sketch that names a header it never actually
+        // uses still builds -- but if that fails too, lead with the
+        // preprocessor's message, which names the header.
+        CompileResult fallback = compile_avr(source);
+        if (fallback.ok) return fallback;
+
         CompileResult result;
-        result.error = pp.error;
+        result.error = pp.error +
+                       "\nardio then retried with preprocessor directives ignored, "
+                       "which failed as well: " + fallback.error;
         return result;
     }
-    return compile_avr(pp.text);
+
+    CompileResult result = compile_avr(pp.text);
+    if (result.ok) return result;
+
+    // The unit preprocessed cleanly but would not compile. If one of the
+    // headers it pulled in is the reason, say so by name: that is far more
+    // useful than a line number pointing into expanded header text.
+    for (const std::string& name : included_headers(source)) {
+        std::string why;
+        if (header_compiles(name, include_paths, why)) continue;
+        result.error = "cannot compile '" + name +
+                       "' yet -- ardio's compiler rejects the header itself: " + why;
+        return result;
+    }
+
+    result.error += quote_error_line(result.error, pp.text);
+    return result;
 }
 
 CompileResult compile_avr(std::string_view source) {

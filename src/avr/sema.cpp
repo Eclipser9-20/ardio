@@ -166,11 +166,109 @@ bool is_bitwise(const std::string& op) {
     return op == "&" || op == "|" || op == "^";
 }
 
+// ------------------------------------------------------ overload symbols ---
+//
+// Several functions may now share a source name, but the back end still emits
+// exactly one label per definition: a free function becomes `<Function::name>`
+// and a method becomes `<Class>__<Function::name>`. Overloads therefore have
+// to be told apart by their name alone, and this pass is what does the
+// telling -- it rewrites Function::name in place and stamps the same string
+// onto Expr::name at every call site. The back end keeps doing precisely what
+// it already did and never learns that overloading exists.
+//
+// The scheme:
+//
+//   * a name with exactly one definition is left completely alone, so
+//     ordinary code and its disassembly are unchanged;
+//   * a name with two or more distinct signatures gets, on every one of them,
+//     a suffix built from its parameter types:
+//
+//         <name> "__" <code of param 1> "_" <code of param 2> ...
+//
+//     with the code `void` standing in for an overload that takes nothing.
+//
+// The codes are readable words -- void bool char int uint long ulong -- with
+// `p` prefixed for a pointer, `a` for an array, and the bare class name for a
+// class, so a disassembly reads plainly:
+//
+//     void Servo::attach(int)            ->  Servo__attach__int
+//     void Servo::attach(int, int, int)  ->  Servo__attach__int_int_int
+//     size_t TwoWire::write(const char*) ->  TwoWire__write__pchar
+//     long random(long)                  ->  random__long
+//
+// The scheme is deterministic: it depends only on the parameter types, not on
+// declaration order or on how many overloads happen to exist, so the same
+// source always yields the same labels.
+//
+// Two caveats, both deliberate:
+//
+//   * a hand-written function genuinely named `attach__int` would collide
+//     with the mangling of `attach(int)`. Accepted -- the suffix only ever
+//     appears when a name is really overloaded, and a `__` in an identifier
+//     is reserved to the implementation in C++ anyway.
+//   * constructors are never renamed. The back end labels every constructor
+//     `<Class>__ctor` from the is_constructor flag rather than from the name,
+//     so a suffix here would be ignored at the definition and break the call.
+//     Overloaded constructors are still resolved and still get their defaults
+//     filled in; giving them distinct labels needs a back-end change.
+
+std::string type_code(const TypePtr& t) {
+    if (!t) return "any";
+    switch (t->kind) {
+    case TypeKind::Void:    return "void";
+    case TypeKind::Bool:    return "bool";
+    case TypeKind::Char:    return "char";
+    case TypeKind::Int:     return "int";
+    case TypeKind::UInt:    return "uint";
+    case TypeKind::Long:    return "long";
+    case TypeKind::ULong:   return "ulong";
+    case TypeKind::Pointer: return "p" + type_code(t->pointee);
+    case TypeKind::Array:   return "a" + type_code(t->pointee);
+    case TypeKind::Class:   return t->class_name;
+    }
+    return "any";
+}
+
+// The signature that identifies one overload among the others of its name.
+std::string signature_of(const std::vector<Param>& params) {
+    if (params.empty()) return "void";
+    std::string s;
+    for (size_t i = 0; i < params.size(); ++i) {
+        if (i) s += "_";
+        s += type_code(params[i].type);
+    }
+    return s;
+}
+
 struct FuncSig {
     TypePtr return_type;
-    size_t param_count = 0;
-    const Function* decl = nullptr;
+    size_t param_count = 0;         // parameters as declared
+    size_t required = 0;            // param_count minus the trailing defaults
+    const Function* decl = nullptr; // the definition if there is one
+    std::string symbol;             // Function::name after any overload suffix
+    std::string display;            // how a diagnostic spells this candidate
+    std::map<size_t, long> defaults;
 };
+
+// How the parser's side table of default arguments is keyed. See sema.h.
+struct DefaultKey {
+    std::string owner;
+    std::string name;
+    size_t param_count = 0;
+    size_t param_index = 0;
+
+    bool operator<(const DefaultKey& o) const {
+        if (owner != o.owner) return owner < o.owner;
+        if (name != o.name) return name < o.name;
+        if (param_count != o.param_count) return param_count < o.param_count;
+        return param_index < o.param_index;
+    }
+};
+
+std::map<DefaultKey, long>& default_arguments() {
+    static std::map<DefaultKey, long> table;
+    return table;
+}
 
 class Sema {
 public:
@@ -221,15 +319,89 @@ private:
     // --------------------------------------------------------- functions ---
 
     void collect_functions() {
-        for (auto& f : program_.functions) {
+        collect_group(program_.functions, "", functions_);
+        for (auto& c : program_.classes) collect_group(c.methods, c.name, methods_);
+    }
+
+    // Buckets one list of functions -- a translation unit's free functions, or
+    // one class's methods -- by source name and then by parameter signature,
+    // renames the members of any bucket that turns out to be overloaded, and
+    // records the resulting overload set under the *source* name, which is
+    // what call sites still spell.
+    //
+    // Several declarations may share a signature: a prototype and its
+    // definition are the ordinary case. They are one overload, not two, so
+    // they collapse into a single entry and the name is left unmangled.
+    void collect_group(std::vector<Function>& fns, const std::string& owner,
+                       std::map<std::string, std::vector<FuncSig>>& out) {
+        // Bucket -> list of (signature, declarations), both in declaration
+        // order so the result never depends on map iteration order.
+        using Bucket = std::vector<std::pair<std::string, std::vector<Function*>>>;
+        std::map<std::string, Bucket> buckets;
+        std::vector<std::string> order;
+
+        for (auto& f : fns) {
             if (!f.return_type) f.return_type = make_type(TypeKind::Void);
-            functions_[f.name] = FuncSig{f.return_type, f.params.size(), &f};
+            Bucket& bucket = buckets[f.name];
+            if (bucket.empty()) order.push_back(f.name);
+            std::string sig = signature_of(f.params);
+            auto it = bucket.begin();
+            for (; it != bucket.end(); ++it)
+                if (it->first == sig) break;
+            if (it == bucket.end()) bucket.push_back({sig, {&f}});
+            else it->second.push_back(&f);
         }
-        for (auto& c : program_.classes)
-            for (auto& m : c.methods) {
-                if (!m.return_type) m.return_type = make_type(TypeKind::Void);
-                methods_[c.name + "::" + m.name] = FuncSig{m.return_type, m.params.size(), &m};
+
+        for (const std::string& base : order) {
+            Bucket& bucket = buckets[base];
+            bool constructors = bucket.front().second.front()->is_constructor;
+            // A single signature keeps its plain name; so do constructors,
+            // whose label the back end builds from the is_constructor flag.
+            bool mangle = bucket.size() > 1 && !constructors;
+
+            for (auto& entry : bucket) {
+                const std::string& sig = entry.first;
+                std::vector<Function*>& decls = entry.second;
+                std::string symbol = mangle ? base + "__" + sig : base;
+                for (Function* f : decls) f->name = symbol;
+
+                // The definition carries the parameter names and the body; a
+                // bare prototype stands in when there is no definition.
+                const Function* decl = decls.front();
+                for (Function* f : decls)
+                    if (f->body) decl = f;
+
+                FuncSig s;
+                s.return_type = decl->return_type;
+                s.param_count = decl->params.size();
+                s.decl = decl;
+                s.symbol = symbol;
+                s.display = constructors ? "constructor of '" + owner + "'"
+                            : owner.empty() ? base
+                                            : owner + "::" + base;
+                s.defaults = defaults_for(owner, base, s.param_count);
+                // Only a run of defaults at the end of the list makes
+                // arguments optional.
+                s.required = s.param_count;
+                while (s.required > 0 && s.defaults.count(s.required - 1)) --s.required;
+
+                if (constructors) ctors_[owner].push_back(std::move(s));
+                else out[owner.empty() ? base : owner + "::" + base].push_back(std::move(s));
             }
+        }
+    }
+
+    static std::map<size_t, long> defaults_for(const std::string& owner, const std::string& name,
+                                               size_t param_count) {
+        std::map<size_t, long> found;
+        DefaultKey lo{owner, name, param_count, 0};
+        for (auto it = default_arguments().lower_bound(lo); it != default_arguments().end(); ++it) {
+            if (it->first.owner != owner || it->first.name != name ||
+                it->first.param_count != param_count)
+                break;
+            if (it->first.param_index < param_count) found[it->first.param_index] = it->second;
+        }
+        return found;
     }
 
     void declare_global(Global& g) {
@@ -370,14 +542,14 @@ private:
             fail(line, "constructor arguments given for non-class type " + describe(type));
         auto cls = classes_.find(type->class_name);
         if (cls == classes_.end()) fail(line, "unknown class '" + type->class_name + "'");
-        for (const auto& m : cls->second->methods) {
-            if (!m.is_constructor) continue;
-            if (m.params.size() != args.size())
-                fail(line, "constructor of '" + type->class_name + "' expects " +
-                               std::to_string(m.params.size()) + " arguments, got " +
-                               std::to_string(args.size()));
-            return;
-        }
+        auto found = ctors_.find(type->class_name);
+        if (found == ctors_.end() || found->second.empty()) return;
+        // Constructors overload and take defaults like anything else; what
+        // they cannot do yet is get distinct labels, since the back end names
+        // every one of them `<Class>__ctor`.
+        const std::string subject = "constructor of '" + type->class_name + "'";
+        const FuncSig& sig = resolve(found->second, args, line, subject);
+        fill_defaults(args, line, sig, subject);
     }
 
     // ------------------------------------------------------- expressions ---
@@ -539,13 +711,149 @@ private:
         return target;
     }
 
+    // How well one argument fits one parameter: 2 for an exact match, 1 for a
+    // match that needs a conversion, 0 for no match at all. Ranking exact
+    // above converting is what lets write('c') and write(1) reach different
+    // overloads instead of whichever was declared last.
+    static int match_arg(const TypePtr& want, const Expr& arg) {
+        if (!want) return 1;                    // an untyped parameter takes anything
+        TypePtr g = decay(arg.type);
+        if (!g) return 0;
+        if (!assignable(want, g)) return 0;
+        // assignable() lets any integer stand in for a pointer, because at
+        // the assignment level a null pointer constant is just a zero. That
+        // is far too generous to choose an overload with: it would let
+        // print(42) reach print(const char*). Only a literal zero counts.
+        if (want->kind == TypeKind::Pointer && is_integer(g->kind)) {
+            if (arg.kind != ExprKind::IntLiteral || arg.int_value != 0) return 0;
+            return 1;
+        }
+        if (want->kind != g->kind) return 1;
+        if (want->kind == TypeKind::Class) return want->class_name == g->class_name ? 2 : 1;
+        if (is_pointerish(want)) return describe(want) == describe(g) ? 2 : 1;
+        if (want->is_signed != g->is_signed) return 1;
+        return 2;
+    }
+
+    static std::string candidate_text(const FuncSig& s) {
+        std::string t = s.display + "(";
+        for (size_t i = 0; i < s.decl->params.size(); ++i) {
+            if (i) t += ", ";
+            t += describe(s.decl->params[i].type);
+        }
+        return t + ")";
+    }
+
+    static std::string candidate_list(const std::vector<const FuncSig*>& set) {
+        std::string t;
+        for (size_t i = 0; i < set.size(); ++i) {
+            if (i) t += ", ";
+            t += candidate_text(*set[i]);
+        }
+        return t;
+    }
+
+    static std::vector<const FuncSig*> all_of(const std::vector<FuncSig>& set) {
+        std::vector<const FuncSig*> out;
+        for (const FuncSig& s : set) out.push_back(&s);
+        return out;
+    }
+
+    // The one-candidate path, kept separate so that a program with no
+    // overloading gets exactly the diagnostics it always got.
+    void check_only_candidate(const FuncSig& s, const std::vector<ExprPtr>& args, size_t line,
+                              const std::string& subject) {
+        if (args.size() < s.required || args.size() > s.param_count) {
+            if (s.required == s.param_count)
+                fail(line, subject + " expects " + std::to_string(s.param_count) +
+                               " arguments, got " + std::to_string(args.size()));
+            fail(line, subject + " expects between " + std::to_string(s.required) + " and " +
+                           std::to_string(s.param_count) + " arguments, got " +
+                           std::to_string(args.size()));
+        }
+        for (size_t i = 0; i < args.size(); ++i) {
+            const TypePtr& want = s.decl->params[i].type;
+            if (want && !assignable(want, args[i]->type))
+                fail(line, "argument " + std::to_string(i + 1) + " of " + subject + " expects " +
+                               describe(want) + ", got " + describe(args[i]->type));
+        }
+    }
+
+    // Picks the overload a call means. Argument count filters first -- with a
+    // candidate viable for any count between its required and its declared
+    // parameters -- and then argument types decide, exact matches outranking
+    // converting ones. A call that supplies every argument outranks one that
+    // leans on a default, so f(int) and f(int, int = 0) do not tie on f(1).
+    // Anything still level is ambiguous and is reported rather than guessed.
+    const FuncSig& resolve(const std::vector<FuncSig>& set, const std::vector<ExprPtr>& args,
+                           size_t line, const std::string& subject) {
+        if (set.size() == 1) {
+            check_only_candidate(set[0], args, line, subject);
+            return set[0];
+        }
+
+        std::vector<const FuncSig*> best;
+        long best_score = -1;
+        for (const FuncSig& s : set) {
+            if (args.size() < s.required || args.size() > s.param_count) continue;
+            long score = 0;
+            bool viable = true;
+            for (size_t i = 0; i < args.size(); ++i) {
+                int m = match_arg(s.decl->params[i].type, *args[i]);
+                if (m == 0) { viable = false; break; }
+                score += m;
+            }
+            if (!viable) continue;
+            score = score * 2 + (args.size() == s.param_count ? 1 : 0);
+            if (score > best_score) {
+                best_score = score;
+                best.clear();
+                best.push_back(&s);
+            } else if (score == best_score) {
+                best.push_back(&s);
+            }
+        }
+
+        if (best.empty())
+            fail(line, "no overload of " + subject + " takes these " +
+                           std::to_string(args.size()) + " arguments; candidates are " +
+                           candidate_list(all_of(set)));
+        if (best.size() > 1)
+            fail(line, "call to " + subject + " is ambiguous; candidates are " +
+                           candidate_list(best));
+        return *best.front();
+    }
+
+    // Materialises the trailing arguments the call left out, so that every
+    // later stage -- and above all code generation -- sees a complete argument
+    // list and needs to know nothing about default arguments.
+    void fill_defaults(std::vector<ExprPtr>& args, size_t line, const FuncSig& s,
+                       const std::string& subject) {
+        for (size_t i = args.size(); i < s.param_count; ++i) {
+            auto found = s.defaults.find(i);
+            if (found == s.defaults.end())
+                fail(line, "parameter " + std::to_string(i + 1) + " of " + subject +
+                               " has no default argument");
+            auto filled = std::make_unique<Expr>();
+            filled->kind = ExprKind::IntLiteral;
+            filled->int_value = found->second;
+            filled->line = line;
+            check(*filled);
+            const TypePtr& want = s.decl->params[i].type;
+            if (want && !assignable(want, filled->type))
+                fail(line, "default for parameter " + std::to_string(i + 1) + " of " + subject +
+                               " does not convert to " + describe(want));
+            args.push_back(std::move(filled));
+        }
+    }
+
     TypePtr check_call(Expr& e) {
         for (auto& a : e.args) {
             if (!a) fail(e.line, "missing argument in call to '" + e.name + "'");
             check(*a);
         }
 
-        const FuncSig* sig = nullptr;
+        const std::vector<FuncSig>* set = nullptr;
         std::string shown = e.name;
 
         if (e.lhs) {
@@ -557,32 +865,27 @@ private:
             shown = obj->class_name + "::" + e.name;
             auto it = methods_.find(shown);
             if (it == methods_.end()) fail(e.line, "undeclared method '" + shown + "'");
-            sig = &it->second;
+            set = &it->second;
         } else {
             auto it = functions_.find(e.name);
             if (it == functions_.end()) {
                 if (current_class_) {
                     auto m = methods_.find(current_class_->name + "::" + e.name);
-                    if (m != methods_.end()) sig = &m->second;
+                    if (m != methods_.end()) set = &m->second;
                 }
-                if (!sig) fail(e.line, "undeclared function '" + e.name + "'");
+                if (!set) fail(e.line, "undeclared function '" + e.name + "'");
             } else {
-                sig = &it->second;
+                set = &it->second;
             }
         }
 
-        if (sig->param_count != e.args.size())
-            fail(e.line, "'" + shown + "' expects " + std::to_string(sig->param_count) +
-                             " arguments, got " + std::to_string(e.args.size()));
-
-        for (size_t i = 0; i < e.args.size(); ++i) {
-            const TypePtr& want = sig->decl->params[i].type;
-            if (want && !assignable(want, e.args[i]->type))
-                fail(e.line, "argument " + std::to_string(i + 1) + " of '" + shown +
-                                 "' expects " + describe(want) + ", got " +
-                                 describe(e.args[i]->type));
-        }
-        return sig->return_type ? sig->return_type : make_type(TypeKind::Void);
+        const std::string subject = "'" + shown + "'";
+        const FuncSig& sig = resolve(*set, e.args, e.line, subject);
+        fill_defaults(e.args, e.line, sig, subject);
+        // The label the back end will call. For a method it prepends the
+        // class itself, so what belongs here is the member name alone.
+        e.name = sig.symbol;
+        return sig.return_type ? sig.return_type : make_type(TypeKind::Void);
     }
 
     TypePtr check_index(Expr& e) {
@@ -611,8 +914,12 @@ private:
         if (cls == classes_.end()) fail(e.line, "unknown class '" + obj->class_name + "'");
         for (const auto& f : cls->second->fields)
             if (f.name == e.name) return f.type;
-        for (const auto& m : cls->second->methods)
-            if (m.name == e.name) return m.return_type;
+        // Methods are looked up through the overload table, because by now
+        // Function::name may carry an overload suffix while `e.name` is still
+        // what the source wrote. A bare mention of an overloaded method has no
+        // one return type; the first overload's stands in.
+        auto ms = methods_.find(obj->class_name + "::" + e.name);
+        if (ms != methods_.end() && !ms->second.empty()) return ms->second.front().return_type;
         fail(e.line, "class '" + obj->class_name + "' has no member '" + e.name + "'");
     }
 
@@ -636,13 +943,26 @@ private:
     Program& program_;
     std::vector<std::map<std::string, TypePtr>> scopes_;
     std::map<std::string, ClassDecl*> classes_;
-    std::map<std::string, FuncSig> functions_;
-    std::map<std::string, FuncSig> methods_;
+    // Overload sets, keyed by the name the source writes: a bare name for a
+    // free function, `Class::name` for a method, and the class name alone for
+    // its constructors.
+    std::map<std::string, std::vector<FuncSig>> functions_;
+    std::map<std::string, std::vector<FuncSig>> methods_;
+    std::map<std::string, std::vector<FuncSig>> ctors_;
     TypePtr current_return_;
     const ClassDecl* current_class_ = nullptr;
 };
 
 } // namespace
+
+void set_default_argument(const std::string& owner_class, const std::string& name,
+                          size_t param_count, size_t param_index, long value) {
+    default_arguments()[DefaultKey{owner_class, name, param_count, param_index}] = value;
+}
+
+void clear_default_arguments() {
+    default_arguments().clear();
+}
 
 SemaResult analyse(Program& program) {
     SemaResult result;

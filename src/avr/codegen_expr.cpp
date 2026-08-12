@@ -107,6 +107,11 @@ int CodeGen::add_global(const std::string& name, int size) {
 
 int CodeGen::expr_size(const Expr& e) {
     if (!e.type) return 2;
+    // A long is the one type wider than a register pair that the generator
+    // materialises: it lives in r22..r25, exactly where the ABI puts a 32-bit
+    // argument or return value. Everything else keeps the old clamp, so an
+    // aggregate still yields the address-sized answer callers expect.
+    if (e.type->kind == TypeKind::Long || e.type->kind == TypeKind::ULong) return 4;
     int n = e.type->size();
     return n < 1 ? 1 : (n > 2 ? 2 : n);
 }
@@ -127,40 +132,180 @@ void CodeGen::widen_to_16(bool is_signed) {
     }
 }
 
+// ------------------------------------------------------------ 32-bit core ---
+//
+// A value of one or two bytes lives in r24:r25 -- an 8-bit value is always
+// kept sign- or zero-extended into r25, so in registers there are really only
+// two widths. A 32-bit value lives in r22..r25, low byte first, which is both
+// the ABI's home for a `long` argument and its home for a `long` return value.
+// Nothing else moves: narrow code generation is byte-for-byte what it was.
+
+// Widens r24:r25 into r22..r25, or narrows r22..r25 back into r24:r25.
+// `from` and `to` are expr_size() answers; a width of 1 only differs from 2 in
+// that the value is re-extended from its low byte afterwards.
+void gen_convert(CodeGen& g, int from, int to, bool from_signed, bool to_signed) {
+    if (g.failed()) return;
+    const bool from_wide = from == 4;
+    const bool to_wide = to == 4;
+
+    if (from_wide && !to_wide) {
+        g.emit("movw r24, r22");                 // keep the low half
+        if (to == 1) g.widen_to_16(to_signed);
+        return;
+    }
+    if (!from_wide && to_wide) {
+        g.emit("movw r22, r24");                 // the value becomes the low half
+        if (from_signed) {
+            g.emit("clr r24");
+            g.emit("sbrc r23, 7");
+            g.emit("com r24");
+            g.emit("mov r25, r24");
+        } else {
+            g.emit("clr r24");
+            g.emit("clr r25");
+        }
+        return;
+    }
+    // Both narrow: a 2 -> 1 narrowing re-extends, everything else is a no-op
+    // because an 8-bit value is already carried extended.
+    if (!from_wide && to == 1) g.widen_to_16(to_signed);
+}
+
+// Sets Z from the value, without destroying it: used by if/while/for.
+void gen_test_value(CodeGen& g, int size) {
+    if (size == 4) {
+        g.emit("    cp   r22, r1");
+        g.emit("    cpc  r23, r1");
+        g.emit("    cpc  r24, r1");
+        g.emit("    cpc  r25, r1");
+    } else {
+        g.emit("    cp   r24, r1");
+        g.emit("    cpc  r25, r1");
+    }
+}
+
+namespace {
+
+// Sets Z from a value that is being consumed, so it may be destroyed.
+void test_and_consume(CodeGen& g, int size) {
+    if (size == 4) {
+        g.emit("or r22, r23");
+        g.emit("or r22, r24");
+        g.emit("or r22, r25");
+    } else {
+        g.emit("or r24, r25");
+    }
+}
+
+void push_value(CodeGen& g, int size) {
+    if (size == 4) { g.emit("push r22"); g.emit("push r23"); }
+    g.emit("push r24");
+    g.emit("push r25");
+}
+
+void pop_value(CodeGen& g, int size) {
+    g.emit("pop r25");
+    g.emit("pop r24");
+    if (size == 4) { g.emit("pop r23"); g.emit("pop r22"); }
+}
+
+// r22..r25 = -r22..r25. COM sets the carry, so every complement has to happen
+// before the NEG whose borrow the SBCI chain then propagates.
+void negate32(CodeGen& g) {
+    g.emit("com r25");
+    g.emit("com r24");
+    g.emit("com r23");
+    g.emit("neg r22");
+    g.emit("sbci r23, -1");
+    g.emit("sbci r24, -1");
+    g.emit("sbci r25, -1");
+}
+
+// r22..r25 += 1 or -= 1, using the SBCI borrow chain rather than four
+// conditional branches.
+void step32(CodeGen& g, bool up) {
+    if (up) {
+        g.emit("subi r22, -1");
+        g.emit("sbci r23, -1");
+        g.emit("sbci r24, -1");
+        g.emit("sbci r25, -1");
+    } else {
+        g.emit("subi r22, 1");
+        g.emit("sbci r23, 0");
+        g.emit("sbci r24, 0");
+        g.emit("sbci r25, 0");
+    }
+}
+
+} // namespace
+
 // ------------------------------------------------------- variable access ---
 
+namespace {
+
+// The registers a value of `size` bytes occupies, low byte first. ldd/std
+// reach only 63 bytes past Y, so a 32-bit slot needs its last byte in range
+// too -- that is checked by the callers below rather than assumed.
+const char* const kWideRegs[4] = {"r22", "r23", "r24", "r25"};
+
+bool frame_slot_in_range(CodeGen& g, const std::string& name, int off, int size) {
+    if (off > 62 || off + size - 1 > 63) {
+        g.fail("local '" + name + "' is too far from the frame pointer");
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 void CodeGen::load_from_variable(const std::string& name, int size, bool is_signed) {
+    const int bytes = size == 4 ? 4 : (size == 2 ? 2 : 1);
     int off = local_offset(name);
     if (off >= 0) {
-        if (off > 62 || (size == 2 && off + 1 > 63)) {
-            fail("local '" + name + "' is too far from the frame pointer");
-            return;
+        if (!frame_slot_in_range(*this, name, off, bytes)) return;
+        if (bytes == 4) {
+            for (int i = 0; i < 4; ++i)
+                emit(std::string("ldd ") + kWideRegs[i] + ", Y+" + imm(off + i));
+        } else {
+            emit("ldd r24, Y+" + imm(off));
+            if (bytes == 2) emit("ldd r25, Y+" + imm(off + 1));
         }
-        emit("ldd r24, Y+" + imm(off));
-        if (size == 2) emit("ldd r25, Y+" + imm(off + 1));
     } else {
         int addr = global_address(name);
-        if (addr < 0) addr = add_global(name, size);
-        emit("lds r24, " + imm(addr));
-        if (size == 2) emit("lds r25, " + imm(addr + 1));
+        if (addr < 0) addr = add_global(name, bytes);
+        if (bytes == 4) {
+            for (int i = 0; i < 4; ++i)
+                emit(std::string("lds ") + kWideRegs[i] + ", " + imm(addr + i));
+        } else {
+            emit("lds r24, " + imm(addr));
+            if (bytes == 2) emit("lds r25, " + imm(addr + 1));
+        }
     }
-    if (size == 1) widen_to_16(is_signed);
+    if (bytes == 1) widen_to_16(is_signed);
 }
 
 void CodeGen::store_to_variable(const std::string& name, int size) {
+    const int bytes = size == 4 ? 4 : (size == 2 ? 2 : 1);
     int off = local_offset(name);
     if (off >= 0) {
-        if (off > 62 || (size == 2 && off + 1 > 63)) {
-            fail("local '" + name + "' is too far from the frame pointer");
-            return;
+        if (!frame_slot_in_range(*this, name, off, bytes)) return;
+        if (bytes == 4) {
+            for (int i = 0; i < 4; ++i)
+                emit("std Y+" + imm(off + i) + ", " + kWideRegs[i]);
+        } else {
+            emit("std Y+" + imm(off) + ", r24");
+            if (bytes == 2) emit("std Y+" + imm(off + 1) + ", r25");
         }
-        emit("std Y+" + imm(off) + ", r24");
-        if (size == 2) emit("std Y+" + imm(off + 1) + ", r25");
     } else {
         int addr = global_address(name);
-        if (addr < 0) addr = add_global(name, size);
-        emit("sts " + imm(addr) + ", r24");
-        if (size == 2) emit("sts " + imm(addr + 1) + ", r25");
+        if (addr < 0) addr = add_global(name, bytes);
+        if (bytes == 4) {
+            for (int i = 0; i < 4; ++i)
+                emit("sts " + imm(addr + i) + ", " + kWideRegs[i]);
+        } else {
+            emit("sts " + imm(addr) + ", r24");
+            if (bytes == 2) emit("sts " + imm(addr + 1) + ", r25");
+        }
     }
 }
 
@@ -207,14 +352,15 @@ void CodeGen::gen_call(const Expr& e) {
         if (!a) { fail("null argument in call to '" + e.name + "'"); return; }
         gen_expr(*a);
         if (failed()) return;
+        if (expr_size(*a) == 4) { emit("push r22"); emit("push r23"); }
         emit("push r24");
         emit("push r25");
     }
 
     for (size_t i = e.args.size(); i-- > 0;) {
         int r = arg_regs[i];
-        emit("pop r" + imm(r + 1));
-        emit("pop r" + imm(r));
+        const int bytes = expr_size(*e.args[i]) == 4 ? 4 : 2;
+        for (int b = bytes; b-- > 0;) emit("pop r" + imm(r + b));
     }
 
     if (is_method) {
@@ -306,6 +452,13 @@ void add_offset(CodeGen& g, int offset) {
 // Reads `size` bytes from the address in r24:r25 back into r24:r25.
 void load_through_address(CodeGen& g, int size, bool is_signed) {
     g.emit("movw r30, r24");
+    if (size == 4) {
+        g.emit("ld r22, Z");
+        g.emit("ldd r23, Z+1");
+        g.emit("ldd r24, Z+2");
+        g.emit("ldd r25, Z+3");
+        return;
+    }
     g.emit("ld r24, Z");
     if (size == 2) g.emit("ldd r25, Z+1");
     else g.widen_to_16(is_signed);
@@ -396,9 +549,9 @@ bool gen_address(CodeGen& g, const Expr& e) {
 // Reads an lvalue that is not a plain named variable.
 void gen_indirect_load(CodeGen& g, const Expr& e) {
     if (is_array(e)) { gen_address(g, e); return; }   // an array decays
-    int size = e.type ? e.type->size() : 2;
-    if (size < 1 || size > 2) {
-        g.fail("only 8- and 16-bit values can be loaded indirectly");
+    int size = CodeGen::expr_size(e);
+    if (e.type && e.type->size() != size) {
+        g.fail("only 8-, 16- and 32-bit values can be loaded indirectly");
         return;
     }
     if (!gen_address(g, e)) return;
@@ -453,12 +606,17 @@ void gen_string_literal(CodeGen& g, const Expr& e) {
 // Writes r24:r25 (or r24 alone) to the lvalue `target`, whose address is
 // computed after the value, so the value is parked on the stack meanwhile.
 void gen_indirect_store(CodeGen& g, const Expr& target, int size) {
-    g.emit("push r24");
-    g.emit("push r25");
+    push_value(g, size);
     if (!gen_address(g, target)) return;
     g.emit("movw r30, r24");
-    g.emit("pop r25");
-    g.emit("pop r24");
+    pop_value(g, size);
+    if (size == 4) {
+        g.emit("st Z, r22");
+        g.emit("std Z+1, r23");
+        g.emit("std Z+2, r24");
+        g.emit("std Z+3, r25");
+        return;
+    }
     g.emit("st Z, r24");
     if (size == 2) g.emit("std Z+1, r25");
 }
@@ -472,6 +630,14 @@ void CodeGen::gen_expr(const Expr& e) {
 
     // ---- literals ---------------------------------------------------------
     case ExprKind::IntLiteral: {
+        if (expr_size(e) == 4) {
+            const long v = e.int_value;
+            emit("ldi r22, " + imm(v & 0xFF));
+            emit("ldi r23, " + imm((v >> 8) & 0xFF));
+            emit("ldi r24, " + imm((v >> 16) & 0xFF));
+            emit("ldi r25, " + imm((v >> 24) & 0xFF));
+            return;
+        }
         emit("ldi r24, " + lo_byte(e.int_value));
         emit("ldi r25, " + hi_byte(e.int_value));
         return;
@@ -507,10 +673,10 @@ void CodeGen::gen_expr(const Expr& e) {
         if (!e.lhs) { fail("cast without an operand"); return; }
         gen_expr(*e.lhs);
         if (failed()) return;
-        if (expr_size(e) == 1) {
-            // Truncating: keep the low byte, then re-widen for the caller.
-            widen_to_16(expr_is_signed(e));
-        }
+        // Widening sign- or zero-extends according to the *source* type;
+        // narrowing keeps the low bytes and re-extends an 8-bit result.
+        gen_convert(*this, expr_size(*e.lhs), expr_size(e),
+                    expr_is_signed(*e.lhs), expr_is_signed(e));
         return;
     }
 
@@ -535,6 +701,12 @@ void CodeGen::gen_expr(const Expr& e) {
         if (e.op.empty() || e.op == "=") {
             gen_expr(*e.rhs);
             if (failed()) return;
+            // An assignment converts, it does not truncate silently: a long
+            // stored into an int keeps the low half, an int stored into a long
+            // is extended according to the int's own signedness.
+            if (size == 4 || expr_size(*e.rhs) == 4)
+                gen_convert(*this, expr_size(*e.rhs), size,
+                            expr_is_signed(*e.rhs), expr_is_signed(target));
         } else {
             // Compound assignment: run the plain binary operation with the
             // destination as its left operand.
@@ -571,24 +743,33 @@ void CodeGen::gen_expr(const Expr& e) {
             int size = expr_size(*e.lhs);
             load_from_variable(e.lhs->name, size, expr_is_signed(*e.lhs));
             if (failed()) return;
-            if (e.is_postfix) { emit("push r24"); emit("push r25"); }
-            if (op == "++") {
+            if (e.is_postfix) push_value(*this, size);
+            if (size == 4) {
+                step32(*this, op == "++");
+            } else if (op == "++") {
                 emit("adiw r24, 1");
             } else {
                 emit("sbiw r24, 1");
             }
             store_to_variable(e.lhs->name, size);
             if (failed()) return;
-            if (e.is_postfix) { emit("pop r25"); emit("pop r24"); }
+            if (e.is_postfix) pop_value(*this, size);
             return;
         }
 
         gen_expr(*e.lhs);
         if (failed()) return;
 
+        const int usize = expr_size(e);
+        if (usize == 4 && expr_size(*e.lhs) != 4 && op != "!")
+            gen_convert(*this, expr_size(*e.lhs), 4, expr_is_signed(*e.lhs),
+                        expr_is_signed(e));
+
         if (op == "+") return;
         if (op == "-") {
-            if (expr_size(e) == 1) {
+            if (usize == 4) {
+                negate32(*this);
+            } else if (usize == 1) {
                 emit("neg r24");
                 widen_to_16(expr_is_signed(e));
             } else {
@@ -599,18 +780,23 @@ void CodeGen::gen_expr(const Expr& e) {
             return;
         }
         if (op == "~") {
+            if (usize == 4) {
+                emit("com r22");
+                emit("com r23");
+            }
             emit("com r24");
             emit("com r25");
             return;
         }
         if (op == "!") {
             std::string done = new_label("not");
-            emit("or r24, r25");
+            test_and_consume(*this, expr_size(*e.lhs));
             emit("ldi r24, 0");
             emit("ldi r25, 0");
             emit(std::string("brne ") + done);
             emit("ldi r24, 1");
             emit_label(done);
+            if (usize == 4) gen_convert(*this, 2, 4, false, false);
             return;
         }
         fail("unsupported unary operator '" + op + "'");
@@ -624,7 +810,7 @@ void CodeGen::gen_expr(const Expr& e) {
         std::string end_label = new_label("cend");
         gen_expr(*e.lhs);
         if (failed()) return;
-        emit("or r24, r25");
+        test_and_consume(*this, expr_size(*e.lhs));
         emit("breq " + else_label);
         gen_expr(*e.rhs);
         if (failed()) return;
@@ -648,11 +834,134 @@ void CodeGen::gen_expr(const Expr& e) {
     }
 }
 
+namespace {
+
+// One 32-bit binary operation. Both operands are evaluated and widened to four
+// bytes: the left is parked on the stack while the right is evaluated, then
+// moved into r18..r21 so the left can come back to its ABI home in r22..r25.
+void gen_wide_binary(CodeGen& g, const std::string& op, const Expr& lhs,
+                     const Expr& rhs, int size, bool result_signed) {
+    const int lhs_size = CodeGen::expr_size(lhs);
+    const int rhs_size = CodeGen::expr_size(rhs);
+    const bool lhs_signed = CodeGen::expr_is_signed(lhs);
+    const bool rhs_signed = CodeGen::expr_is_signed(rhs);
+
+    g.gen_expr(lhs);
+    if (g.failed()) return;
+    gen_convert(g, lhs_size, 4, lhs_signed, lhs_signed);
+    push_value(g, 4);
+    g.gen_expr(rhs);
+    if (g.failed()) return;
+    gen_convert(g, rhs_size, 4, rhs_signed, rhs_signed);
+    g.emit("movw r18, r22");
+    g.emit("movw r20, r24");
+    pop_value(g, 4);
+
+    // The operands' own signedness decides how the operation behaves; the
+    // result type only decides how wide the answer is left.
+    const bool is_signed = lhs_signed && rhs_signed;
+
+    auto finish = [&]() {
+        if (size != 4) gen_convert(g, 4, size, result_signed, result_signed);
+    };
+
+    if (op == "+" || op == "-") {
+        const char* first = op == "+" ? "add" : "sub";
+        const char* rest = op == "+" ? "adc" : "sbc";
+        g.emit(std::string(first) + " r22, r18");
+        g.emit(std::string(rest) + " r23, r19");
+        g.emit(std::string(rest) + " r24, r20");
+        g.emit(std::string(rest) + " r25, r21");
+        finish();
+        return;
+    }
+    if (op == "&" || op == "|" || op == "^") {
+        const char* m = op == "&" ? "and" : (op == "|" ? "or" : "eor");
+        g.emit(std::string(m) + " r22, r18");
+        g.emit(std::string(m) + " r23, r19");
+        g.emit(std::string(m) + " r24, r20");
+        g.emit(std::string(m) + " r25, r21");
+        finish();
+        return;
+    }
+    if (op == "*") {
+        g.emit("call __ardio_mul32");
+        finish();
+        return;
+    }
+    if (op == "/" || op == "%") {
+        // The helpers leave the quotient in r22..r25 and the remainder in
+        // r26:r27:r30:r31 -- the four call-clobbered registers the dividend and
+        // divisor do not occupy. See runtime/math32.S.
+        g.emit(is_signed ? "call __ardio_divmod32" : "call __ardio_udivmod32");
+        if (op == "%") {
+            g.emit("movw r22, r26");
+            g.emit("movw r24, r30");
+        }
+        finish();
+        return;
+    }
+    if (op == "<<" || op == ">>") {
+        // AVR shifts one bit at a time, so the count -- the low byte of the
+        // right operand -- drives a loop.
+        std::string top = g.new_label("shift32");
+        std::string done = g.new_label("shift32end");
+        g.emit_label(top);
+        g.emit("tst r18");
+        g.emit("breq " + done);
+        if (op == "<<") {
+            g.emit("lsl r22");
+            g.emit("rol r23");
+            g.emit("rol r24");
+            g.emit("rol r25");
+        } else {
+            g.emit(is_signed ? "asr r25" : "lsr r25");
+            g.emit("ror r24");
+            g.emit("ror r23");
+            g.emit("ror r22");
+        }
+        g.emit("dec r18");
+        g.emit("rjmp " + top);
+        g.emit_label(done);
+        finish();
+        return;
+    }
+    if (is_comparison(op)) {
+        Compare c = comparison_branch(op, is_signed);
+        std::string done = g.new_label("cmp32");
+        if (c.swap) {
+            g.emit("cp r18, r22");
+            g.emit("cpc r19, r23");
+            g.emit("cpc r20, r24");
+            g.emit("cpc r21, r25");
+        } else {
+            g.emit("cp r22, r18");
+            g.emit("cpc r23, r19");
+            g.emit("cpc r24, r20");
+            g.emit("cpc r25, r21");
+        }
+        g.emit("ldi r24, 1");
+        g.emit("ldi r25, 0");
+        g.emit(std::string(c.branch) + " " + done);
+        g.emit("ldi r24, 0");
+        g.emit_label(done);
+        if (size == 4) gen_convert(g, 2, 4, false, false);
+        return;
+    }
+
+    g.fail("unsupported 32-bit binary operator '" + op + "'");
+}
+
+} // namespace
+
 void CodeGen::gen_binary(const std::string& op, const Expr& lhs, const Expr& rhs,
                          int size, bool result_signed) {
     if (failed()) return;
     if (size < 1) size = 1;
-    if (size > 2) size = 2;
+    if (size > 2 && size != 4) size = 2;
+
+    const int lhs_size = expr_size(lhs);
+    const int rhs_size = expr_size(rhs);
 
     // Short-circuit operators never evaluate the right side unconditionally.
     if (op == "&&" || op == "||") {
@@ -660,11 +969,11 @@ void CodeGen::gen_binary(const std::string& op, const Expr& lhs, const Expr& rhs
         std::string end_label = new_label("logend");
         gen_expr(lhs);
         if (failed()) return;
-        emit("or r24, r25");
+        test_and_consume(*this, lhs_size);
         emit(std::string(op == "&&" ? "breq " : "brne ") + shortcut);
         gen_expr(rhs);
         if (failed()) return;
-        emit("or r24, r25");
+        test_and_consume(*this, rhs_size);
         emit(std::string(op == "&&" ? "breq " : "brne ") + shortcut);
         emit(std::string("ldi r24, ") + (op == "&&" ? "1" : "0"));
         emit("ldi r25, 0");
@@ -673,6 +982,22 @@ void CodeGen::gen_binary(const std::string& op, const Expr& lhs, const Expr& rhs
         emit(std::string("ldi r24, ") + (op == "&&" ? "0" : "1"));
         emit("ldi r25, 0");
         emit_label(end_label);
+        if (size == 4) gen_convert(*this, 2, 4, false, false);
+        return;
+    }
+
+    // ---- 32-bit --------------------------------------------------------
+    //
+    // An operation is done at 32 bits when either operand is a long or when
+    // the result is: the narrower operand is widened first, so nothing is
+    // computed at a width that could lose the answer. The left operand ends
+    // in r22..r25 and the right in r18..r21; both halves are call-clobbered,
+    // which is what lets the multiply and divide helpers be plain calls.
+    const bool comparison = is_comparison(op);
+    const bool wide = lhs_size == 4 || rhs_size == 4 ||
+                      (!comparison && size == 4);
+    if (wide) {
+        gen_wide_binary(*this, op, lhs, rhs, size, result_signed);
         return;
     }
 

@@ -795,3 +795,148 @@ TEST(parser_switch_state_machine_round_trip) {
     CHECK(loop->then_branch->body[0]->then_branch->kind == StmtKind::Break);
     CHECK(printing->else_branch->kind == StmtKind::Block);
 }
+
+// ------------------------------------------------------- enumerations -----
+
+TEST(parser_enum_tag_names_a_usable_type) {
+    Program program = parse_ok(
+        "enum State { MainMenu, Printing, Done };\n"
+        "State currentState = MainMenu;\n"
+        "void run(State next) { State local = Printing; local = next; }\n");
+    const Global* current = find_global(program, "currentState");
+    CHECK(current != nullptr);
+    CHECK(current->type->kind == TypeKind::Int);
+    CHECK(render(current->init.get()) == std::string("MainMenu"));
+
+    const Function* run = find_function(program, "run");
+    CHECK(run != nullptr);
+    CHECK_EQ(run->params.size(), size_t(1));
+    CHECK(run->params[0].type->kind == TypeKind::Int);
+    CHECK(run->params[0].name == std::string("next"));
+    const Stmt* local = run->body->body[0].get();
+    CHECK(local->kind == StmtKind::VarDecl);
+    CHECK(local->var_type->kind == TypeKind::Int);
+    CHECK(render(local->var_init.get()) == std::string("Printing"));
+}
+
+TEST(parser_scoped_enum_is_a_type_and_its_enumerators_are_globals) {
+    Program program = parse_ok(
+        "enum class Mode : unsigned char { Off, On };\n"
+        "Mode mode = Mode::On;\n");
+    const Global* off = find_global(program, "Off");
+    CHECK(off != nullptr);
+    CHECK_EQ(off->init->int_value, 0L);
+    const Global* mode = find_global(program, "mode");
+    CHECK(mode != nullptr);
+    CHECK(mode->type->kind == TypeKind::Int);
+    CHECK(render(mode->init.get()) == std::string("On"));
+}
+
+TEST(parser_enumerator_values_fold_constant_expressions) {
+    Program program = parse_ok("enum Bits { None = 0, Low = 1 << 2, Both = Low | 1, Back = -3 };");
+    CHECK_EQ(find_global(program, "Low")->init->int_value, 4L);
+    CHECK_EQ(find_global(program, "Both")->init->int_value, 5L);
+    CHECK_EQ(find_global(program, "Back")->init->int_value, -3L);
+}
+
+TEST(parser_enum_rejects_a_non_constant_enumerator) {
+    ParseResult result = parse_text("int n; enum Bad { X = n + f() };");
+    CHECK(!result.ok);
+    CHECK(result.error.find("constant integer enumerator") != std::string::npos);
+}
+
+TEST(parser_enum_type_is_usable_in_a_cast_and_a_trailing_comma_is_allowed) {
+    Program program = parse_ok(
+        "enum State { A, B, };\n"
+        "void f(int raw) { State s = (State)raw; s = B; }\n");
+    CHECK_EQ(program.globals.size(), size_t(2));
+    const Stmt* decl = find_function(program, "f")->body->body[0].get();
+    CHECK(decl->kind == StmtKind::VarDecl);
+    CHECK(render(decl->var_init.get()) == std::string("(cast raw)"));
+}
+
+// -------------------------------------------------- brace initialisers -----
+
+TEST(parser_brace_initialiser_keeps_every_element) {
+    Program program = parse_ok("int table[4] = { 1, 2, 3, 4 };");
+    const Global* table = find_global(program, "table");
+    CHECK(table != nullptr);
+    CHECK(table->type->kind == TypeKind::Array);
+    CHECK_EQ(table->type->array_length, 4L);
+    CHECK(table->init->kind == ExprKind::InitList);
+    CHECK(render(table->init.get()) == std::string("{1, 2, 3, 4}"));
+}
+
+TEST(parser_nested_brace_initialiser_nests) {
+    Program program = parse_ok("int vector[2][3] = { {1, 2, 3}, {4, 5, 6} };");
+    const Global* v = find_global(program, "vector");
+    CHECK_EQ(v->type->array_length, 2L);
+    CHECK_EQ(v->type->pointee->array_length, 3L);
+    CHECK(render(v->init.get()) == std::string("{{1, 2, 3}, {4, 5, 6}}"));
+}
+
+TEST(parser_array_length_is_deduced_from_the_initialiser) {
+    Program program = parse_ok(
+        "int t[] = { 1, 2, 3 };\n"
+        "char s[] = \"AB\";\n"
+        "int rows[][2] = { {1, 2}, {3, 4}, {5, 6} };\n");
+    CHECK_EQ(find_global(program, "t")->type->array_length, 3L);
+    CHECK_EQ(find_global(program, "s")->type->array_length, 3L);
+    const Global* rows = find_global(program, "rows");
+    CHECK_EQ(rows->type->array_length, 3L);
+    CHECK_EQ(rows->type->pointee->array_length, 2L);
+}
+
+TEST(parser_local_array_takes_a_brace_initialiser) {
+    Program program = parse_ok("void f() { int a[] = { 7, 8 }; }");
+    const Stmt* decl = body_of(program, "f")->body[0].get();
+    CHECK(decl->kind == StmtKind::VarDecl);
+    CHECK_EQ(decl->var_type->array_length, 2L);
+    CHECK(render(decl->var_init.get()) == std::string("{7, 8}"));
+}
+
+TEST(parser_empty_brace_initialiser_is_kept) {
+    Program program = parse_ok("int zeros[3] = {}; int n = {};");
+    CHECK(find_global(program, "zeros")->init->kind == ExprKind::InitList);
+    CHECK_EQ(find_global(program, "zeros")->init->args.size(), size_t(0));
+    CHECK_EQ(find_global(program, "n")->init->int_value, 0L);
+}
+
+TEST(parser_scalar_brace_initialiser_unwraps_to_its_value) {
+    Program program = parse_ok("int n = { 5 };");
+    CHECK(find_global(program, "n")->init->kind == ExprKind::IntLiteral);
+    CHECK_EQ(find_global(program, "n")->init->int_value, 5L);
+}
+
+TEST(parser_too_many_initialisers_is_an_error) {
+    ParseResult result = parse_text("int table[2] = { 1, 2, 3 };");
+    CHECK(!result.ok);
+    CHECK(result.error.find("too many initialisers") != std::string::npos);
+
+    ParseResult scalar = parse_text("int n = { 1, 2 };");
+    CHECK(!scalar.ok);
+    CHECK(scalar.error.find("too many initialisers for a scalar") != std::string::npos);
+
+    ParseResult row = parse_text("int rows[2][2] = { {1, 2, 3}, {4, 5} };");
+    CHECK(!row.ok);
+    CHECK(row.error.find("too many initialisers") != std::string::npos);
+}
+
+TEST(parser_unterminated_brace_initialiser_is_an_error) {
+    ParseResult result = parse_text("int t[] = { 1, 2");
+    CHECK(!result.ok);
+    CHECK(result.error.find("brace initialiser") != std::string::npos);
+}
+
+TEST(parser_font_table_survives_intact) {
+    Program program = parse_ok(
+        "int vector[3][4] = {\n"
+        "  { 0, 1, 2, 3 },\n"
+        "  { 4, 5, 6, 7 },\n"
+        "  { 8, 9, 10, 11 },\n"
+        "};\n");
+    const Global* v = find_global(program, "vector");
+    CHECK_EQ(v->init->args.size(), size_t(3));
+    for (size_t i = 0; i < 3; ++i) CHECK_EQ(v->init->args[i]->args.size(), size_t(4));
+    CHECK_EQ(v->init->args[2]->args[3]->int_value, 11L);
+}

@@ -632,3 +632,447 @@ TEST(sema_method_body_sees_its_own_fields) {
     CHECK(r.ok);
     CHECK(r.error.empty());
 }
+
+// ------------------------------------------------------------ overloading ---
+
+namespace {
+
+// Builds a free function `<ret> <name>(<params>)` with an empty body and
+// appends it, so a test can declare a whole overload set in a few lines.
+Function& add_overload(Program& p, const std::string& name, std::vector<TypeKind> params,
+                       TypeKind ret = TypeKind::Void) {
+    Function f;
+    f.name = name;
+    f.return_type = make_type(ret);
+    for (size_t i = 0; i < params.size(); ++i)
+        f.params.push_back({"p" + std::to_string(i), make_type(params[i])});
+    f.body = block({});
+    p.functions.push_back(std::move(f));
+    return p.functions.back();
+}
+
+// The same, as a method of `c`.
+Function& add_method(ClassDecl& c, const std::string& name, std::vector<TypePtr> params,
+                     TypeKind ret = TypeKind::Void) {
+    Function m;
+    m.name = name;
+    m.owner_class = c.name;
+    m.return_type = make_type(ret);
+    for (size_t i = 0; i < params.size(); ++i)
+        m.params.push_back({"p" + std::to_string(i), params[i]});
+    m.body = block({});
+    c.methods.push_back(std::move(m));
+    return c.methods.back();
+}
+
+// Finds the symbol a definition ended up with, by position.
+const std::string& fn_symbol(const Program& p, size_t i) { return p.functions[i].name; }
+
+// A program's defaults are global state; every test that sets one clears it
+// first so the tests stay independent of each other's order.
+struct Defaults {
+    Defaults() { clear_default_arguments(); }
+    ~Defaults() { clear_default_arguments(); }
+};
+
+} // namespace
+
+TEST(sema_leaves_a_name_with_one_definition_completely_alone) {
+    Program p;
+    add_overload(p, "delay", {TypeKind::Long});
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("delay", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(100));
+        return a;
+    }())));
+    add_fn(p, "setup", std::move(b));
+
+    CHECK(analyse(p).ok);
+    CHECK(fn_symbol(p, 0) == "delay");
+    CHECK(stmt_expr(p, 0, 1).name == "delay");
+}
+
+TEST(sema_picks_an_overload_by_argument_count) {
+    Program p;
+    add_overload(p, "attach", {TypeKind::Int});
+    add_overload(p, "attach", {TypeKind::Int, TypeKind::Int, TypeKind::Int});
+
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("attach", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(9));
+        return a;
+    }())));
+    b.push_back(expr_stmt(call("attach", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(9));
+        a.push_back(lit(544));
+        a.push_back(lit(2400));
+        return a;
+    }())));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(r.ok);
+    CHECK(r.error.empty());
+    // Both definitions were renamed, and each call points at one of them.
+    CHECK(fn_symbol(p, 0) == "attach__int");
+    CHECK(fn_symbol(p, 1) == "attach__int_int_int");
+    CHECK(stmt_expr(p, 0, 2).name == "attach__int");
+    CHECK(stmt_expr(p, 1, 2).name == "attach__int_int_int");
+}
+
+TEST(sema_picks_an_overload_by_argument_type) {
+    Program p;
+    add_overload(p, "write", {TypeKind::Char});
+    add_overload(p, "write", {TypeKind::Long});
+
+    std::vector<StmtPtr> b;
+    b.push_back(var("c", make_type(TypeKind::Char)));
+    b.push_back(var("l", make_type(TypeKind::Long)));
+    b.push_back(expr_stmt(call("write", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(ident("c"));
+        return a;
+    }())));
+    b.push_back(expr_stmt(call("write", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(ident("l"));
+        return a;
+    }())));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(r.ok);
+    CHECK(stmt_expr(p, 2, 2).name == "write__char");
+    CHECK(stmt_expr(p, 3, 2).name == "write__long");
+}
+
+TEST(sema_prefers_an_exact_match_over_a_converting_one) {
+    Program p;
+    // Both are assignable from a char, so only the exactness rule separates
+    // them -- and only the pointer overload is exact for a string literal.
+    add_overload(p, "print", {TypeKind::Int});
+    Function f;
+    f.name = "print";
+    f.return_type = make_type(TypeKind::Void);
+    f.params.push_back({"s", make_pointer(make_type(TypeKind::Char))});
+    f.body = block({});
+    p.functions.push_back(std::move(f));
+
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("print", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(str("hi"));
+        return a;
+    }())));
+    b.push_back(expr_stmt(call("print", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(7));
+        return a;
+    }())));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(r.ok);
+    CHECK(stmt_expr(p, 0, 2).name == "print__pchar");
+    CHECK(stmt_expr(p, 1, 2).name == "print__int");
+}
+
+TEST(sema_overloads_a_method_and_keeps_the_class_off_the_call_name) {
+    Program p;
+    ClassDecl c;
+    c.name = "TwoWire";
+    add_method(c, "write", {make_type(TypeKind::Int)});
+    add_method(c, "write", {make_pointer(make_type(TypeKind::Char)), make_type(TypeKind::Int)});
+    p.classes.push_back(std::move(c));
+
+    auto wire = make_type(TypeKind::Class);
+    wire->class_name = "TwoWire";
+
+    std::vector<StmtPtr> b;
+    b.push_back(var("w", wire));
+    auto one = call("write", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(65));
+        return a;
+    }());
+    one->lhs = ident("w");
+    b.push_back(expr_stmt(std::move(one)));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(r.ok);
+    // The definitions carry the bare member name; the back end prepends the
+    // class itself, so `TwoWire__write__int` is the label that results.
+    CHECK(p.classes[0].methods[0].name == "write__int");
+    CHECK(p.classes[0].methods[1].name == "write__pchar_int");
+    CHECK(stmt_expr(p, 1, 0).name == "write__int");
+}
+
+TEST(sema_treats_a_prototype_and_its_definition_as_one_function) {
+    Program p;
+    Function proto;
+    proto.name = "beep";
+    proto.return_type = make_type(TypeKind::Void);
+    proto.params.push_back({"n", make_type(TypeKind::Int)});
+    p.functions.push_back(std::move(proto));      // no body
+    add_overload(p, "beep", {TypeKind::Int});     // the definition
+
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("beep", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(3));
+        return a;
+    }())));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(r.ok);
+    // One signature, so nothing is renamed.
+    CHECK(fn_symbol(p, 0) == "beep");
+    CHECK(fn_symbol(p, 1) == "beep");
+    CHECK(stmt_expr(p, 0, 2).name == "beep");
+}
+
+TEST(sema_reports_an_ambiguous_call_instead_of_guessing) {
+    Program p;
+    add_overload(p, "send", {TypeKind::Int, TypeKind::Long});
+    add_overload(p, "send", {TypeKind::Long, TypeKind::Int});
+
+    std::vector<StmtPtr> b;
+    b.push_back(var("c", make_type(TypeKind::Char)));
+    b.push_back(expr_stmt(call("send", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(ident("c", 12));
+        a.push_back(ident("c", 12));
+        return a;
+    }(), 12), 12));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(!r.ok);
+    CHECK(r.error == "line 12: call to 'send' is ambiguous; candidates are "
+                     "send(int, long), send(long, int)");
+}
+
+TEST(sema_reports_when_no_overload_accepts_the_arguments) {
+    Program p;
+    add_overload(p, "tone", {TypeKind::Int});
+    add_overload(p, "tone", {TypeKind::Int, TypeKind::Int});
+
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("tone", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(1, 4));
+        a.push_back(lit(2, 4));
+        a.push_back(lit(3, 4));
+        return a;
+    }(), 4), 4));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(!r.ok);
+    CHECK(r.error == "line 4: no overload of 'tone' takes these 3 arguments; "
+                     "candidates are tone(int), tone(int, int)");
+}
+
+TEST(sema_still_rejects_the_wrong_arity_against_a_single_definition) {
+    // The one-candidate diagnostic must not change now that overloading works.
+    Program p;
+    add_overload(p, "pinMode", {TypeKind::Int, TypeKind::Int});
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("pinMode", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(13, 6));
+        return a;
+    }(), 6), 6));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(!r.ok);
+    CHECK(r.error == "line 6: 'pinMode' expects 2 arguments, got 1");
+}
+
+// ------------------------------------------------------ default arguments ---
+
+TEST(sema_fills_in_a_trailing_default_argument) {
+    Defaults guard;
+    Program p;
+    add_overload(p, "attach", {TypeKind::Int, TypeKind::Int, TypeKind::Int});
+    set_default_argument("", "attach", 3, 1, 544);
+    set_default_argument("", "attach", 3, 2, 2400);
+
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("attach", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(9));
+        return a;
+    }())));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(r.ok);
+    CHECK(r.error.empty());
+    // The call now carries a complete argument list.
+    const Expr& c = stmt_expr(p, 0, 1);
+    CHECK_EQ(c.args.size(), size_t(3));
+    CHECK_EQ(c.args[0]->int_value, 9L);
+    CHECK_EQ(c.args[1]->int_value, 544L);
+    CHECK_EQ(c.args[2]->int_value, 2400L);
+    CHECK(c.args[2]->type->kind == TypeKind::Int);
+}
+
+TEST(sema_accepts_a_default_being_supplied_explicitly) {
+    Defaults guard;
+    Program p;
+    add_overload(p, "random", {TypeKind::Long, TypeKind::Long}, TypeKind::Long);
+    set_default_argument("", "random", 2, 1, 0);
+
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("random", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(10));
+        a.push_back(lit(20));
+        return a;
+    }())));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(r.ok);
+    const Expr& c = stmt_expr(p, 0, 1);
+    CHECK_EQ(c.args.size(), size_t(2));
+    CHECK_EQ(c.args[1]->int_value, 20L);
+}
+
+TEST(sema_rejects_a_call_below_the_required_argument_count) {
+    Defaults guard;
+    Program p;
+    add_overload(p, "attach", {TypeKind::Int, TypeKind::Int, TypeKind::Int});
+    set_default_argument("", "attach", 3, 2, 2400);   // only the last is optional
+
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("attach", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(9, 21));
+        return a;
+    }(), 21), 21));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(!r.ok);
+    CHECK(r.error == "line 21: 'attach' expects between 2 and 3 arguments, got 1");
+}
+
+TEST(sema_fills_a_method_default_and_still_resolves_the_overload) {
+    Defaults guard;
+    Program p;
+    ClassDecl c;
+    c.name = "LiquidCrystal_I2C";
+    add_method(c, "print", {make_pointer(make_type(TypeKind::Char))});
+    add_method(c, "print", {make_type(TypeKind::Long), make_type(TypeKind::Int)});
+    p.classes.push_back(std::move(c));
+    // print(long value, int base = 10)
+    set_default_argument("LiquidCrystal_I2C", "print", 2, 1, 10);
+
+    auto lcd = make_type(TypeKind::Class);
+    lcd->class_name = "LiquidCrystal_I2C";
+
+    std::vector<StmtPtr> b;
+    b.push_back(var("lcd", lcd));
+    auto number = call("print", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(42));
+        return a;
+    }());
+    number->lhs = ident("lcd");
+    b.push_back(expr_stmt(std::move(number)));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(r.ok);
+    const Expr& called = stmt_expr(p, 1, 0);
+    CHECK(called.name == "print__long_int");
+    CHECK_EQ(called.args.size(), size_t(2));
+    if (called.args.size() == 2) CHECK_EQ(called.args[1]->int_value, 10L);
+}
+
+TEST(sema_lets_a_default_settle_an_otherwise_equal_arity_choice) {
+    Defaults guard;
+    Program p;
+    add_overload(p, "beep", {TypeKind::Int});
+    add_overload(p, "beep", {TypeKind::Int, TypeKind::Int});
+    set_default_argument("", "beep", 2, 1, 5);
+
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("beep", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(1));
+        return a;
+    }())));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    // Supplying every argument beats leaning on a default, so the one-parameter
+    // overload wins outright rather than the call being called ambiguous.
+    CHECK(r.ok);
+    CHECK(stmt_expr(p, 0, 2).name == "beep__int");
+}
+
+TEST(sema_defaults_do_not_leak_between_same_named_overloads) {
+    Defaults guard;
+    Program p;
+    add_overload(p, "send", {TypeKind::Int});
+    add_overload(p, "send", {TypeKind::Int, TypeKind::Int});
+    // Only the two-parameter overload has a default.
+    set_default_argument("", "send", 2, 1, 3);
+
+    std::vector<StmtPtr> b;
+    b.push_back(expr_stmt(call("send", [] {
+        std::vector<ExprPtr> a;
+        a.push_back(lit(1));
+        a.push_back(lit(2));
+        return a;
+    }())));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(r.ok);
+    CHECK(stmt_expr(p, 0, 2).name == "send__int_int");
+    CHECK_EQ(stmt_expr(p, 0, 2).args.size(), size_t(2));
+}
+
+TEST(sema_fills_a_constructor_default) {
+    Defaults guard;
+    Program p;
+    ClassDecl c;
+    c.name = "Stepper";
+    Function ctor;
+    ctor.name = "Stepper";
+    ctor.is_constructor = true;
+    ctor.return_type = make_type(TypeKind::Void);
+    ctor.params.push_back({"steps", make_type(TypeKind::Int)});
+    ctor.params.push_back({"speed", make_type(TypeKind::Int)});
+    ctor.body = block({});
+    c.methods.push_back(std::move(ctor));
+    p.classes.push_back(std::move(c));
+    set_default_argument("Stepper", "Stepper", 2, 1, 60);
+
+    auto stepper = make_type(TypeKind::Class);
+    stepper->class_name = "Stepper";
+
+    auto decl = var("motor", stepper);
+    decl->ctor_args.push_back(lit(200));
+    std::vector<StmtPtr> b;
+    b.push_back(std::move(decl));
+    add_fn(p, "setup", std::move(b));
+
+    auto r = analyse(p);
+    CHECK(r.ok);
+    // Constructors keep their `<Class>__ctor` label, but their arguments are
+    // completed like anything else's.
+    CHECK(p.classes[0].methods[0].name == "Stepper");
+    CHECK_EQ(p.functions[0].body->body[0]->ctor_args.size(), size_t(2));
+    CHECK_EQ(p.functions[0].body->body[0]->ctor_args[1]->int_value, 60L);
+}
