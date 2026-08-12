@@ -346,7 +346,7 @@ void CodeGen::gen_binary(const std::string& op, const Expr& lhs, const Expr& rhs
     if (op == "&&" || op == "||") {
         std::string shortcut = new_label(op == "&&" ? "andfalse" : "ortrue");
         std::string end_label = new_label("logend");
-        gen_expr(*e.lhs);
+        gen_expr(lhs);
         if (failed()) return;
         emit("or r24, r25");
         emit(std::string(op == "&&" ? "breq " : "brne ") + shortcut);

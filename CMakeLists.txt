@@ -84,6 +84,7 @@ add_executable(ardio_tests
     tests/test_avr_assembler.cpp
     tests/test_lexer.cpp
     tests/test_preprocess.cpp
+    tests/test_runtime_core.cpp
 )
 target_link_libraries(ardio_tests PRIVATE libardio)
 target_include_directories(ardio_tests PRIVATE tests)
