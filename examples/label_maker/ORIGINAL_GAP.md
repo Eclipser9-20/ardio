@@ -133,15 +133,9 @@ In the sketch: `boolean pPenOnPaper = false;`, `void plot(boolean …)`,
 **Difficulty: easy.** Three aliases — `boolean` → `bool`, `byte`/`uint8_t` →
 `unsigned char` — plus the rest of `<stdint.h>`'s AVR set while you are there.
 
-## 5. Aggregate initialisers
+## 5. Aggregate initialisers -- DONE
 
-All three forms are rejected, at global and at block scope.
-
-```
-error: line 187: cannot initialise int[4] from <untyped>
-error: line 187: cannot initialise int[2][2] from <untyped>
-error: line 187: cannot initialise char[4] from char[4]
-```
+All three forms now compile, at global and at block scope.
 
 ```cpp
 int v[4] = {1, 2, 3, 4};
@@ -149,14 +143,16 @@ int v[2][2] = {{1, 2}, {3, 4}};
 const char a[] = "ABC";
 ```
 
-In the sketch: `int xPins[4] = {6, 8, 7, 9};`, the alphabet string, and the
-63×14 stroke-font table — 74 of the file's lines, and the reason the sketch
-exists.
+Braced lists are typed against the target type, element by element, with
+nested braces recursing into the element type; too many initialisers is an
+error and too few zero-fill, as C promises. A global's initialiser is folded
+to a byte image and stored before the entry point runs; a local's is lowered
+into one store per element.
 
-**Difficulty: medium.** Uninitialised arrays, including two-dimensional ones,
-already work; what is missing is turning a brace list into initialised data in
-the image. The 2-D case needs row-major flattening with the row stride from
-the declared type.
+The 63x14 table is 1764 bytes. It fits in the ATmega328P's SRAM, but only just
+-- globals are limited to 1792 bytes so that the stack has room -- so a global
+array that does not fit is now a diagnostic naming the sizes rather than a
+run-time overwrite of the stack.
 
 ## 6. Functional-style casts
 

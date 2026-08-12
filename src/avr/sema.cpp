@@ -58,7 +58,19 @@ std::string describe(const TypePtr& t) {
     case TypeKind::Long:    return "long";
     case TypeKind::ULong:   return "unsigned long";
     case TypeKind::Pointer: return describe(t->pointee) + "*";
-    case TypeKind::Array:   return describe(t->pointee) + "[" + std::to_string(t->array_length) + "]";
+    case TypeKind::Array: {
+        // C spells the outermost dimension first: `int b[3][2]` is an array of
+        // 3 arrays of 2 ints, and must read back as int[3][2]. Walking inwards
+        // and appending gets that order; recursing on the element type and
+        // prepending would print it inside out.
+        std::string dims;
+        TypePtr cur = t;
+        while (cur && cur->kind == TypeKind::Array) {
+            dims += "[" + std::to_string(cur->array_length) + "]";
+            cur = cur->pointee;
+        }
+        return describe(cur) + dims;
+    }
     case TypeKind::Class:   return t->class_name;
     }
     return "?";
@@ -105,6 +117,109 @@ TypePtr usual_conversions(const TypePtr& a, const TypePtr& b) {
     if (!l->is_signed) return l;
     if (!r->is_signed) return r;
     return l;
+}
+
+// ------------------------------------------------ aggregate initialisers ---
+
+bool is_char_array(const TypePtr& t) {
+    return t && t->kind == TypeKind::Array && t->pointee &&
+           t->pointee->kind == TypeKind::Char;
+}
+
+ExprPtr make_int_expr(long value, size_t line) {
+    auto e = std::make_unique<Expr>();
+    e->kind = ExprKind::IntLiteral;
+    e->line = line;
+    e->int_value = value;
+    e->type = make_type(TypeKind::Int);
+    return e;
+}
+
+ExprPtr make_ident_expr(const std::string& name, TypePtr type, size_t line) {
+    auto e = std::make_unique<Expr>();
+    e->kind = ExprKind::Identifier;
+    e->line = line;
+    e->name = name;
+    e->type = std::move(type);
+    return e;
+}
+
+// Builds `name[i][j]... = value;` as an ordinary statement. The tree is fully
+// typed here rather than re-checked, because every part of it was just derived
+// from a declared type that analysis has already validated.
+StmtPtr make_element_store(const std::string& name, const TypePtr& decl_type,
+                           const std::vector<long>& path, ExprPtr value, size_t line) {
+    ExprPtr base = make_ident_expr(name, decl_type, line);
+    TypePtr cur = decl_type;
+    for (long index : path) {
+        auto ix = std::make_unique<Expr>();
+        ix->kind = ExprKind::Index;
+        ix->line = line;
+        ix->lhs = std::move(base);
+        ix->rhs = make_int_expr(index, line);
+        cur = cur ? cur->pointee : cur;
+        ix->type = cur;
+        base = std::move(ix);
+    }
+    auto assign = std::make_unique<Expr>();
+    assign->kind = ExprKind::Assign;
+    assign->op = "=";
+    assign->line = line;
+    assign->type = cur;
+    assign->lhs = std::move(base);
+    assign->rhs = std::move(value);
+
+    auto stmt = std::make_unique<Stmt>();
+    stmt->kind = StmtKind::Expression;
+    stmt->line = line;
+    stmt->expr = std::move(assign);
+    return stmt;
+}
+
+// Flattens an initialiser for `name` of type `decl_type` into one store per
+// scalar element, in address order, zero-filling everything the braces left
+// out -- which is what C promises and what SRAM, being uninitialised at reset,
+// does not give for free.
+//
+// `slot` owns the sub-initialiser for the element `path` names, and may be
+// null (nothing was written for it). Element expressions are moved out of the
+// original tree rather than copied.
+void expand_initialiser(const std::string& name, const TypePtr& decl_type,
+                        const TypePtr& type, ExprPtr* slot, std::vector<long>& path,
+                        std::vector<StmtPtr>& out, size_t line) {
+    if (type && type->kind == TypeKind::Array) {
+        const bool from_string = slot && *slot && (*slot)->kind == ExprKind::StringLiteral;
+        const std::string text = from_string ? (*slot)->str_value : std::string();
+        for (long i = 0; i < type->array_length; ++i) {
+            path.push_back(i);
+            if (from_string) {
+                long ch = i < static_cast<long>(text.size())
+                              ? static_cast<unsigned char>(text[static_cast<size_t>(i)])
+                              : 0;
+                ExprPtr byte = make_int_expr(ch, line);
+                expand_initialiser(name, decl_type, type->pointee, &byte, path, out, line);
+            } else {
+                ExprPtr* sub = nullptr;
+                if (slot && *slot && (*slot)->kind == ExprKind::InitList &&
+                    i < static_cast<long>((*slot)->args.size()))
+                    sub = &(*slot)->args[static_cast<size_t>(i)];
+                expand_initialiser(name, decl_type, type->pointee, sub, path, out, line);
+            }
+            path.pop_back();
+        }
+        return;
+    }
+
+    ExprPtr value;
+    if (slot && *slot) {
+        Expr& e = **slot;
+        if (e.kind == ExprKind::InitList)
+            value = e.args.empty() ? make_int_expr(0, line) : std::move(e.args[0]);
+        else
+            value = std::move(*slot);
+    }
+    if (!value) value = make_int_expr(0, line);
+    out.push_back(make_element_store(name, decl_type, path, std::move(value), line));
 }
 
 bool is_lvalue(const Expr& e) {
@@ -355,9 +470,22 @@ private:
         for (const std::string& base : order) {
             Bucket& bucket = buckets[base];
             bool constructors = bucket.front().second.front()->is_constructor;
+
+            // A function with no body anywhere in the translation unit is
+            // implemented in assembly, where its label is already fixed --
+            // renaming it would emit a call to a symbol the runtime does not
+            // define. Those keep their source name even when overloaded.
+            bool externally_defined = false;
+            for (const auto& entry : bucket) {
+                bool any_body = false;
+                for (const Function* f : entry.second)
+                    if (f->body) { any_body = true; break; }
+                if (!any_body) { externally_defined = true; break; }
+            }
+
             // A single signature keeps its plain name; so do constructors,
             // whose label the back end builds from the is_constructor flag.
-            bool mangle = bucket.size() > 1 && !constructors;
+            bool mangle = bucket.size() > 1 && !constructors && !externally_defined;
 
             for (auto& entry : bucket) {
                 const std::string& sig = entry.first;
@@ -407,12 +535,66 @@ private:
     void declare_global(Global& g) {
         if (!g.type) fail(g.line, "global '" + g.name + "' has no type");
         declare(g.name, g.type, g.line);
-        if (g.init) {
-            TypePtr t = check(*g.init);
-            if (!assignable(g.type, t))
-                fail(g.line, "cannot initialise " + describe(g.type) + " from " + describe(t));
-        }
+        if (g.init) check_initialiser(*g.init, g.type, g.line);
         check_ctor_args(g.type, g.ctor_args, g.line);
+    }
+
+    // Types an initialiser against the thing it initialises. A braced list
+    // only means something once the target type is known, so this is where an
+    // InitList gets checked -- element count against the array length, each
+    // element against the element type, recursing for nested braces. Missing
+    // elements are legal and become zeros; extra ones are an error.
+    void check_initialiser(Expr& init, const TypePtr& target, size_t line) {
+        if (target && target->kind == TypeKind::Array) {
+            if (init.kind == ExprKind::StringLiteral) {
+                // A string literal initialising a char array copies its
+                // characters plus the terminator, rather than assigning one
+                // array to another (which C has no such thing as).
+                if (!is_char_array(target))
+                    fail(line, "cannot initialise " + describe(target) +
+                                   " from a string literal");
+                check(init);
+                // C lets the array be exactly as long as the characters, in
+                // which case the terminator is simply dropped.
+                long need = static_cast<long>(init.str_value.size());
+                if (target->array_length > 0 && need > target->array_length)
+                    fail(line, "string literal needs " + std::to_string(need + 1) +
+                                   " bytes, which does not fit in " + describe(target));
+                return;
+            }
+            if (init.kind != ExprKind::InitList)
+                fail(line, "cannot initialise " + describe(target) + " from " +
+                               describe(decay(check(init))));
+            if (static_cast<long>(init.args.size()) > target->array_length)
+                fail(line, std::to_string(init.args.size()) + " initialisers for " +
+                               describe(target) + ", which holds " +
+                               std::to_string(target->array_length));
+            for (auto& element : init.args)
+                if (element) check_initialiser(*element, target->pointee, line);
+            init.type = target;
+            return;
+        }
+
+        if (init.kind == ExprKind::InitList) {
+            // `int x = { 1 }` -- a braced initialiser for a scalar holds at
+            // most one value.
+            if (init.args.size() > 1)
+                fail(line, std::to_string(init.args.size()) + " initialisers for " +
+                               describe(target) + ", which holds 1");
+            if (!init.args.empty() && init.args[0])
+                check_initialiser(*init.args[0], target, line);
+            init.type = target;
+            return;
+        }
+
+        TypePtr t = check(init);
+        if (!assignable(target, t))
+            fail(line, "cannot initialise " + describe(target) + " from " + describe(t));
+    }
+
+    // True when a declaration needs lowering into element-by-element stores.
+    static bool needs_expansion(const Stmt& s) {
+        return s.var_init && s.var_type && s.var_type->kind == TypeKind::Array;
     }
 
     void analyse_function(Function& f, const ClassDecl* owner) {
@@ -458,6 +640,11 @@ private:
     // -------------------------------------------------------- statements ---
 
     void check_stmt(Stmt& s) {
+        // Set by the enclosing block for its own direct children only, so a
+        // `for` initialiser -- which has nowhere to splice stores into -- does
+        // not inherit it.
+        const bool in_block = expanding_block_;
+        expanding_block_ = false;
         switch (s.kind) {
         case StmtKind::Empty:
         case StmtKind::Break:
@@ -473,22 +660,43 @@ private:
             if (s.var_type->kind == TypeKind::Class &&
                 !classes_.count(s.var_type->class_name))
                 fail(s.line, "unknown class '" + s.var_type->class_name + "'");
-            if (s.var_init) {
-                TypePtr t = check(*s.var_init);
-                if (!assignable(s.var_type, t))
-                    fail(s.line, "cannot initialise " + describe(s.var_type) + " from " + describe(t));
-            }
+            if (s.var_init) check_initialiser(*s.var_init, s.var_type, s.line);
             check_ctor_args(s.var_type, s.ctor_args, s.line);
             declare(s.var_name, s.var_type, s.line);
+            // A local array's initialiser has no single value to leave in a
+            // register, so it is lowered into one store per element by the
+            // enclosing block. Reaching here means there is no block to do
+            // that -- a `for` initialiser, say.
+            if (needs_expansion(s) && !in_block)
+                fail(s.line, "an array initialiser is only supported on a "
+                             "declaration inside a block");
             break;
         }
 
-        case StmtKind::Block:
+        case StmtKind::Block: {
             scopes_.emplace_back();
-            for (auto& child : s.body)
-                if (child) check_stmt(*child);
+            // Index-based, because expanding an array declaration splices the
+            // stores that fill it in directly after the declaration.
+            for (size_t i = 0; i < s.body.size(); ++i) {
+                if (!s.body[i]) continue;
+                Stmt& child = *s.body[i];
+                expanding_block_ = true;
+                check_stmt(child);
+                if (child.kind != StmtKind::VarDecl || !needs_expansion(child)) continue;
+
+                std::vector<StmtPtr> stores;
+                std::vector<long> path;
+                expand_initialiser(child.var_name, child.var_type, child.var_type,
+                                   &child.var_init, path, stores, child.line);
+                child.var_init.reset();
+                s.body.insert(s.body.begin() + static_cast<long>(i) + 1,
+                              std::make_move_iterator(stores.begin()),
+                              std::make_move_iterator(stores.end()));
+                i += stores.size();
+            }
             scopes_.pop_back();
             break;
+        }
 
         case StmtKind::If:
             require_condition(s);
@@ -951,6 +1159,7 @@ private:
     std::map<std::string, std::vector<FuncSig>> ctors_;
     TypePtr current_return_;
     const ClassDecl* current_class_ = nullptr;
+    bool expanding_block_ = false;   // the statement being checked is a block's direct child
 };
 
 } // namespace

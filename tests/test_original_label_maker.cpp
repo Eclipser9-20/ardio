@@ -112,23 +112,6 @@ TEST(original_label_maker_still_cannot_spell_byte) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Aggregate initialisers -- one-dimensional, two-dimensional, and the
-// string-literal form. The sketch has all three: xPins/yPins, the 63x14
-// character table, and the alphabet.
-// ---------------------------------------------------------------------------
-TEST(original_label_maker_still_cannot_initialise_an_array) {
-    still_rejected(bare("int v[4] = {1, 2, 3, 4};"));
-}
-
-TEST(original_label_maker_still_cannot_initialise_a_2d_array) {
-    still_rejected(bare("int v[2][2] = {{1, 2}, {3, 4}};"));
-}
-
-TEST(original_label_maker_still_cannot_initialise_char_array_from_a_string) {
-    still_rejected(bare("const char a[] = \"ABC\";"));
-}
-
-// ---------------------------------------------------------------------------
 // 6. Functional-style casts.
 //
 //     char c = char(str.charAt(i));
@@ -167,7 +150,9 @@ TEST(original_label_maker_still_cannot_parse_extern_c) {
     still_rejected(bare("extern \"C\" { void ff(unsigned char c); }"));
 }
 
-TEST(original_label_maker_still_cannot_include_HardwareSerial) {
+// FIXED: HardwareSerial.h now preprocesses and compiles, so `Serial` is
+// reachable from a sketch.
+TEST(original_label_maker_can_include_HardwareSerial) {
     std::string dir;
     if (!runtime_include_dir(dir)) {
         std::printf("    skipped: runtime/include not found\n");
@@ -176,7 +161,8 @@ TEST(original_label_maker_still_cannot_include_HardwareSerial) {
     auto r = ardio::compile_avr(
         "#include <HardwareSerial.h>\nvoid setup() { Serial.begin(9600); }\nvoid loop() {}\n",
         std::vector<std::string>{dir});
-    still_rejected(r);
+    if (!r.ok) std::printf("    (compiler said: %s)\n", r.error.c_str());
+    CHECK(r.ok);
 }
 
 // ---------------------------------------------------------------------------
@@ -214,15 +200,26 @@ TEST(original_label_maker_still_has_no_abs) {
 // Written as raw assembly so the test says exactly what is missing rather
 // than needing a few thousand lines of C to provoke it.
 // ---------------------------------------------------------------------------
-TEST(original_label_maker_still_cannot_relax_a_long_jump) {
-    std::string asm_text = "start:\n    rjmp far\n";
+// FIXED: RJMP and RCALL reach only +2047/-2048 words, which a full-size sketch
+// overflows. They now widen to the two-word absolute JMP/CALL, which addresses
+// the whole flash -- the same fixed-point sizing loop that relaxes conditional
+// branches.
+TEST(original_label_maker_relaxes_a_long_jump) {
+    std::string asm_text = "start:\n    rcall far\n";
     for (int i = 0; i < 3000; i++) asm_text += "    nop\n";
     asm_text += "far:\n    ret\n";
 
     auto r = ardio::assemble(asm_text);
-    if (r.ok) std::printf("    long jumps now assemble -- the limitation is gone\n");
-    else      std::printf("    (still: %s)\n", r.error.c_str());
-    CHECK(!r.ok);
+    if (!r.ok) std::printf("    (assembler said: %s)\n", r.error.c_str());
+    CHECK(r.ok);
+    if (!r.ok) return;
+
+    // The call widened to CALL (0x940E) plus an absolute word address. The
+    // target sits after the two-word call and 3000 nops.
+    int w0 = int(r.code[0]) | (int(r.code[1]) << 8);
+    int w1 = int(r.code[2]) | (int(r.code[3]) << 8);
+    CHECK_EQ(w0, 0x940E);
+    CHECK_EQ(w1, 3002);
 }
 
 // ---------------------------------------------------------------------------

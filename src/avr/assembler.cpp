@@ -743,8 +743,8 @@ AssembleResult assemble(std::string_view source) {
     };
 
     for (int attempt = 0; ; ++attempt) {
-        if (attempt > 16) {
-            result.error = "branch relaxation did not settle";
+        if (attempt > 64) {
+            result.error = "branch relaxation did not settle -- a jump target keeps moving out of reach as instructions widen";
             return result;
         }
         bool relaxed_something = false;
@@ -779,7 +779,9 @@ AssembleResult assemble(std::string_view source) {
             } else {
                 e.align_word();
                 int words = instruction_words(line.mnemonic);
-                if (is_branch(line.mnemonic) && relaxed.count(line_index)) words = 2;
+                bool relative_jump = line.mnemonic == "rjmp" || line.mnemonic == "rcall";
+                if ((is_branch(line.mnemonic) || relative_jump) && relaxed.count(line_index))
+                    words = 2;
                 e.pc += 2 * words;
             }
         }
@@ -988,11 +990,28 @@ AssembleResult assemble(std::string_view source) {
             if (ops.empty()) ctx.fail("missing target");
             long target = 0;
             if (!ctx.failed() && resolve_target(ops[0], true, target)) {
-                long k = target - pc - 1;
-                check_range(ctx, k, -2048, 2047, "jump offset");
-                if (!ctx.failed()) {
-                    word = uint16_t((m == "rjmp" ? 0xC000 : 0xD000) | (unsigned(k) & 0x0FFF));
-                    encoded = true;
+                if (relaxed.count(line_index)) {
+                    // Out of RJMP's reach: widen to the two-word absolute form,
+                    // which addresses the whole flash.
+                    check_range(ctx, target, 0, 0xFFFF, "address");
+                    if (!ctx.failed()) {
+                        word = m == "rjmp" ? 0x940C : 0x940E;
+                        extra = uint16_t(target);
+                        encoded = two_words = true;
+                    }
+                } else {
+                    long k = target - pc - 1;
+                    if (k < -2048 || k > 2047) {
+                        relaxed.insert(line_index);
+                        relaxed_something = true;
+                        word = m == "rjmp" ? 0x940C : 0x940E;
+                        extra = uint16_t(target & 0xFFFF);
+                        encoded = two_words = true;
+                    } else {
+                        word = uint16_t((m == "rjmp" ? 0xC000 : 0xD000) |
+                                        (unsigned(k) & 0x0FFF));
+                        encoded = true;
+                    }
                 }
             }
         } else if (branch_base(m, base)) {
@@ -1013,12 +1032,22 @@ AssembleResult assemble(std::string_view source) {
                 } else {
                     long k = target - pc - 1;
                     if (k < -64 || k > 63) {
-                        relaxed.insert(line_index);   // too far: widen and start over
+                        // Too far. Record it and encode the widened form now:
+                        // this pass's output is discarded, but keeping the
+                        // program counter consistent means every other jump in
+                        // the same pass is measured against realistic
+                        // addresses, so they are all found together rather
+                        // than one per retry.
+                        relaxed.insert(line_index);
                         relaxed_something = true;
-                        break;
+                        long wide = target - (pc + 1) - 1;
+                        word = uint16_t((base ^ 0x0400) | (1u << 3));
+                        extra = uint16_t(0xC000 | (unsigned(wide) & 0x0FFF));
+                        encoded = two_words = true;
+                    } else {
+                        word = uint16_t(base | ((unsigned(k) & 0x7F) << 3));
+                        encoded = true;
                     }
-                    word = uint16_t(base | ((unsigned(k) & 0x7F) << 3));
-                    encoded = true;
                 }
             }
         } else if (ops.size() >= 2 && parse_register(ops[0]) >= 0 &&

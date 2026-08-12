@@ -104,6 +104,7 @@ add_executable(ardio_tests
     tests/test_compiler.cpp
     tests/test_ir_turret.cpp
     tests/test_label_maker.cpp
+    tests/test_aggregate_init.cpp
     tests/test_original_label_maker.cpp
     tests/test_runtime_string.cpp
     tests/test_codegen_class.cpp

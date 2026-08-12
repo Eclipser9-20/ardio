@@ -15,6 +15,7 @@
 #include <cctype>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace ardio {
 
@@ -133,6 +134,14 @@ std::string quote_error_line(const std::string& error, const std::string& unit) 
     size_t first = text.find_first_not_of(" \t");
     if (first == std::string::npos) return {};
     text = text.substr(first);
+
+    // A generated table can be thousands of characters on one line; echoing all
+    // of it buries the diagnostic rather than illustrating it.
+    constexpr size_t kMaxEcho = 100;
+    if (text.size() > kMaxEcho)
+        text = text.substr(0, kMaxEcho) + " ... (" +
+               std::to_string(text.size() - kMaxEcho) + " more characters)";
+
     return "\n  " + std::to_string(n) + " | " + text +
            "\n(line numbers count the whole translation unit: the sketch plus "
            "every header it includes)";
@@ -184,6 +193,69 @@ bool fold_constant(const Expr& e, const std::map<std::string, long>& known, long
     default:
         return false;
     }
+}
+
+// The ATmega328P's SRAM is 0x0100..0x08FF. Globals are packed upwards from the
+// bottom while the stack grows downwards from RAMEND, so they have to be kept
+// clear of each other: this is how much room is left for the stack, calls and
+// locals. It is a fixed budget rather than a guess at the program's real
+// depth, but a fixed budget that is checked beats silently laying a table over
+// the stack and corrupting it at run time.
+constexpr int kSramStart = 0x0100;
+constexpr int kSramEnd   = 0x0900;    // one past the last byte
+constexpr int kStackReserve = 256;
+
+// Appends `size` little-endian bytes of `value`.
+void append_scalar(std::vector<int>& bytes, long value, int size) {
+    for (int i = 0; i < size; ++i) bytes.push_back(static_cast<int>((value >> (8 * i)) & 0xFF));
+}
+
+// Folds a global's initialiser into the exact byte image the variable should
+// hold when the entry point runs -- the .data section a linker would normally
+// emit. Braced initialisers and string literals are laid out element by
+// element in address order, and anything the source left out is zero, as C
+// promises. Returns false if some part of it is not a compile-time constant.
+bool fold_initialiser(const Expr* e, const TypePtr& type,
+                      const std::map<std::string, long>& known,
+                      std::vector<int>& bytes) {
+    const int total = type ? type->size() : 2;
+    if (type && type->kind == TypeKind::Array) {
+        const TypePtr& elem = type->pointee;
+        const int elem_size = elem ? elem->size() : 1;
+        if (elem_size < 1) return false;
+
+        if (e && e->kind == ExprKind::StringLiteral) {
+            for (long i = 0; i < type->array_length; ++i) {
+                const std::string& s = e->str_value;
+                long ch = i < static_cast<long>(s.size())
+                              ? static_cast<unsigned char>(s[static_cast<size_t>(i)])
+                              : 0;
+                append_scalar(bytes, ch, elem_size);
+            }
+            return true;
+        }
+        if (e && e->kind != ExprKind::InitList) return false;
+        for (long i = 0; i < type->array_length; ++i) {
+            const Expr* sub = nullptr;
+            if (e && i < static_cast<long>(e->args.size()))
+                sub = e->args[static_cast<size_t>(i)].get();
+            if (!fold_initialiser(sub, elem, known, bytes)) return false;
+        }
+        return true;
+    }
+
+    if (!e) {                                   // left out: zero fill
+        append_scalar(bytes, 0, total);
+        return true;
+    }
+    if (e->kind == ExprKind::InitList) {        // `int x = { 1 }`
+        const Expr* sub = e->args.empty() ? nullptr : e->args[0].get();
+        return fold_initialiser(sub, type, known, bytes);
+    }
+    long v = 0;
+    if (!fold_constant(*e, known, v)) return false;
+    append_scalar(bytes, v, total);
+    return true;
 }
 
 bool has_function(const Program& p, const std::string& name) {
@@ -259,6 +331,20 @@ CompileResult compile_avr(std::string_view source) {
     for (const Global& g : parsed.program.globals) {
         int size = g.type ? g.type->size() : 2;
         if (size < 1) size = 1;
+        const int limit = kSramEnd - kStackReserve;
+        if (gen.next_global_address + size > limit) {
+            const int used = gen.next_global_address - kSramStart;
+            result.error = "line " + std::to_string(g.line) + ": '" + g.name + "' needs " +
+                           std::to_string(size) + " bytes of SRAM, but only " +
+                           std::to_string(limit - gen.next_global_address) +
+                           " of the " + std::to_string(limit - kSramStart) +
+                           " bytes available to globals are left (" + std::to_string(used) +
+                           " already in use, and " + std::to_string(kStackReserve) +
+                           " bytes are reserved for the stack). This chip has " +
+                           std::to_string(kSramEnd - kSramStart) +
+                           " bytes of SRAM in total.";
+            return result;
+        }
         gen.add_global(g.name, size);
     }
 
@@ -283,26 +369,34 @@ CompileResult compile_avr(std::string_view source) {
     // Globals with constant initialisers are stored before the entry point
     // runs, standing in for the .data copy a linker would normally perform.
     std::map<std::string, long> constant_globals;
+    int loaded = -1;                      // byte currently in r24, or -1 if unknown
     for (const Global& g : parsed.program.globals) {
         if (!g.init) continue;
-        int size = g.type ? g.type->size() : 2;
         int addr = gen.global_address(g.name);
         if (addr < 0) continue;
 
-        long v = 0;
-        if (!fold_constant(*g.init, constant_globals, v)) {
+        std::vector<int> image;
+        if (!fold_initialiser(g.init.get(), g.type, constant_globals, image)) {
             result.error = "line " + std::to_string(g.line) + ": initialiser for '" +
                            g.name + "' is not a constant. Globals are stored before " +
                            "the program starts, so their initialisers must be " +
                            "computable at compile time.";
             return result;
         }
-        constant_globals[g.name] = v;
-        gen.emit("    ldi  r24, " + std::to_string(v & 0xFF));
-        gen.emit("    sts  " + std::to_string(addr) + ", r24");
-        if (size >= 2) {
-            gen.emit("    ldi  r24, " + std::to_string((v >> 8) & 0xFF));
-            gen.emit("    sts  " + std::to_string(addr + 1) + ", r24");
+        // Only a scalar has a value later initialisers can name.
+        if (g.type && g.type->kind != TypeKind::Array && !image.empty()) {
+            long v = 0;
+            for (size_t i = image.size(); i-- > 0;) v = (v << 8) | image[i];
+            constant_globals[g.name] = v;
+        }
+        for (size_t i = 0; i < image.size(); ++i) {
+            // A table repeats byte values constantly; reloading r24 only when
+            // the value actually changes roughly halves the setup code.
+            if (image[i] != loaded) {
+                gen.emit("    ldi  r24, " + std::to_string(image[i]));
+                loaded = image[i];
+            }
+            gen.emit("    sts  " + std::to_string(addr + static_cast<int>(i)) + ", r24");
         }
     }
 

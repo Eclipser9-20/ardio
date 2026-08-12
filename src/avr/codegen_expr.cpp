@@ -828,6 +828,14 @@ void CodeGen::gen_expr(const Expr& e) {
         gen_binary(e.op, *e.lhs, *e.rhs, expr_size(e), expr_is_signed(e));
         return;
 
+    case ExprKind::InitList:
+        // A braced list is not a value: it has no single result to leave in a
+        // register. Analysis lowers the ones that initialise a local into
+        // element stores and folds the ones that initialise a global into a
+        // byte image, so reaching here means one turned up somewhere else.
+        fail("a braced initialiser can only appear as an initialiser");
+        return;
+
     default:
         fail("unsupported expression kind");
         return;

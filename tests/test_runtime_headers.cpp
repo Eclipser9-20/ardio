@@ -15,7 +15,9 @@
 
 #include <fstream>
 #include <sstream>
+#include <filesystem>
 #include <string>
+#include <vector>
 #include <vector>
 
 namespace {
@@ -56,7 +58,16 @@ void check_header_compiles(const char* name) {
         std::printf("  skip %s (not found)\n", name);
         return;
     }
-    ardio::CompileResult result = ardio::compile_avr(text + kEntryPoint);
+    // Headers include each other (ezButton.h needs Arduino.h for HIGH), so
+    // compile with the runtime include directory on the path rather than
+    // feeding raw text to a compiler that cannot resolve #include.
+    std::vector<std::string> include_paths;
+    for (const char* dir : {"runtime/include", "../runtime/include",
+                            "../../runtime/include", "../../../runtime/include"}) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(dir, ec)) { include_paths.push_back(dir); break; }
+    }
+    ardio::CompileResult result = ardio::compile_avr(text + kEntryPoint, include_paths);
     if (!result.ok)
         ::ardio_test::fail(__FILE__, __LINE__,
                            std::string(name) + " did not compile: " + result.error);
