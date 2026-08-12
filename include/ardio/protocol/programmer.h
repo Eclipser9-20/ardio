@@ -25,4 +25,23 @@ UploadResult upload_stk500v1(SerialPort& port, const std::string& path,
                              const Board& board, const HexImage& image,
                              const ProgressFn& progress);
 
+struct ReadResult {
+    bool ok = false;
+    std::string error;
+    int baud_used = 0;
+    std::string stage;              // as UploadResult::stage
+    std::vector<uint8_t> data;      // flash contents, page by page
+};
+
+// Reads `byte_count` bytes of flash back off the board (0 means the whole
+// flash), so firmware can be saved before being overwritten.
+//
+// UNVERIFIED AGAINST HARDWARE. The protocol layer is tested against a scripted
+// bootloader and round-trips through the HEX writer, but a read from a real
+// ATmega328P returned data that did not match the image just written to it.
+// Do not rely on a dump as a backup until that is explained.
+ReadResult read_flash_stk500v1(SerialPort& port, const std::string& path,
+                               const Board& board, uint32_t byte_count,
+                               const ProgressFn& progress);
+
 } // namespace ardio

@@ -250,6 +250,36 @@ int do_flash(const std::string& hex_path, const PortInfo& port, const Board& boa
     return 0;
 }
 
+// Reads the board's flash and writes it as Intel HEX. Trailing erased flash
+// (0xFF) is dropped so a small sketch does not produce a 32 KB file.
+int do_dump(const std::string& out_path, const PortInfo& port, const Board& board) {
+    auto serial = make_serial_port();
+    auto result = read_flash_stk500v1(*serial, port.device, board, 0,
+                                      [](const std::string& msg) {
+                                          std::printf("  %s\n", msg.c_str());
+                                      });
+    if (!result.ok) {
+        std::fprintf(stderr, "error [%s]: %s\n", result.stage.c_str(),
+                     result.error.c_str());
+        return 1;
+    }
+
+    std::vector<uint8_t> data = result.data;
+    while (!data.empty() && data.back() == 0xFF) data.pop_back();
+
+    std::ofstream out(out_path);
+    if (!out) {
+        std::fprintf(stderr, "error: cannot write %s\n", out_path.c_str());
+        return 1;
+    }
+    out << write_intel_hex(data);
+    out.close();
+
+    std::printf("saved %zu bytes from %s to %s\n", data.size(),
+                port.device.c_str(), out_path.c_str());
+    return 0;
+}
+
 int do_monitor(const PortInfo& port, int baud) {
     auto serial = make_serial_port();
     std::string error;
@@ -276,6 +306,7 @@ void print_help() {
         "  push [sketch]      build and upload\n"
         "  build [sketch]     compile only\n"
         "  flash <file.hex>   upload a prebuilt image\n"
+        "  dump [file.hex]    save the board's current firmware\n"
         "  monitor            open the serial monitor\n"
         "  ports              list serial ports\n"
         "  boards             list supported boards\n"
@@ -289,6 +320,7 @@ void print_help() {
         "  --board <id>       board id (default: from USB id)\n"
         "  --baud <n>         monitor baud rate\n"
         "  -m, --monitor      open the monitor after a successful push\n"
+        "  --backup [file]    save existing firmware before overwriting it\n"
         "  -h, --help         show this help\n");
 }
 
@@ -346,11 +378,32 @@ int run_command(const Args& args) {
         std::printf("built %s\n", result.hex_path.c_str());
         if (args.command == "build") return 0;
 
+        if (args.backup_first) {
+            std::string backup = args.backup_path.empty() ? "firmware-backup.hex"
+                                                          : args.backup_path;
+            std::printf("backing up existing firmware first\n");
+            int brc = do_dump(backup, port, *board);
+            if (brc != 0) {
+                std::fprintf(stderr,
+                             "error: backup failed, so nothing was overwritten\n");
+                return brc;
+            }
+        }
+
         int rc = do_flash(result.hex_path, port, *board);
         if (rc != 0) return rc;
         if (args.monitor_after)
             return do_monitor(port, args.baud ? args.baud : cfg.monitor_baud);
         return 0;
+    }
+
+    if (args.command == "dump") {
+        std::string out_path = args.positional.empty() ? "firmware-backup.hex"
+                                                       : args.positional;
+        PortInfo port;
+        const Board* board = nullptr;
+        if (!resolve(args, cfg, port, board)) return 1;
+        return do_dump(out_path, port, *board);
     }
 
     if (args.command == "flash") {

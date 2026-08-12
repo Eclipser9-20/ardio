@@ -53,6 +53,109 @@ bool try_sync(SerialPort& port) {
 
 } // namespace
 
+ReadResult read_flash_stk500v1(SerialPort& port, const std::string& path,
+                               const Board& board, uint32_t byte_count,
+                               const ProgressFn& progress) {
+    ReadResult result;
+    auto report = [&](const std::string& msg) { if (progress) progress(msg); };
+
+    const uint32_t total = byte_count == 0 ? board.flash_size : byte_count;
+    if (total > board.flash_size) {
+        result.stage = "size";
+        result.error = "asked for " + std::to_string(total) + " bytes but " +
+                       board.name + " has only " + std::to_string(board.flash_size);
+        return result;
+    }
+
+    std::string tried;
+    bool synced = false;
+    for (int baud : board.baud_rates) {
+        if (!tried.empty()) tried += ", ";
+        tried += std::to_string(baud);
+
+        std::string open_error;
+        if (!port.open(path, baud, open_error)) {
+            result.stage = "open";
+            result.error = open_error;
+            return result;
+        }
+        report("trying " + std::to_string(baud) + " baud");
+        pulse_reset(port);
+        if (try_sync(port)) {
+            synced = true;
+            result.baud_used = baud;
+            break;
+        }
+        port.close();
+    }
+
+    if (!synced) {
+        result.stage = "sync";
+        result.error = "no response from bootloader on " + path +
+                       " at any known baud rate (tried " + tried + ")";
+        return result;
+    }
+    report("synced at " + std::to_string(result.baud_used) + " baud");
+
+    if (!stk500v1::is_ok_response(transact(port, stk500v1::cmd_enter_progmode(), 2))) {
+        result.stage = "sync";
+        result.error = "bootloader refused to enter programming mode";
+        return result;
+    }
+
+    auto sig_resp = transact(port, stk500v1::cmd_read_signature(), 5);
+    if (sig_resp.size() != 5 || sig_resp[0] != stk500v1::kInSync ||
+        sig_resp[4] != stk500v1::kOk) {
+        result.stage = "signature";
+        result.error = "could not read device signature";
+        return result;
+    }
+    std::array<uint8_t, 3> got{sig_resp[1], sig_resp[2], sig_resp[3]};
+    if (got != board.signature) {
+        result.stage = "signature";
+        result.error = "device signature mismatch: expected " + hex3(board.signature) +
+                       " for " + board.name + " but found " + hex3(got);
+        return result;
+    }
+    report("signature ok (" + hex3(got) + ")");
+
+    // A read-page reply is INSYNC, then the bytes, then OK.
+    const uint32_t page = board.page_size;
+    result.data.reserve(total);
+    for (uint32_t offset = 0; offset < total; offset += page) {
+        uint32_t chunk = total - offset;
+        if (chunk > page) chunk = page;
+
+        if (!stk500v1::is_ok_response(
+                transact(port, stk500v1::cmd_load_address(uint16_t(offset / 2)), 2))) {
+            result.stage = "read";
+            result.error = "bootloader rejected load-address at byte offset " +
+                           std::to_string(offset);
+            return result;
+        }
+
+        auto resp = transact(port, stk500v1::cmd_read_page(uint16_t(chunk)), chunk + 2);
+        if (resp.size() != chunk + 2 || resp.front() != stk500v1::kInSync ||
+            resp.back() != stk500v1::kOk) {
+            result.stage = "read";
+            result.error = "page read failed at byte offset " + std::to_string(offset);
+            return result;
+        }
+        result.data.insert(result.data.end(), resp.begin() + 1, resp.end() - 1);
+        report("read " + std::to_string(offset + chunk) + "/" + std::to_string(total) +
+               " bytes");
+    }
+
+    if (!stk500v1::is_ok_response(transact(port, stk500v1::cmd_leave_progmode(), 2))) {
+        result.stage = "read";
+        result.error = "bootloader refused to leave programming mode";
+        return result;
+    }
+
+    result.ok = true;
+    return result;
+}
+
 UploadResult upload_stk500v1(SerialPort& port, const std::string& path,
                              const Board& board, const HexImage& image,
                              const ProgressFn& progress) {

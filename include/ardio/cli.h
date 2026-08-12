@@ -11,6 +11,8 @@ struct Args {
     std::string board;
     int baud = 0;            // 0 = use config/board default
     bool monitor_after = false;
+    bool backup_first = false;   // save existing firmware before writing
+    std::string backup_path;
     bool help = false;
     std::string error;
 };

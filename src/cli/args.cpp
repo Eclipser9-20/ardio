@@ -35,6 +35,11 @@ Args parse_args(int argc, char** argv) {
             if (a.baud <= 0) { a.error = "--baud needs a positive number"; return a; }
         }
         else if (arg == "-m" || arg == "--monitor") { a.monitor_after = true; }
+        else if (arg == "--backup") {
+            a.backup_first = true;
+            // An optional filename may follow, but not another flag.
+            if (i + 1 < argc && argv[i + 1][0] != '-') a.backup_path = argv[++i];
+        }
         else if (arg == "--help" || arg == "-h")    { a.help = true; }
         else if (!arg.empty() && arg[0] == '-') {
             a.error = "unknown flag '" + arg + "'";

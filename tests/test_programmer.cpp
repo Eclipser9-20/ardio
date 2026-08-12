@@ -102,3 +102,78 @@ TEST(upload_rejects_image_larger_than_flash) {
     CHECK(result.stage == "size");
     CHECK(result.error.find("32768") != std::string::npos);
 }
+
+namespace {
+
+// Queues a bootloader that will answer a read of `pages` flash pages, each
+// filled with `fill`.
+void queue_read_session(ardio::FakeSerialPort& port, int pages, uint8_t fill,
+                        const std::array<uint8_t, 3>& sig, int page_size) {
+    auto ok = [&] { port.to_read.push_back(0x14); port.to_read.push_back(0x10); };
+    ok();                                        // get_sync
+    ok();                                        // enter progmode
+    port.to_read.push_back(0x14);                // signature
+    port.to_read.push_back(sig[0]);
+    port.to_read.push_back(sig[1]);
+    port.to_read.push_back(sig[2]);
+    port.to_read.push_back(0x10);
+    for (int p = 0; p < pages; ++p) {
+        ok();                                    // load address
+        port.to_read.push_back(0x14);            // read page: INSYNC, data..., OK
+        for (int i = 0; i < page_size; ++i) port.to_read.push_back(fill);
+        port.to_read.push_back(0x10);
+    }
+    ok();                                        // leave progmode
+}
+
+} // namespace
+
+TEST(read_flash_returns_the_bytes_the_board_reports) {
+    const ardio::Board* nano = ardio::find_board_by_id("nano");
+    ardio::FakeSerialPort port;
+    queue_read_session(port, 2, 0xA5, nano->signature, int(nano->page_size));
+
+    auto r = ardio::read_flash_stk500v1(port, "/dev/fake", *nano,
+                                        nano->page_size * 2, nullptr);
+    CHECK(r.ok);
+    CHECK_EQ(r.data.size(), size_t(nano->page_size * 2));
+    CHECK_EQ(int(r.data.front()), 0xA5);
+    CHECK_EQ(int(r.data.back()), 0xA5);
+    CHECK_EQ(r.baud_used, 115200);
+}
+
+TEST(read_flash_reports_the_stage_when_the_board_is_silent) {
+    const ardio::Board* nano = ardio::find_board_by_id("nano");
+    ardio::FakeSerialPort port;                  // nothing queued
+
+    auto r = ardio::read_flash_stk500v1(port, "/dev/fake", *nano, 128, nullptr);
+    CHECK(!r.ok);
+    CHECK(r.stage == "sync");
+}
+
+TEST(read_flash_refuses_to_read_past_the_end_of_flash) {
+    const ardio::Board* nano = ardio::find_board_by_id("nano");
+    ardio::FakeSerialPort port;
+
+    auto r = ardio::read_flash_stk500v1(port, "/dev/fake", *nano, 40000, nullptr);
+    CHECK(!r.ok);
+    CHECK(r.stage == "size");
+    CHECK(r.error.find("32768") != std::string::npos);
+}
+
+TEST(read_flash_round_trips_through_the_hex_writer) {
+    // A dump is only useful if it can be flashed back.
+    const ardio::Board* nano = ardio::find_board_by_id("nano");
+    ardio::FakeSerialPort port;
+    queue_read_session(port, 1, 0x3C, nano->signature, int(nano->page_size));
+
+    auto r = ardio::read_flash_stk500v1(port, "/dev/fake", *nano, nano->page_size, nullptr);
+    CHECK(r.ok);
+
+    std::string text = ardio::write_intel_hex(r.data);
+    std::string err;
+    auto back = ardio::parse_intel_hex(text, err);
+    CHECK(back.has_value());
+    bool identical = back->data == r.data;
+    CHECK(identical);
+}
