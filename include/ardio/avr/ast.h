@@ -21,6 +21,7 @@ using TypePtr = std::shared_ptr<Type>;
 struct Type {
     TypeKind kind = TypeKind::Int;
     bool is_signed = true;
+    bool is_const = false;      // a const global may be folded into its uses
     TypePtr pointee;            // Pointer / Array element
     long array_length = 0;      // Array only
     std::string class_name;     // Class only
@@ -38,6 +39,10 @@ TypePtr make_array(TypePtr elem, long n);
 enum class ExprKind {
     IntLiteral, StringLiteral, Identifier, Unary, Binary, Assign,
     Call, Index, Member, Cast, Conditional,
+    // A braced initialiser: { 1, 2, 3 }, or nested for a 2-D array. The
+    // elements are in `args`, so an aggregate is just an expression whose
+    // parts are known at compile time.
+    InitList,
 };
 
 struct Expr;
