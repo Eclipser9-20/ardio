@@ -16,7 +16,7 @@ add_compile_options(-Wno-unused-command-line-argument)
 add_library(libardio STATIC)
 set_target_properties(libardio PROPERTIES OUTPUT_NAME ardio)
 target_include_directories(libardio PUBLIC include)
-target_sources(libardio PRIVATE src/hex.cpp src/board.cpp src/protocol/stk500v1.cpp src/protocol/programmer.cpp src/platform/ports_select.cpp src/toolchain/config.cpp src/toolchain/search.cpp src/build/compile.cpp)
+target_sources(libardio PRIVATE src/hex.cpp src/board.cpp src/protocol/stk500v1.cpp src/protocol/programmer.cpp src/platform/ports_select.cpp src/toolchain/config.cpp src/toolchain/search.cpp src/build/compile.cpp src/monitor.cpp)
 
 if(APPLE)
     target_sources(libardio PRIVATE src/platform/macos/serial_macos.cpp src/platform/macos/ports_macos.cpp)
