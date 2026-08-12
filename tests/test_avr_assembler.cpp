@@ -142,3 +142,81 @@ TEST(avr_assembles_a_complete_blink_program) {
     CHECK_EQ(word_at(r, 2), 0x982D);
     CHECK_EQ(word_at(r, 3), 0xCFFD);      // back 3 words to loop
 }
+
+TEST(avr_encodes_movw_register_pairs) {
+    // movw r24, r22  ->  0x01CB
+    auto r = asm_ok("movw r24, r22");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0x01CB);
+}
+
+TEST(avr_movw_rejects_odd_registers) {
+    auto r = ardio::assemble("movw r25, r22");
+    CHECK(!r.ok);
+    CHECK(r.error.find("even") != std::string::npos);
+}
+
+TEST(avr_encodes_adiw_and_sbiw) {
+    // adiw r24, 1 -> 0x9601 ; sbiw r28, 2 -> 0x9722
+    auto r = asm_ok("adiw r24, 1\nsbiw r28, 2");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0x9601);
+    CHECK_EQ(word_at(r, 1), 0x9722);
+}
+
+TEST(avr_adiw_rejects_non_pair_registers) {
+    auto r = ardio::assemble("adiw r23, 1");
+    CHECK(!r.ok);
+    CHECK(r.error.find("r24") != std::string::npos);
+}
+
+TEST(avr_lds_and_sts_occupy_two_words) {
+    // lds r24, 0x0100 -> 0x9180 0x0100
+    auto r = asm_ok("lds r24, 0x0100");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(4));
+    CHECK_EQ(word_at(r, 0), 0x9180);
+    CHECK_EQ(word_at(r, 1), 0x0100);
+}
+
+TEST(avr_two_word_instructions_shift_later_labels) {
+    // lds is 2 words, so "here" sits at word 2, and rjmp here is +0... but the
+    // rjmp itself is at word 2, so the offset back to itself is -1.
+    auto r = asm_ok("lds r24, 0x0100\nhere: rjmp here");
+    CHECK(r.ok);
+    CHECK_EQ(r.code.size(), size_t(6));
+    CHECK_EQ(word_at(r, 2), 0xCFFF);
+}
+
+TEST(avr_call_is_two_words_with_absolute_target) {
+    auto r = asm_ok("call target\nnop\ntarget: ret");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0x940E);
+    CHECK_EQ(word_at(r, 1), 0x0003);   // call=2 words, nop=1 -> target at 3
+}
+
+TEST(avr_encodes_std_and_ldd_with_displacement) {
+    // Layout is 10q0 qq0d dddd 1qqq (bit 9 selects store, bit 3 selects Y).
+    // r24 -> d4=0x0100 plus low nibble 0x0080; q=3 -> 0x0003.
+    //   ldd r24, Y+3 -> 0x818B
+    //   std Y+3, r24 -> 0x838B
+    auto r = asm_ok("std Y+3, r24\nldd r24, Y+3");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0x838B);
+    CHECK_EQ(word_at(r, 1), 0x818B);
+}
+
+TEST(avr_clr_is_an_alias_for_eor_with_itself) {
+    // clr r24 == eor r24, r24 -> 0x2788
+    auto r = asm_ok("clr r24");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0x2788);
+}
+
+TEST(avr_encodes_push_pop_and_ret) {
+    auto r = asm_ok("push r28\npop r28\nret");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0x93CF);
+    CHECK_EQ(word_at(r, 1), 0x91CF);
+    CHECK_EQ(word_at(r, 2), 0x9508);
+}

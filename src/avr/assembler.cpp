@@ -1,10 +1,12 @@
 // A two-pass assembler for the AVR instruction set.
 //
-// Pass 1 walks the source recording where each label lands, because a branch
-// may refer to a label defined further down. Pass 2 encodes, resolving those
-// labels to PC-relative offsets. Every AVR instruction handled here is a
-// single 16-bit word, so a label's address is simply the instruction count so
-// far -- which keeps pass 1 to a counter rather than a sizing algorithm.
+// Pass 1 records where each label lands, because a branch may refer to a label
+// defined further down. Pass 2 encodes, resolving labels to PC-relative
+// offsets or absolute word addresses.
+//
+// Most AVR instructions are one 16-bit word, but CALL, JMP, LDS and STS are
+// two, so pass 1 asks instruction_words() for each mnemonic rather than
+// assuming a fixed size.
 
 #include "ardio/avr/assembler.h"
 
@@ -37,12 +39,11 @@ std::string lower(std::string_view s) {
     return out;
 }
 
-// One source line, already split into its parts.
 struct Line {
-    std::string label;                 // empty if none
-    std::string mnemonic;              // empty if the line is only a label
+    std::string label;
+    std::string mnemonic;
     std::vector<std::string> operands;
-    size_t number = 0;                 // 1-based, for error messages
+    size_t number = 0;
 };
 
 std::vector<std::string> split_operands(std::string_view s) {
@@ -66,8 +67,9 @@ std::vector<Line> split_lines(std::string_view src) {
         if (end == std::string_view::npos) end = src.size();
         std::string_view raw = trim(strip_comment(src.substr(i, end - i)));
         ++n;
+        bool last = end == src.size();
         i = end + 1;
-        if (raw.empty()) { if (end == src.size()) break; continue; }
+        if (raw.empty()) { if (last) break; continue; }
 
         Line line;
         line.number = n;
@@ -89,9 +91,14 @@ std::vector<Line> split_lines(std::string_view src) {
         }
 
         if (!line.label.empty() || !line.mnemonic.empty()) lines.push_back(line);
-        if (end == src.size()) break;
+        if (last) break;
     }
     return lines;
+}
+
+// CALL, JMP, LDS and STS carry a 16-bit operand in a second word.
+int instruction_words(const std::string& m) {
+    return (m == "call" || m == "jmp" || m == "lds" || m == "sts") ? 2 : 1;
 }
 
 // -------------------------------------------------------------- operands ---
@@ -99,14 +106,12 @@ std::vector<Line> split_lines(std::string_view src) {
 struct Ctx {
     std::string error;
     size_t line = 0;
-
     void fail(const std::string& msg) {
         if (error.empty()) error = "line " + std::to_string(line) + ": " + msg;
     }
     bool failed() const { return !error.empty(); }
 };
 
-// Parses "r16" / "R16" into 16. Returns -1 if it is not a register.
 int parse_register(const std::string& s) {
     if (s.size() < 2 || (s[0] != 'r' && s[0] != 'R')) return -1;
     for (size_t i = 1; i < s.size(); ++i)
@@ -115,7 +120,6 @@ int parse_register(const std::string& s) {
     return (n >= 0 && n <= 31) ? n : -1;
 }
 
-// Parses a decimal, 0x-hex or 0b-binary literal. Returns false if malformed.
 bool parse_number(const std::string& s, long& out) {
     if (s.empty()) return false;
     size_t start = 0;
@@ -136,6 +140,17 @@ bool parse_number(const std::string& s, long& out) {
     if (!end || *end != '\0') return false;
     out = neg ? -v : v;
     return true;
+}
+
+// Parses "Y+6" / "Z+0" into the displacement. Returns false if not that form.
+bool parse_displacement(const std::string& s, char& base, long& q) {
+    if (s.size() < 1) return false;
+    char b = char(std::toupper(static_cast<unsigned char>(s[0])));
+    if (b != 'Y' && b != 'Z') return false;
+    base = b;
+    if (s.size() == 1) { q = 0; return true; }
+    if (s[1] != '+') return false;
+    return parse_number(s.substr(2), q);
 }
 
 int need_register(Ctx& ctx, const std::vector<std::string>& ops, size_t idx,
@@ -165,44 +180,51 @@ void check_range(Ctx& ctx, long v, long lo, long hi, const char* what) {
 
 // -------------------------------------------------------------- encoding ---
 
-// Instructions whose operands are (register, register).
 bool encode_two_reg(const std::string& m, int d, int r, uint16_t& out) {
-    if (m == "mov") { out = uint16_t(0x2C00 | ((r & 0x10) << 5) | (d << 4) | (r & 0x0F)); return true; }
-    if (m == "add") { out = uint16_t(0x0C00 | ((r & 0x10) << 5) | (d << 4) | (r & 0x0F)); return true; }
-    if (m == "sub") { out = uint16_t(0x1800 | ((r & 0x10) << 5) | (d << 4) | (r & 0x0F)); return true; }
-    if (m == "and") { out = uint16_t(0x2000 | ((r & 0x10) << 5) | (d << 4) | (r & 0x0F)); return true; }
-    if (m == "or")  { out = uint16_t(0x2800 | ((r & 0x10) << 5) | (d << 4) | (r & 0x0F)); return true; }
-    if (m == "eor") { out = uint16_t(0x2400 | ((r & 0x10) << 5) | (d << 4) | (r & 0x0F)); return true; }
-    if (m == "cp")  { out = uint16_t(0x1400 | ((r & 0x10) << 5) | (d << 4) | (r & 0x0F)); return true; }
+    auto pack = [&](uint16_t base) {
+        return uint16_t(base | ((r & 0x10) << 5) | (d << 4) | (r & 0x0F));
+    };
+    if (m == "mov") { out = pack(0x2C00); return true; }
+    if (m == "add" || m == "lsl") { out = pack(0x0C00); return true; }
+    if (m == "adc" || m == "rol") { out = pack(0x1C00); return true; }
+    if (m == "sub") { out = pack(0x1800); return true; }
+    if (m == "sbc") { out = pack(0x0800); return true; }
+    if (m == "and" || m == "tst") { out = pack(0x2000); return true; }
+    if (m == "or")  { out = pack(0x2800); return true; }
+    if (m == "eor" || m == "clr") { out = pack(0x2400); return true; }
+    if (m == "cp")  { out = pack(0x1400); return true; }
+    if (m == "cpc") { out = pack(0x0400); return true; }
+    if (m == "mul") { out = pack(0x9C00); return true; }
     return false;
 }
 
-// Instructions whose only operand is a register.
 bool encode_one_reg(const std::string& m, int d, uint16_t& out) {
     if (m == "inc")  { out = uint16_t(0x9403 | (d << 4)); return true; }
     if (m == "dec")  { out = uint16_t(0x940A | (d << 4)); return true; }
     if (m == "com")  { out = uint16_t(0x9400 | (d << 4)); return true; }
     if (m == "neg")  { out = uint16_t(0x9401 | (d << 4)); return true; }
+    if (m == "asr")  { out = uint16_t(0x9405 | (d << 4)); return true; }
+    if (m == "lsr")  { out = uint16_t(0x9406 | (d << 4)); return true; }
+    if (m == "ror")  { out = uint16_t(0x9407 | (d << 4)); return true; }
+    if (m == "swap") { out = uint16_t(0x9402 | (d << 4)); return true; }
     if (m == "push") { out = uint16_t(0x920F | (d << 4)); return true; }
     if (m == "pop")  { out = uint16_t(0x900F | (d << 4)); return true; }
     return false;
 }
 
-// Instructions with no operands.
 bool encode_no_operand(const std::string& m, uint16_t& out) {
-    if (m == "nop")  { out = 0x0000; return true; }
-    if (m == "ret")  { out = 0x9508; return true; }
-    if (m == "reti") { out = 0x9518; return true; }
-    if (m == "sei")  { out = 0x9478; return true; }
-    if (m == "cli")  { out = 0x94F8; return true; }
-    if (m == "sleep"){ out = 0x9588; return true; }
-    if (m == "wdr")  { out = 0x95A8; return true; }
+    if (m == "nop")   { out = 0x0000; return true; }
+    if (m == "ret")   { out = 0x9508; return true; }
+    if (m == "reti")  { out = 0x9518; return true; }
+    if (m == "sei")   { out = 0x9478; return true; }
+    if (m == "cli")   { out = 0x94F8; return true; }
+    if (m == "sleep") { out = 0x9588; return true; }
+    if (m == "wdr")   { out = 0x95A8; return true; }
     return false;
 }
 
-// Conditional branches: 1111 0Fkk kkkk ksss
 bool branch_base(const std::string& m, uint16_t& base) {
-    if (m == "brne") { base = 0xF401; return true; }  // F=1, s=001
+    if (m == "brne") { base = 0xF401; return true; }
     if (m == "breq") { base = 0xF001; return true; }
     if (m == "brcs" || m == "brlo") { base = 0xF000; return true; }
     if (m == "brcc" || m == "brsh") { base = 0xF400; return true; }
@@ -213,13 +235,24 @@ bool branch_base(const std::string& m, uint16_t& base) {
     return false;
 }
 
+// Immediate forms restricted to r16-r31.
+bool immediate_base(const std::string& m, uint16_t& base) {
+    if (m == "ldi")  { base = 0xE000; return true; }
+    if (m == "subi") { base = 0x5000; return true; }
+    if (m == "sbci") { base = 0x4000; return true; }
+    if (m == "andi") { base = 0x7000; return true; }
+    if (m == "ori")  { base = 0x6000; return true; }
+    if (m == "cpi")  { base = 0x3000; return true; }
+    return false;
+}
+
 } // namespace
 
 AssembleResult assemble(std::string_view source) {
     AssembleResult result;
     std::vector<Line> lines = split_lines(source);
 
-    // ---- pass 1: label addresses (in words) --------------------------------
+    // ---- pass 1: label addresses, in words ---------------------------------
     std::map<std::string, long> labels;
     {
         long pc = 0;
@@ -232,25 +265,44 @@ AssembleResult assemble(std::string_view source) {
                 }
                 labels[line.label] = pc;
             }
-            if (!line.mnemonic.empty()) ++pc;
+            if (!line.mnemonic.empty()) pc += instruction_words(line.mnemonic);
         }
     }
 
     // ---- pass 2: encode ----------------------------------------------------
     Ctx ctx;
     long pc = 0;
+    std::vector<uint16_t> words;
+
+    // Resolves an operand that may be a label or a literal.
+    auto resolve_target = [&](const std::string& op, bool relative, long& out) {
+        auto it = labels.find(op);
+        if (it != labels.end()) { out = it->second; return true; }
+        long n = 0;
+        if (!parse_number(op, n)) {
+            ctx.fail("undefined label '" + op + "'");
+            return false;
+        }
+        out = relative ? pc + n : n;
+        return true;
+    };
+
     for (const Line& line : lines) {
         if (line.mnemonic.empty()) continue;
         ctx.line = line.number;
         const std::string& m = line.mnemonic;
         const auto& ops = line.operands;
-        uint16_t word = 0;
-        bool encoded = false;
+        uint16_t word = 0, extra = 0;
+        bool encoded = false, two_words = false;
 
+        uint16_t base = 0;
         if (encode_no_operand(m, word)) {
             encoded = true;
-        } else if (m == "ldi" || m == "subi" || m == "andi" || m == "ori" ||
-                   m == "cpi") {
+        } else if (m == "clr" || m == "tst" || m == "lsl" || m == "rol") {
+            // Aliases that repeat their single operand as both sources.
+            int d = need_register(ctx, ops, 0, "register");
+            if (!ctx.failed() && encode_two_reg(m, d, d, word)) encoded = true;
+        } else if (immediate_base(m, base)) {
             int d = need_register(ctx, ops, 0, "destination register");
             long k = need_number(ctx, ops, 1, "immediate");
             if (!ctx.failed()) {
@@ -259,14 +311,33 @@ AssembleResult assemble(std::string_view source) {
                 check_range(ctx, k, -128, 255, "immediate");
             }
             if (!ctx.failed()) {
-                uint16_t base = m == "ldi" ? 0xE000 : m == "subi" ? 0x5000
-                              : m == "andi" ? 0x7000 : m == "ori" ? 0x6000 : 0x3000;
                 unsigned kk = unsigned(k) & 0xFF;
                 word = uint16_t(base | ((kk & 0xF0) << 4) | ((d - 16) << 4) | (kk & 0x0F));
                 encoded = true;
             }
+        } else if (m == "movw") {
+            int d = need_register(ctx, ops, 0, "destination register");
+            int r = need_register(ctx, ops, 1, "source register");
+            if (!ctx.failed() && ((d | r) & 1))
+                ctx.fail("movw needs even register numbers");
+            if (!ctx.failed()) {
+                word = uint16_t(0x0100 | ((d / 2) << 4) | (r / 2));
+                encoded = true;
+            }
+        } else if (m == "adiw" || m == "sbiw") {
+            int d = need_register(ctx, ops, 0, "register pair");
+            long k = need_number(ctx, ops, 1, "immediate");
+            if (!ctx.failed()) {
+                if (d != 24 && d != 26 && d != 28 && d != 30)
+                    ctx.fail(m + " only works on r24, r26, r28 or r30");
+                check_range(ctx, k, 0, 63, "immediate");
+            }
+            if (!ctx.failed()) {
+                word = uint16_t((m == "adiw" ? 0x9600 : 0x9700) |
+                                ((k & 0x30) << 2) | (((d - 24) / 2) << 4) | (k & 0x0F));
+                encoded = true;
+            }
         } else if (m == "out" || m == "in") {
-            // "out A, Rr" but "in Rd, A" -- the operand order differs.
             long a = 0;
             int r = 0;
             if (m == "out") {
@@ -278,8 +349,8 @@ AssembleResult assemble(std::string_view source) {
             }
             if (!ctx.failed()) check_range(ctx, a, 0, 0x3F, "I/O address");
             if (!ctx.failed()) {
-                uint16_t base = m == "out" ? 0xB800 : 0xB000;
-                word = uint16_t(base | ((a & 0x30) << 5) | (r << 4) | (a & 0x0F));
+                word = uint16_t((m == "out" ? 0xB800 : 0xB000) |
+                                ((a & 0x30) << 5) | (r << 4) | (a & 0x0F));
                 encoded = true;
             }
         } else if (m == "sbi" || m == "cbi" || m == "sbic" || m == "sbis") {
@@ -290,47 +361,81 @@ AssembleResult assemble(std::string_view source) {
                 check_range(ctx, b, 0, 7, "bit number");
             }
             if (!ctx.failed()) {
-                uint16_t base = m == "sbi" ? 0x9A00 : m == "cbi" ? 0x9800
-                              : m == "sbic" ? 0x9900 : 0x9B00;
-                word = uint16_t(base | (a << 3) | b);
+                uint16_t bb = m == "sbi" ? 0x9A00 : m == "cbi" ? 0x9800
+                            : m == "sbic" ? 0x9900 : 0x9B00;
+                word = uint16_t(bb | (a << 3) | b);
                 encoded = true;
+            }
+        } else if (m == "sbrc" || m == "sbrs") {
+            int r = need_register(ctx, ops, 0, "register");
+            long b = need_number(ctx, ops, 1, "bit number");
+            if (!ctx.failed()) check_range(ctx, b, 0, 7, "bit number");
+            if (!ctx.failed()) {
+                word = uint16_t((m == "sbrc" ? 0xFC00 : 0xFE00) | (r << 4) | b);
+                encoded = true;
+            }
+        } else if (m == "lds" || m == "sts") {
+            int r = 0;
+            long addr = 0;
+            if (m == "lds") {
+                r = need_register(ctx, ops, 0, "destination register");
+                addr = need_number(ctx, ops, 1, "address");
+            } else {
+                addr = need_number(ctx, ops, 0, "address");
+                r = need_register(ctx, ops, 1, "source register");
+            }
+            if (!ctx.failed()) check_range(ctx, addr, 0, 0xFFFF, "address");
+            if (!ctx.failed()) {
+                word = uint16_t((m == "lds" ? 0x9000 : 0x9200) | (r << 4));
+                extra = uint16_t(addr);
+                encoded = two_words = true;
+            }
+        } else if (m == "ldd" || m == "std") {
+            int r = 0;
+            char b = 0;
+            long q = 0;
+            bool form_ok = true;
+            if (m == "ldd") {
+                r = need_register(ctx, ops, 0, "destination register");
+                if (ops.size() < 2 || !parse_displacement(ops[1], b, q)) form_ok = false;
+            } else {
+                if (ops.empty() || !parse_displacement(ops[0], b, q)) form_ok = false;
+                r = need_register(ctx, ops, 1, "source register");
+            }
+            if (!form_ok) ctx.fail("expected Y+q or Z+q");
+            if (!ctx.failed()) check_range(ctx, q, 0, 63, "displacement");
+            if (!ctx.failed()) {
+                uint16_t bb = (m == "ldd" ? 0x8000 : 0x8200) | (b == 'Y' ? 0x0008 : 0x0000);
+                word = uint16_t(bb | ((q & 0x20) << 8) | ((q & 0x18) << 7) |
+                                (r << 4) | (q & 0x07));
+                encoded = true;
+            }
+        } else if (m == "call" || m == "jmp") {
+            if (ops.empty()) ctx.fail("missing target");
+            long target = 0;
+            if (!ctx.failed() && resolve_target(ops[0], false, target)) {
+                check_range(ctx, target, 0, 0xFFFF, "address");
+                if (!ctx.failed()) {
+                    word = m == "call" ? 0x940E : 0x940C;
+                    extra = uint16_t(target);
+                    encoded = two_words = true;
+                }
             }
         } else if (m == "rjmp" || m == "rcall") {
             if (ops.empty()) ctx.fail("missing target");
             long target = 0;
-            if (!ctx.failed()) {
-                auto it = labels.find(ops[0]);
-                if (it != labels.end()) {
-                    target = it->second;
-                } else if (!parse_number(ops[0], target)) {
-                    ctx.fail("undefined label '" + ops[0] + "'");
-                } else {
-                    target = pc + target;   // numeric operand is already relative
-                }
-            }
-            if (!ctx.failed()) {
+            if (!ctx.failed() && resolve_target(ops[0], true, target)) {
                 long k = target - pc - 1;
                 check_range(ctx, k, -2048, 2047, "jump offset");
                 if (!ctx.failed()) {
-                    uint16_t base = m == "rjmp" ? 0xC000 : 0xD000;
-                    word = uint16_t(base | (unsigned(k) & 0x0FFF));
+                    word = uint16_t((m == "rjmp" ? 0xC000 : 0xD000) | (unsigned(k) & 0x0FFF));
                     encoded = true;
                 }
             }
-        } else if (uint16_t base = 0; branch_base(m, base)) {
+        } else if (branch_base(m, base)) {
             if (ops.empty()) ctx.fail("missing target");
             long target = 0;
-            if (!ctx.failed()) {
-                auto it = labels.find(ops[0]);
-                if (it != labels.end()) {
-                    target = it->second;
-                } else if (!parse_number(ops[0], target)) {
-                    ctx.fail("undefined label '" + ops[0] + "'");
-                } else {
-                    target = pc + target;
-                }
-            }
-            if (!ctx.failed()) {
+            if (!ctx.failed() && resolve_target(ops[0], true, target)) {
                 long k = target - pc - 1;
                 check_range(ctx, k, -64, 63, "branch offset");
                 if (!ctx.failed()) {
@@ -356,11 +461,16 @@ AssembleResult assemble(std::string_view source) {
             return result;
         }
 
-        result.code.push_back(uint8_t(word & 0xFF));         // little-endian
-        result.code.push_back(uint8_t((word >> 8) & 0xFF));
-        ++pc;
+        words.push_back(word);
+        if (two_words) words.push_back(extra);
+        pc += two_words ? 2 : 1;
     }
 
+    result.code.reserve(words.size() * 2);
+    for (uint16_t w : words) {                 // little-endian
+        result.code.push_back(uint8_t(w & 0xFF));
+        result.code.push_back(uint8_t((w >> 8) & 0xFF));
+    }
     result.ok = true;
     return result;
 }
