@@ -14,6 +14,7 @@
 
 #include <cctype>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -258,6 +259,93 @@ bool fold_initialiser(const Expr* e, const TypePtr& type,
     return true;
 }
 
+bool has_function(const Program& p, const std::string& name);
+
+// ---------------------------------------------------------- reachability ---
+//
+// Every function in every included header would otherwise be emitted, whether
+// or not anything calls it -- an empty sketch that includes <Arduino.h> came
+// out at 4.5 KB of unreachable code. avr-gcc solves this by putting each
+// function in its own section and letting the linker garbage-collect them;
+// ardio has no linker, so it walks the call graph from the entry points and
+// emits only what is reachable.
+
+void collect_calls_expr(const Expr* e, std::set<std::string>& out);
+
+void collect_calls_stmt(const Stmt* s, std::set<std::string>& out) {
+    if (!s) return;
+    collect_calls_expr(s->expr.get(), out);
+    collect_calls_expr(s->var_init.get(), out);
+    collect_calls_expr(s->step.get(), out);
+    for (const ExprPtr& a : s->ctor_args) collect_calls_expr(a.get(), out);
+    for (const StmtPtr& c : s->body) collect_calls_stmt(c.get(), out);
+    collect_calls_stmt(s->then_branch.get(), out);
+    collect_calls_stmt(s->else_branch.get(), out);
+    collect_calls_stmt(s->init.get(), out);
+}
+
+void collect_calls_expr(const Expr* e, std::set<std::string>& out) {
+    if (!e) return;
+    if (e->kind == ExprKind::Call && !e->name.empty()) {
+        // A method call carries its object in lhs; the label the generator
+        // emits is ClassName__method.
+        std::string class_name;
+        if (e->lhs && e->lhs->type) {
+            const TypePtr& t = e->lhs->type;
+            if (t->kind == TypeKind::Class) class_name = t->class_name;
+            else if (t->kind == TypeKind::Pointer && t->pointee &&
+                     t->pointee->kind == TypeKind::Class)
+                class_name = t->pointee->class_name;
+        }
+        out.insert(class_name.empty() ? e->name : class_name + "__" + e->name);
+    }
+    collect_calls_expr(e->lhs.get(), out);
+    collect_calls_expr(e->rhs.get(), out);
+    collect_calls_expr(e->third.get(), out);
+    for (const ExprPtr& a : e->args) collect_calls_expr(a.get(), out);
+}
+
+// Names of everything reachable from the entry points, as the generator would
+// label them.
+std::set<std::string> reachable_symbols(const Program& program) {
+    std::map<std::string, std::set<std::string>> calls;   // label -> callees
+    for (const Function& f : program.functions)
+        if (f.body) collect_calls_stmt(f.body.get(), calls[f.name]);
+    for (const ClassDecl& c : program.classes)
+        for (const Function& m : c.methods)
+            if (m.body)
+                collect_calls_stmt(m.body.get(),
+                                   calls[c.name + "__" +
+                                         (m.is_constructor ? "ctor" : m.name)]);
+
+    std::set<std::string> reached;
+    std::vector<std::string> worklist;
+    auto add = [&](const std::string& name) {
+        if (reached.insert(name).second) worklist.push_back(name);
+    };
+
+    for (const char* root : {"setup", "loop", "main"})
+        if (has_function(program, root)) add(root);
+
+    // A global of class type runs its constructor before the entry point.
+    for (const Global& g : program.globals) {
+        if (g.type && g.type->kind == TypeKind::Class)
+            add(g.type->class_name + "__ctor");
+        collect_calls_expr(g.init.get(), reached);
+        for (const ExprPtr& a : g.ctor_args) collect_calls_expr(a.get(), reached);
+    }
+    for (const std::string& n : reached) worklist.push_back(n);
+
+    while (!worklist.empty()) {
+        std::string name = worklist.back();
+        worklist.pop_back();
+        auto it = calls.find(name);
+        if (it == calls.end()) continue;
+        for (const std::string& callee : it->second) add(callee);
+    }
+    return reached;
+}
+
 bool has_function(const Program& p, const std::string& name) {
     for (const Function& f : p.functions)
         if (f.name == name && f.body) return true;
@@ -417,8 +505,12 @@ CompileResult compile_avr(std::string_view source) {
         gen.emit("    rjmp .Lhalt");
     }
 
+    const std::set<std::string> reachable = reachable_symbols(parsed.program);
+
     for (const ClassDecl& c : parsed.program.classes) {
         for (const Function& m : c.methods) {
+            std::string label = c.name + "__" + (m.is_constructor ? "ctor" : m.name);
+            if (!reachable.count(label)) continue;   // nothing calls it
             gen.gen_class_method(c, m);
             if (gen.failed()) {
                 result.error = gen.error;
@@ -428,6 +520,7 @@ CompileResult compile_avr(std::string_view source) {
     }
 
     for (const Function& f : parsed.program.functions) {
+        if (f.body && !reachable.count(f.name)) continue;   // nothing calls it
         gen.gen_function(f);
         if (gen.failed()) {
             result.error = gen.error;

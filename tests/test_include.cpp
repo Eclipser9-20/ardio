@@ -10,6 +10,8 @@
 #include "ardio/avr/compiler.h"
 
 #include <filesystem>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -146,16 +148,42 @@ TEST(a_missing_header_the_sketch_never_uses_still_builds) {
     CHECK(r.ok);
 }
 
-TEST(a_header_ardio_cannot_compile_is_named_rather_than_a_line_number) {
+// Including a header whose harder parts ardio cannot generate is fine as long
+// as the sketch does not reach them: unreachable functions are not code
+// generated, so a sketch pays only for what it calls. WString.h has fields
+// ardio's generator cannot handle, and including it is still harmless.
+TEST(a_header_with_ungeneratable_parts_is_fine_while_they_are_unused) {
     std::vector<std::string> paths = runtime_include_paths();
     ardio::CompileResult r = ardio::compile_avr(
         "#include <WString.h>\n"
         "void setup() {}\n"
         "void loop() {}\n",
         paths);
+    if (!r.ok) std::printf("    (compiler said: %s)\n", r.error.c_str());
+    CHECK(r.ok);
+}
+
+// The naming diagnostic still applies to a header that genuinely cannot be
+// compiled at all -- a syntax error rather than an unreachable construct,
+// since parsing happens whether or not anything calls the code.
+TEST(a_header_ardio_cannot_compile_is_named_rather_than_a_line_number) {
+    std::string dir = std::string(ARDIO_TEST_TMP) + "/broken_header_probe";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    {
+        std::ofstream out(dir + "/BrokenProbe.h");
+        out << "#pragma once\nint = = ;\n";
+    }
+
+    ardio::CompileResult r = ardio::compile_avr(
+        "#include <BrokenProbe.h>\n"
+        "void setup() {}\n"
+        "void loop() {}\n",
+        std::vector<std::string>{dir});
+    std::filesystem::remove_all(dir, ec);
+
     CHECK(!r.ok);
-    CHECK(r.error.find("WString.h") != std::string::npos);
-    CHECK(r.error.find("cannot compile") != std::string::npos);
+    CHECK(r.error.find("BrokenProbe.h") != std::string::npos);
 }
 
 TEST(an_error_in_the_sketch_itself_quotes_the_offending_line) {

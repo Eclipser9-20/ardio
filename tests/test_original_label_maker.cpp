@@ -79,8 +79,12 @@ TEST(original_label_maker_still_cannot_sizeof) {
 // `String text;` from existing at all.
 // ---------------------------------------------------------------------------
 TEST(original_label_maker_still_cannot_use_an_array_field) {
+    // The method has to be *called*: unreachable functions are no longer code
+    // generated, so a limitation only shows up on a path something reaches.
     still_rejected(bare("class C { public: char f() { return b[0]; } char b[33]; };\n"
-                        "C c;"));
+                        "C c;\n"
+                        "char use() { return c.f(); }\n"
+                        "int spare = use();"));
 }
 
 TEST(original_label_maker_still_cannot_use_String) {
