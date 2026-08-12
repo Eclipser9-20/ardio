@@ -40,6 +40,14 @@ std::string render(const Expr* expr) {
             return std::to_string(expr->int_value);
         case ExprKind::StringLiteral:
             return "\"" + expr->str_value + "\"";
+        case ExprKind::InitList: {
+            std::string out = "{";
+            for (size_t i = 0; i < expr->args.size(); ++i) {
+                if (i) out += ", ";
+                out += render(expr->args[i].get());
+            }
+            return out + "}";
+        }
         case ExprKind::Identifier:
             return expr->name;
         case ExprKind::Unary:
