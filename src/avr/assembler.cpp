@@ -20,6 +20,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <map>
+#include <set>
 
 namespace ardio {
 namespace {
@@ -724,6 +725,30 @@ AssembleResult assemble(std::string_view source) {
     AssembleResult result;
     std::vector<Line> lines = split_lines(source);
 
+    // Conditional branches reach only +63/-64 words. When a target is further
+    // away the branch is "relaxed": the condition is inverted to skip over an
+    // RJMP, which reaches +2047/-2048.
+    //
+    //     brne far        becomes    breq .+2
+    //                                rjmp far
+    //
+    // Relaxing makes an instruction longer, which can push another branch out
+    // of range, so sizing and encoding are repeated until no new branch needs
+    // relaxing. Each round only ever adds to the set, so this terminates.
+    std::set<size_t> relaxed;
+
+    auto is_branch = [](const std::string& m) {
+        uint16_t unused = 0;
+        return branch_base(m, unused);
+    };
+
+    for (int attempt = 0; ; ++attempt) {
+        if (attempt > 16) {
+            result.error = "branch relaxation did not settle";
+            return result;
+        }
+        bool relaxed_something = false;
+
     // ---- pass 1: symbol addresses ------------------------------------------
     //
     // Sizing happens in bytes, because .byte/.ascii/.space runs are not
@@ -735,7 +760,8 @@ AssembleResult assemble(std::string_view source) {
         Ctx ctx;
         Emitter e;                       // e.emit stays false: sizing only
         std::map<std::string, long> labels;
-        for (const Line& line : lines) {
+        for (size_t line_index = 0; line_index < lines.size(); ++line_index) {
+            const Line& line = lines[line_index];
             ctx.line = line.number;
             if (!line.label.empty()) {
                 e.align_word();
@@ -752,7 +778,9 @@ AssembleResult assemble(std::string_view source) {
                 if (!run_directive(line, ctx, e, syms)) { result.error = ctx.error; return result; }
             } else {
                 e.align_word();
-                e.pc += 2 * instruction_words(line.mnemonic);
+                int words = instruction_words(line.mnemonic);
+                if (is_branch(line.mnemonic) && relaxed.count(line_index)) words = 2;
+                e.pc += 2 * words;
             }
         }
     }
@@ -772,7 +800,8 @@ AssembleResult assemble(std::string_view source) {
         return eval(ctx, syms, op, out_addr);
     };
 
-    for (const Line& line : lines) {
+    for (size_t line_index = 0; line_index < lines.size(); ++line_index) {
+        const Line& line = lines[line_index];
         ctx.line = line.number;
         if (!line.label.empty()) img.align_word();
         if (line.mnemonic.empty()) continue;
@@ -970,9 +999,24 @@ AssembleResult assemble(std::string_view source) {
             if (ops.empty()) ctx.fail("missing target");
             long target = 0;
             if (!ctx.failed() && resolve_target(ops[0], true, target)) {
-                long k = target - pc - 1;
-                check_range(ctx, k, -64, 63, "branch offset");
-                if (!ctx.failed()) {
+                if (relaxed.count(line_index)) {
+                    // Inverted branch skipping one word, then an RJMP. Bit 10
+                    // of the branch encoding selects set-versus-clear, so
+                    // flipping it inverts the condition.
+                    long k = target - (pc + 1) - 1;
+                    check_range(ctx, k, -2048, 2047, "relaxed branch offset");
+                    if (!ctx.failed()) {
+                        word = uint16_t((base ^ 0x0400) | (1u << 3));
+                        extra = uint16_t(0xC000 | (unsigned(k) & 0x0FFF));
+                        encoded = two_words = true;
+                    }
+                } else {
+                    long k = target - pc - 1;
+                    if (k < -64 || k > 63) {
+                        relaxed.insert(line_index);   // too far: widen and start over
+                        relaxed_something = true;
+                        break;
+                    }
                     word = uint16_t(base | ((unsigned(k) & 0x7F) << 3));
                     encoded = true;
                 }
@@ -999,10 +1043,14 @@ AssembleResult assemble(std::string_view source) {
         if (two_words) img.put_word(extra);
     }
 
+    if (relaxed_something) continue;        // a branch widened: size and encode again
+    if (ctx.failed()) { result.error = ctx.error; return result; }
+
     img.align_word();                          // never end mid-word
     result.code = std::move(img.bytes);
     result.ok = true;
     return result;
+    }
 }
 
 } // namespace ardio

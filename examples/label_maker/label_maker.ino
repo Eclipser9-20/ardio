@@ -72,7 +72,7 @@ const int space = 1150;         // x_scale * 5: one character cell
 
 int xpos = 0;                   // current carriage position, in steps
 int ypos = 0;
-int angle = PEN_UP_ANGLE;
+int angle = 25;              // PEN_UP_ANGLE; only literals initialise globals
 bool pen_on_paper = false;
 
 int x_phase = 0;                // full-drive phase index of each motor
@@ -85,15 +85,15 @@ const int EDITING = 1;
 const int PRINT_CONFIRM = 2;
 const int PRINTING = 3;
 
-int state = MAIN_MENU;
-int prev_state = PRINTING;
+int state = 0;                  // MAIN_MENU
+int prev_state = 3;             // PRINTING, so the menu paints on the first pass
 int cursor_position = 0;
 int current_character = 0;
 int blink_tick = 0;
 
 // ---------------------------------------------------------- label text -----
 //
-// ardio has no arrays, so the label is 16 separate globals behind a pair of
+// ardio has no arrays, so the label is 12 separate globals behind a pair of
 // accessor functions. text_len is how many of them are in use.
 
 int text_len = 0;
@@ -109,10 +109,6 @@ int text_8 = 32;
 int text_9 = 32;
 int text_10 = 32;
 int text_11 = 32;
-int text_12 = 32;
-int text_13 = 32;
-int text_14 = 32;
-int text_15 = 32;
 
 int text_get(int i) {
     if (i == 0) return text_0;
@@ -127,10 +123,6 @@ int text_get(int i) {
     if (i == 9) return text_9;
     if (i == 10) return text_10;
     if (i == 11) return text_11;
-    if (i == 12) return text_12;
-    if (i == 13) return text_13;
-    if (i == 14) return text_14;
-    if (i == 15) return text_15;
     return 32;
 }
 
@@ -147,19 +139,15 @@ void text_set(int i, int c) {
     if (i == 9) { text_9 = c; return; }
     if (i == 10) { text_10 = c; return; }
     if (i == 11) { text_11 = c; return; }
-    if (i == 12) { text_12 = c; return; }
-    if (i == 13) { text_13 = c; return; }
-    if (i == 14) { text_14 = c; return; }
-    if (i == 15) { text_15 = c; return; }
 }
 
 void text_clear() {
     text_len = 0;
-    for (int i = 0; i < 16; i++) text_set(i, 32);
+    for (int i = 0; i < 12; i++) text_set(i, 32);
 }
 
 void text_append(int c) {
-    if (text_len >= 16) return;
+    if (text_len >= 12) return;
     text_set(text_len, c);
     text_len = text_len + 1;
 }
@@ -171,9 +159,9 @@ void text_backspace() {
 }
 
 // The character menu you scroll through while editing: slot 0 is a space,
-// then A..Z, then 0..9, then four marks. An if-chain over 41 entries costs
+// then A..Z, then 0..9, then a hyphen and a full stop. An if-chain over all 39 entries costs
 // about two kilobytes of flash here, so it is arithmetic instead.
-const int ALPHABET_SIZE = 41;
+const int ALPHABET_SIZE = 39;
 
 int alphabet(int i) {
     if (i <= 0) return 32;              // space
@@ -181,8 +169,6 @@ int alphabet(int i) {
     if (i < 37) return i + 21;          // '0' .. '9'
     if (i == 37) return 45;             // '-'
     if (i == 38) return 46;             // '.'
-    if (i == 39) return 33;             // '!'
-    if (i == 40) return 63;             // '?'
     return 32;
 }
 
@@ -217,7 +203,7 @@ const int GLYPH_END = 200;
 const int GLYPH_DOT = 222;
 
 // Maps an ASCII code to a glyph slot, or -1 for "nothing to draw". The slots
-// are laid out A..Z, 0..9, '-', '.', '!', '?' so that the two big ranges fall
+// are laid out A..Z, 0..9, '-' and '.' so that the two big ranges fall
 // out of subtraction rather than another long chain of comparisons.
 int glyph_slot(int c) {
     if (c > 96 && c < 123) c = c - 32;  // fold lower case up
@@ -225,8 +211,6 @@ int glyph_slot(int c) {
     if (c > 47 && c < 58) return c - 22;
     if (c == 45) return 36;
     if (c == 46) return 37;
-    if (c == 33) return 38;
-    if (c == 63) return 39;
     return -1;
 }
 
@@ -612,26 +596,6 @@ int glyph_37(int i) {   // .
     return GLYPH_END;
 }
 
-int glyph_38(int i) {   // !
-    if (i == 0) return 1;
-    if (i == 1) return 104;
-    if (i == 2) return 0;
-    if (i == 3) return 222;
-    return GLYPH_END;
-}
-
-int glyph_39(int i) {   // ?
-    if (i == 0) return 3;
-    if (i == 1) return 114;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 122;
-    if (i == 5) return 121;
-    if (i == 6) return 20;
-    if (i == 7) return 222;
-    return GLYPH_END;
-}
-
 int glyph(int slot, int i) {
     if (slot == 0) return glyph_0(i);
     if (slot == 1) return glyph_1(i);
@@ -671,8 +635,6 @@ int glyph(int slot, int i) {
     if (slot == 35) return glyph_35(i);
     if (slot == 36) return glyph_36(i);
     if (slot == 37) return glyph_37(i);
-    if (slot == 38) return glyph_38(i);
-    if (slot == 39) return glyph_39(i);
     return GLYPH_END;
 }
 

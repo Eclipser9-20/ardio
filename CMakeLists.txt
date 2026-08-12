@@ -101,6 +101,9 @@ add_executable(ardio_tests
     tests/test_runtime_io.cpp
     tests/test_sketch.cpp
     tests/test_compiler.cpp
+    tests/test_ir_turret.cpp
+    tests/test_label_maker.cpp
+    tests/test_runtime_string.cpp
     tests/test_codegen_class.cpp
     tests/test_runtime_headers.cpp
     tests/test_runtime_ir.cpp

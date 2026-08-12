@@ -88,7 +88,7 @@ ss_have_rpm:
         movw    r20, r24                ; divisor = rpm
         ldi     r26, 0x70               ; dividend = 29296
         ldi     r27, 0x72
-        rcall   div16
+        rcall   stp_div16
 
         ldi     r30, 0xD0               ; clamp to a floor of 2000 us
         ldi     r31, 0x07
@@ -143,7 +143,7 @@ st_wrap:
 
         lds     r24, 0x0345             ; wait out the step time
         lds     r25, 0x0346
-        rcall   delay_us
+        rcall   stp_delay_us
 
         sbiw    r28, 1
         rjmp    st_loop
@@ -220,50 +220,50 @@ ap_c4_on:
 ; Both make the pin an output first, so stepper_init needs no separate pass.
 ; ---------------------------------------------------------------------------
 coil_on:
-        rcall   pin_decode
-        rcall   pin_ddr_out
-        rcall   pin_high
+        rcall   stp_pin_decode
+        rcall   stp_pin_ddr_out
+        rcall   stp_pin_high
         ret
 coil_off:
-        rcall   pin_decode
-        rcall   pin_ddr_out
-        rcall   pin_low
+        rcall   stp_pin_decode
+        rcall   stp_pin_ddr_out
+        rcall   stp_pin_low
         ret
 
 ; ---------------------------------------------------------------------------
-; div16: r26:r27 = r26:r27 / r20:r21   (remainder left in r18:r19)
+; stp_div16: r26:r27 = r26:r27 / r20:r21   (remainder left in r18:r19)
 ;
 ; Restoring shift-and-subtract, 16 iterations, MSB first: the dividend shifts
 ; out of the top of r26:r27 while the quotient shifts in at the bottom.
 ; ---------------------------------------------------------------------------
-div16:
+stp_div16:
         clr     r18
         clr     r19
         ldi     r22, 16
-div16_loop:
+stp_div16_loop:
         lsl     r26
         rol     r27
         rol     r18
         rol     r19
         cp      r18, r20
         cpc     r19, r21
-        brlo    div16_next
+        brlo    stp_div16_next
         sub     r18, r20
         sbc     r19, r21
         ori     r26, 1
-div16_next:
+stp_div16_next:
         dec     r22
-        brne    div16_loop
+        brne    stp_div16_loop
         ret
 
 ; ---------------------------------------------------------------------------
-; delay_us: busy-wait r24:r25 microseconds at 16 MHz.
+; stp_delay_us: busy-wait r24:r25 microseconds at 16 MHz.
 ; The loop body is exactly 16 cycles: 12 nop + sbiw + brne taken.
 ; ---------------------------------------------------------------------------
-delay_us:
+stp_delay_us:
         sbiw    r24, 0
-        breq    du_done
-du_loop:
+        breq    stp_du_done
+stp_du_loop:
         nop
         nop
         nop
@@ -277,103 +277,103 @@ du_loop:
         nop
         nop
         sbiw    r24, 1
-        brne    du_loop
-du_done:
+        brne    stp_du_loop
+stp_du_done:
         ret
 
 ; ---------------------------------------------------------------------------
-; pin_decode: r24 = Arduino pin number -> r20 = port id, r21 = bit mask.
+; stp_pin_decode: r24 = Arduino pin number -> r20 = port id, r21 = bit mask.
 ; Port ids: 0 = PORTD (pins 0-7), 1 = PORTB (8-13), 2 = PORTC (14-19).
 ; Clobbers r22, r23.
 ; ---------------------------------------------------------------------------
-pin_decode:
+stp_pin_decode:
         mov     r22, r24
         cpi     r24, 8
-        brlo    pd_portd
+        brlo    stp_pd_portd
         cpi     r24, 14
-        brlo    pd_portb
+        brlo    stp_pd_portb
         ldi     r20, 2
         subi    r22, 14
-        rjmp    pd_mask
-pd_portb:
+        rjmp    stp_pd_mask
+stp_pd_portb:
         ldi     r20, 1
         subi    r22, 8
-        rjmp    pd_mask
-pd_portd:
+        rjmp    stp_pd_mask
+stp_pd_portd:
         ldi     r20, 0
-pd_mask:
+stp_pd_mask:
         ldi     r21, 1
-pd_shift:
+stp_pd_shift:
         tst     r22
-        breq    pd_done
+        breq    stp_pd_done
         lsl     r21
         dec     r22
-        rjmp    pd_shift
-pd_done:
+        rjmp    stp_pd_shift
+stp_pd_done:
         ret
 
 ; ---------------------------------------------------------------------------
-; pin_ddr_out / pin_high / pin_low: act on port id r20, mask r21.
+; stp_pin_ddr_out / stp_pin_high / stp_pin_low: act on port id r20, mask r21.
 ; sbi/cbi need a compile-time address, so the port is picked by branch.
 ; Clobbers r19, r23.
 ; ---------------------------------------------------------------------------
-pin_ddr_out:
+stp_pin_ddr_out:
         cpi     r20, 1
-        breq    pdo_b
+        breq    stp_pdo_b
         cpi     r20, 2
-        breq    pdo_c
+        breq    stp_pdo_c
         in      r23, 0x0A               ; DDRD
         or      r23, r21
         out     0x0A, r23
         ret
-pdo_b:
+stp_pdo_b:
         in      r23, 0x04               ; DDRB
         or      r23, r21
         out     0x04, r23
         ret
-pdo_c:
+stp_pdo_c:
         in      r23, 0x07               ; DDRC
         or      r23, r21
         out     0x07, r23
         ret
 
-pin_high:
+stp_pin_high:
         cpi     r20, 1
-        breq    ph_b
+        breq    stp_ph_b
         cpi     r20, 2
-        breq    ph_c
+        breq    stp_ph_c
         in      r23, 0x0B               ; PORTD
         or      r23, r21
         out     0x0B, r23
         ret
-ph_b:
+stp_ph_b:
         in      r23, 0x05               ; PORTB
         or      r23, r21
         out     0x05, r23
         ret
-ph_c:
+stp_ph_c:
         in      r23, 0x08               ; PORTC
         or      r23, r21
         out     0x08, r23
         ret
 
-pin_low:
+stp_pin_low:
         mov     r19, r21
         com     r19
         cpi     r20, 1
-        breq    pl_b
+        breq    stp_pl_b
         cpi     r20, 2
-        breq    pl_c
+        breq    stp_pl_c
         in      r23, 0x0B               ; PORTD
         and     r23, r19
         out     0x0B, r23
         ret
-pl_b:
+stp_pl_b:
         in      r23, 0x05               ; PORTB
         and     r23, r19
         out     0x05, r23
         ret
-pl_c:
+stp_pl_c:
         in      r23, 0x08               ; PORTC
         and     r23, r19
         out     0x08, r23

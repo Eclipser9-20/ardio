@@ -66,7 +66,7 @@ Two consequences worth knowing:
   since a repeat frame carries no command byte.
 
 If `runtime/ir.S` does land and is wired into the build, the four functions
-named `ir_begin`, `ir_available`, `ir_decode` and `ir_byte` here are the ones to
+named `measure`, `ir_bit`, `ir_byte` and `ir_decode` here are the ones to
 delete; nothing else in the sketch depends on how a command is obtained.
 
 ### Serial output is gone
@@ -75,10 +75,6 @@ The original prints protocol diagnostics and a line per action. `runtime/serial.
 exists but, like `servo.S`, is not linked into a sketch build, and `Serial` is
 not a name the compiler knows. Every `Serial.print*` call was dropped. Nothing
 else changes; they were diagnostics only.
-
-### `switch` became an if/else chain
-
-See limitation 2 below.
 
 ### Functions were split up
 
@@ -111,49 +107,44 @@ have no counterpart in the original.
    `brYY .+2 / rjmp target` would remove this entirely and is the highest-value
    fix here.
 
-2. **`switch` never code-generates.** `parse_switch` lowers the controlling
-   expression into a temporary declared as `TypeKind::Long`
-   (`src/avr/parser.cpp`), and `codegen_stmt.cpp` rejects any local larger than
-   two bytes with `only 8- and 16-bit locals are supported`. So *every* switch
-   fails, with or without a `default` label -- which matters because a `switch`
-   on a received command is the shape of most Arduino sketches. Narrowing the
-   temporary to the controlling expression's own type would fix it.
+2. **Only `core.S` is linked.** `src/build/compile.cpp` appends exactly one
+   runtime file to the generated assembly. `servo.S`, `serial.S`, `wire.S`,
+   `lcd.S`, `stepper.S` and `button.S` are unreachable from a sketch: calling
+   `servo_write` leaves an undefined label. That is why the servo driver and the
+   IR decoder are written out in the sketch, and why there is no serial output.
+   Appending every runtime file and letting the assembler drop what is
+   unreferenced -- or a real symbol-driven link step -- would let this sketch
+   shrink by roughly half.
 
-3. **Integer division compiles but does not link.** `a / b` generates a call to
-   `__ardio_divmod16`, which nothing in the linked runtime defines, so a build
-   that uses `/` fails with `undefined label '__ardio_divmod16'`. The servo pulse
-   width therefore approximates `angle * 1000 / 180` as `(angle * 89) >> 4`
-   (5.5625 against 5.5556, under a microsecond of error over the whole sweep).
-
-4. **Only `core.S` is linked.** `src/build/compile.cpp` appends exactly one
-   runtime file. `servo.S`, `serial.S`, `wire.S`, `lcd.S`, `stepper.S` and
-   `button.S` are unreachable from a sketch, which is why the servo driver and
-   the IR decoder are written out in the sketch. Appending every runtime file
-   and letting the assembler drop what is unreferenced -- or a real
-   symbol-driven link step -- would let this sketch shrink by about half.
-
-5. **Locals are capped at 62 bytes per frame** (`needs N bytes of locals; the
+3. **Locals are capped at 62 bytes per frame** (`needs N bytes of locals; the
    frame pointer reaches only 62`). An `int[32]` alone is 64 bytes, so the
    obvious "buffer the 32 IR bits, then interpret them" structure is not
    expressible; the port consumes the frame a byte at a time instead.
 
-6. **No 32-bit locals.** `long` is in the type system and in `Type::size()`, but
-   `codegen_stmt.cpp` refuses to allocate one. This is also the mechanism behind
-   limitation 2.
+4. **No 32-bit locals.** `long` is in the type system and in `Type::size()`, but
+   `codegen_stmt.cpp` refuses to allocate one: `only 8- and 16-bit locals are
+   supported`.
 
-7. **No floating point.** `float x = 1.5;` fails in the lexer/parser. Not needed
+5. **No floating point.** `float x = 1.5;` fails in the lexer/parser. Not needed
    here, but worth recording.
 
-8. **`#include` and `#define` are stripped, not processed.** The sketch
+6. **`#include` and `#define` are stripped, not processed.** The sketch
    preprocessor removes `#` lines wholesale, so every runtime entry point must be
    declared by hand in the sketch and macro constants must become variables.
 
-9. **No default arguments.** `void f(int a = 3)` parses, but calling `f()`
+7. **No default arguments.** `void f(int a = 3)` parses, but calling `f()`
    reports `'f' expects 1 arguments, got 0`.
 
-10. **No `Serial`, and no `String`.** Neither is a name the compiler knows.
-    `String` was not needed here -- unlike the Label Maker sketch -- so it cost
-    nothing, but any sketch that prints is currently out of reach.
+8. **No `Serial`, and no `String`.** Neither is a name the compiler knows.
+   `String` was not needed here -- unlike the Label Maker sketch -- so it cost
+   nothing, but any sketch that prints is currently out of reach.
+
+Two limitations were hit during this port and then fixed in the compiler while
+it was underway, so they are recorded only as history: `switch` used to lower
+its controlling expression into a 32-bit temporary that the code generator
+refused to allocate, so no switch ever built; and `/` used to emit a call to an
+`__ardio_divmod16` helper that the linked runtime did not define. Both work now,
+and the sketch uses both.
 
 Things that were expected to be missing and turned out to be fine: `%`, `&&`,
 `||`, compound assignment, unary minus, arrays, `do`/`while`, and calling a

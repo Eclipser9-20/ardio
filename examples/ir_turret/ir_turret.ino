@@ -33,7 +33,8 @@ int OUTPUT_MODE = 1;
 // --------------------------------------------------------- remote codes ----
 //
 // NEC command byte for each button on the bundled remote. To add a button on
-// another NEC remote, read the command byte it sends and add a case below.
+// another NEC remote, read the command byte it sends and add a case to
+// handleCommand below.
 
 int CMD_LEFT = 0x08;
 int CMD_RIGHT = 0x5A;
@@ -68,13 +69,9 @@ int pitchMin = 10;        // lower travel limit
 void servoPulse(int pin, int angle) {
     if (angle < 0) angle = 0;
     if (angle > 180) angle = 180;
-    // 1000 + angle * 1000 / 180 microseconds. ardio's code generator emits '/'
-    // as a call to a __ardio_divmod16 helper that the linked runtime does not
-    // define yet, so 1000/180 = 5.5556 is approximated here as 89/16 = 5.5625:
-    // at most one microsecond of error across the whole 0..180 sweep, well
-    // inside a hobby servo's own resolution. angle * 89 peaks at 16020, so the
-    // intermediate still fits in a signed 16-bit int.
-    int width = 1000 + ((angle * 89) >> 4);
+    // 1000 + angle * 1000 / 180 microseconds, reduced to * 50 / 9 so the
+    // intermediate stays under 9000 and inside a signed 16-bit int.
+    int width = 1000 + angle * 50 / 9;
     digitalWrite(pin, 1);
     delayMicroseconds(width);
     digitalWrite(pin, 0);
@@ -298,17 +295,15 @@ void setup() {
 }
 
 // Dispatches one decoded remote command.
-//
-// The original dispatches on a switch. ardio parses switch but lowers it
-// through a 32-bit temporary its code generator will not allocate, so this is
-// an if/else chain instead.
 void handleCommand(int command) {
-    if (command == CMD_UP) upMove(1);
-    else if (command == CMD_DOWN) downMove(1);
-    else if (command == CMD_LEFT) leftMove(1);
-    else if (command == CMD_RIGHT) rightMove(1);
-    else if (command == CMD_OK) fire();
-    else if (command == CMD_STAR) fireAllAndPause();
+    switch (command) {
+        case CMD_UP: upMove(1); break;
+        case CMD_DOWN: downMove(1); break;
+        case CMD_LEFT: leftMove(1); break;
+        case CMD_RIGHT: rightMove(1); break;
+        case CMD_OK: fire(); break;
+        case CMD_STAR: fireAllAndPause(); break;
+    }
 }
 
 void fireAllAndPause() {

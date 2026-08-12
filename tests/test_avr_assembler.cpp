@@ -117,10 +117,44 @@ TEST(avr_reports_out_of_range_io_address) {
     CHECK(r.error.find("range") != std::string::npos);
 }
 
-TEST(avr_reports_branch_out_of_range) {
-    // BRNE reaches +63/-64 words. 200 nops puts the target far past that.
+TEST(avr_relaxes_a_branch_that_cannot_reach) {
+    // BRNE reaches only +63/-64 words, so a target 200 words back is out of
+    // reach. Rather than failing, the assembler inverts the condition to skip
+    // over an RJMP, which reaches +2047/-2048:
+    //     brne back   ->   breq .+2 ; rjmp back
     std::string src = "back:\n";
     for (int i = 0; i < 200; ++i) src += "nop\n";
+    src += "brne back\n";
+
+    auto r = asm_ok(src.c_str());
+    CHECK(r.ok);
+    // 200 nops plus a two-word relaxed branch.
+    CHECK_EQ(r.code.size(), size_t(200 * 2 + 4));
+
+    // breq (0xF001) skipping one word: 0xF001 | (1 << 3) = 0xF009
+    CHECK_EQ(word_at(r, 200), 0xF009);
+    // rjmp back from word 201: 201 + 1 + k = 0 -> k = -202
+    CHECK_EQ(word_at(r, 201), int(0xC000 | (unsigned(-202) & 0x0FFF)));
+}
+
+TEST(avr_relaxation_keeps_later_labels_correct) {
+    // Relaxing makes the branch two words instead of one, so anything after it
+    // shifts. A label placed after a relaxed branch must still resolve.
+    std::string src = "back:\n";
+    for (int i = 0; i < 100; ++i) src += "nop\n";
+    src += "brne back\n";
+    src += "after: rjmp after\n";
+
+    auto r = asm_ok(src.c_str());
+    CHECK(r.ok);
+    // 100 nops + 2 relaxed-branch words = word 102 for "after".
+    CHECK_EQ(word_at(r, 102), 0xCFFF);   // rjmp to itself
+}
+
+TEST(avr_reports_a_branch_that_even_rjmp_cannot_reach) {
+    // RJMP reaches +2047/-2048 words. Past that there is nothing left to try.
+    std::string src = "back:\n";
+    for (int i = 0; i < 3000; ++i) src += "nop\n";
     src += "brne back\n";
     auto r = ardio::assemble(src);
     CHECK(!r.ok);
