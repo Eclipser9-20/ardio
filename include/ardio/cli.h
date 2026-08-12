@@ -4,8 +4,9 @@
 namespace ardio {
 
 struct Args {
-    std::string command;     // "ports", "push", ...
-    std::string positional;  // sketch or hex path
+    std::string command;     // "ports", "push", "toolchain", ...
+    std::string positional;  // sketch/hex path, or a subcommand
+    std::string positional2; // second operand, e.g. "toolchain fetch <pkg>"
     std::string port;
     std::string board;
     int baud = 0;            // 0 = use config/board default

@@ -40,7 +40,8 @@ Args parse_args(int argc, char** argv) {
             a.error = "unknown flag '" + arg + "'";
             return a;
         }
-        else if (a.positional.empty()) { a.positional = arg; }
+        else if (a.positional.empty())  { a.positional = arg; }
+        else if (a.positional2.empty()) { a.positional2 = arg; }
         else { a.error = "unexpected argument '" + arg + "'"; return a; }
     }
     return a;

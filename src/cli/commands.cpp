@@ -102,6 +102,106 @@ int cmd_doctor() {
     return missing == 0 ? 0 : 1;
 }
 
+std::string tools_dir() {
+    const char* home = std::getenv("HOME");
+    return (fs::path(home ? home : ".") / ".ardio" / "tools").string();
+}
+
+int cmd_toolchain(const Args& args) {
+    Config cfg = load_config();
+    auto roots = roots_for(cfg);
+    const std::string& sub = args.positional;
+
+    if (sub.empty() || sub == "list") {
+        std::printf("installed:\n");
+        bool any = false;
+        for (const char* tool : {"avr-g++", "avr-objcopy", "avr-gcc"}) {
+            ToolLocation loc = find_tool(tool, roots);
+            if (loc.found) {
+                std::printf("  %-14s %s  (via %s)\n", tool, loc.path.c_str(),
+                            loc.found_in_root.c_str());
+                any = true;
+            }
+        }
+        if (!any) std::printf("  (none found)\n");
+
+        std::printf("\navailable to fetch for this machine (%s):\n",
+                    host_triple().empty() ? "unsupported host" : host_triple().c_str());
+        bool offered = false;
+        for (const RemoteTool& t : remote_tool_registry()) {
+            if (t.host != host_triple()) continue;
+            std::printf("  %-6s %s  (%.1f MB)\n", t.package.c_str(), t.version.c_str(),
+                        double(t.size_bytes) / 1e6);
+            offered = true;
+        }
+        if (!offered) std::printf("  (no published build for this host)\n");
+        std::printf("\nfetch with:  ardio toolchain fetch <package>\n");
+        return 0;
+    }
+
+    // "ardio toolchain fetch avr" -> positional="fetch", positional2="avr"
+    if (sub == "fetch") {
+        const std::string& package = args.positional2;
+        if (package.empty()) {
+            std::fprintf(stderr,
+                         "error: 'toolchain fetch' needs a package name, e.g.\n"
+                         "         ardio toolchain fetch avr\n");
+            return 2;
+        }
+
+        std::string host = host_triple();
+        if (host.empty()) {
+            std::fprintf(stderr,
+                         "error: no published toolchain build for this platform yet\n");
+            return 1;
+        }
+        const RemoteTool* tool = find_remote_tool(package, host);
+        if (!tool) {
+            std::fprintf(stderr,
+                         "error: no '%s' toolchain available for %s.\n"
+                         "       Run 'ardio toolchain list' to see what is offered.\n",
+                         package.c_str(), host.c_str());
+            return 1;
+        }
+
+        // Explicit consent. ardio never downloads anything silently.
+        std::printf("about to download a toolchain:\n"
+                    "  package   %s %s\n"
+                    "  host      %s\n"
+                    "  url       %s\n"
+                    "  size      %.1f MB\n"
+                    "  sha-256   %s\n"
+                    "  install   %s\n\n"
+                    "proceed? [y/N] ",
+                    tool->package.c_str(), tool->version.c_str(), tool->host.c_str(),
+                    tool->url.c_str(), double(tool->size_bytes) / 1e6,
+                    tool->sha256.c_str(), tools_dir().c_str());
+        std::fflush(stdout);
+
+        int c = std::getchar();
+        if (c != 'y' && c != 'Y') {
+            std::printf("cancelled -- nothing was downloaded\n");
+            return 1;
+        }
+
+        auto result = fetch_remote_tool(*tool, tools_dir(),
+                                        [](const std::string& m) {
+                                            std::printf("  %s\n", m.c_str());
+                                        });
+        if (!result.ok) {
+            std::fprintf(stderr, "error: %s\n", result.error.c_str());
+            return 1;
+        }
+        std::printf("\ninstalled to %s\n", result.installed_to.c_str());
+        std::printf("run 'ardio doctor' to confirm it is being found.\n");
+        return 0;
+    }
+
+    std::fprintf(stderr, "error: unknown toolchain subcommand '%s'. "
+                         "Try 'list' or 'fetch <package>'.\n", sub.c_str());
+    return 2;
+}
+
 // Resolves port + board, printing the reason on failure.
 bool resolve(const Args& args, const Config& cfg, PortInfo& out_port,
              const Board*& out_board) {
@@ -179,6 +279,9 @@ void print_help() {
         "  ports              list serial ports\n"
         "  boards             list supported boards\n"
         "  doctor             diagnose toolchains and ports\n"
+        "  toolchain list     show installed and fetchable toolchains\n"
+        "  toolchain fetch <pkg>\n"
+        "                     download a toolchain (asks first)\n"
         "\n"
         "options:\n"
         "  --port <device>    serial port (default: auto-detect)\n"
@@ -200,9 +303,10 @@ int run_command(const Args& args) {
         return 0;
     }
 
-    if (args.command == "ports")  return cmd_ports();
-    if (args.command == "boards") return cmd_boards();
-    if (args.command == "doctor") return cmd_doctor();
+    if (args.command == "ports")     return cmd_ports();
+    if (args.command == "boards")    return cmd_boards();
+    if (args.command == "doctor")    return cmd_doctor();
+    if (args.command == "toolchain") return cmd_toolchain(args);
 
     Config cfg = load_config();
 
