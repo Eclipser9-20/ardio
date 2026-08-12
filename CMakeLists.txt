@@ -13,9 +13,9 @@ add_compile_options(-Wno-unused-command-line-argument)
 add_library(libardio STATIC)
 set_target_properties(libardio PROPERTIES OUTPUT_NAME ardio)
 target_include_directories(libardio PUBLIC include)
-target_sources(libardio PRIVATE src/placeholder.cpp)
+target_sources(libardio PRIVATE src/hex.cpp)
 
-add_executable(ardio_tests tests/main.cpp tests/test_harness.cpp)
+add_executable(ardio_tests tests/main.cpp tests/test_harness.cpp tests/test_hex.cpp)
 target_link_libraries(ardio_tests PRIVATE libardio)
 target_include_directories(ardio_tests PRIVATE tests)
 
