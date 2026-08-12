@@ -220,3 +220,66 @@ TEST(avr_encodes_push_pop_and_ret) {
     CHECK_EQ(word_at(r, 1), 0x91CF);
     CHECK_EQ(word_at(r, 2), 0x9508);
 }
+
+TEST(avr_encodes_ld_and_st_pointer_modes) {
+    // ld r24, X -> 0x918C ; ld r24, X+ -> 0x918D ; ld r24, -X -> 0x918E
+    auto r = asm_ok("ld r24, X\nld r24, X+\nld r24, -X");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0x918C);
+    CHECK_EQ(word_at(r, 1), 0x918D);
+    CHECK_EQ(word_at(r, 2), 0x918E);
+}
+
+TEST(avr_encodes_st_through_z_with_increment) {
+    // st Z+, r24 -> 0x9381
+    auto r = asm_ok("st Z+, r24");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0x9381);
+}
+
+TEST(avr_plain_y_and_z_loads_match_zero_displacement) {
+    // ld r24, Y == ldd r24, Y+0 ; ld r24, Z == ldd r24, Z+0
+    auto a = asm_ok("ld r24, Y\nld r24, Z");
+    auto b = asm_ok("ldd r24, Y+0\nldd r24, Z+0");
+    CHECK(a.ok && b.ok);
+    CHECK_EQ(word_at(a, 0), word_at(b, 0));
+    CHECK_EQ(word_at(a, 1), word_at(b, 1));
+}
+
+TEST(avr_rejects_malformed_pointer_operand) {
+    auto r = ardio::assemble("ld r24, W+");
+    CHECK(!r.ok);
+}
+
+TEST(avr_encodes_sreg_bit_instructions) {
+    auto r = asm_ok("sec\nclc\nset\nclt\nlpm\nicall\nijmp");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0x9408);  // sec
+    CHECK_EQ(word_at(r, 1), 0x9488);  // clc
+    CHECK_EQ(word_at(r, 2), 0x9468);  // set
+    CHECK_EQ(word_at(r, 3), 0x94E8);  // clt
+    CHECK_EQ(word_at(r, 4), 0x95C8);  // lpm
+    CHECK_EQ(word_at(r, 5), 0x9509);  // icall
+    CHECK_EQ(word_at(r, 6), 0x9409);  // ijmp
+}
+
+TEST(avr_encodes_bst_bld_and_cpse) {
+    // r24 contributes (24<<4) = 0x180, which includes the d4 bit at 0x100.
+    //   bst  r24, 3   -> 0xFA00 | 0x180 | 3            = 0xFB83
+    //   bld  r24, 3   -> 0xF800 | 0x180 | 3            = 0xF983
+    //   cpse r24, r22 -> 0x1000 | 0x200 | 0x180 | 6    = 0x1386
+    //                    (r22's bit 4 lands at 0x200)
+    auto r = asm_ok("bst r24, 3\nbld r24, 3\ncpse r24, r22");
+    CHECK(r.ok);
+    CHECK_EQ(word_at(r, 0), 0xFB83);
+    CHECK_EQ(word_at(r, 1), 0xF983);
+    CHECK_EQ(word_at(r, 2), 0x1386);
+}
+
+TEST(avr_cbr_is_andi_with_the_complemented_mask) {
+    // cbr r16, 0x0F == andi r16, 0xF0 -> 0x7F00
+    auto a = asm_ok("cbr r16, 0x0F");
+    auto b = asm_ok("andi r16, 0xF0");
+    CHECK(a.ok && b.ok);
+    CHECK_EQ(word_at(a, 0), word_at(b, 0));
+}

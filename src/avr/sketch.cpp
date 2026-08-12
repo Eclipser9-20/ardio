@@ -20,21 +20,17 @@ bool is_space(char c) {
     return std::isspace(static_cast<unsigned char>(c)) != 0;
 }
 
-// Two blanked views of the source, produced together.
+// A blanked view of the source: comments, string and character literals, and
+// preprocessor directives are all replaced by spaces. What is left is the bare
+// code punctuation -- braces, parentheses, semicolons -- with no literal able
+// to masquerade as structure.
 //
-//   code      -- comments, literals and directives replaced by spaces. Used to
-//                find braces, parentheses and statement boundaries.
-//   uncomment -- only comments replaced by spaces. Used to lift the text of a
-//                declaration back out, so a default argument such as
-//                `const char* s = "hi"` survives into the forward declaration.
-//
-// Both are the same length as the input and keep newlines in place, so offsets
-// are interchangeable with the original.
+// It is the same length as the input and keeps newlines in place, so offsets
+// are interchangeable with the original text.
 struct Masks {
     bool ok = true;
     std::string error;
     std::string code;
-    std::string uncomment;
 };
 
 // True if `s` looks like a character literal starting at `i` (i.e. there is a
@@ -52,13 +48,9 @@ bool char_literal_closes(const std::string& s, size_t i) {
 Masks build_masks(const std::string& s) {
     Masks m;
     m.code = s;
-    m.uncomment = s;
 
-    auto blank = [&](size_t i, bool also_uncomment) {
-        if (s[i] != '\n') {
-            m.code[i] = ' ';
-            if (also_uncomment) m.uncomment[i] = ' ';
-        }
+    auto blank = [&](size_t i) {
+        if (s[i] != '\n') m.code[i] = ' ';
     };
 
     size_t i = 0;
@@ -70,7 +62,7 @@ Masks build_masks(const std::string& s) {
 
         // Line comment.
         if (c == '/' && i + 1 < s.size() && s[i + 1] == '/') {
-            while (i < s.size() && s[i] != '\n') { blank(i, true); ++i; }
+            while (i < s.size() && s[i] != '\n') { blank(i); ++i; }
             continue;
         }
 
@@ -88,7 +80,7 @@ Masks build_masks(const std::string& s) {
                 m.error = "unterminated block comment";
                 return m;
             }
-            for (size_t j = start; j < i; ++j) blank(j, true);
+            for (size_t j = start; j < i; ++j) blank(j);
             at_line_start = false;
             continue;
         }
@@ -97,9 +89,9 @@ Masks build_masks(const std::string& s) {
         // end of the line unless the line is continued with a backslash.
         if (c == '#' && at_line_start) {
             while (i < s.size()) {
-                if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '\n') { blank(i, false); ++i; blank(i, false); ++i; continue; }
+                if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '\n') { blank(i); ++i; blank(i); ++i; continue; }
                 if (s[i] == '\n') break;
-                blank(i, false);
+                blank(i);
                 ++i;
             }
             continue;
@@ -121,7 +113,7 @@ Masks build_masks(const std::string& s) {
                 m.error = "unterminated string literal";
                 return m;
             }
-            for (size_t j = start; j < i; ++j) blank(j, false);
+            for (size_t j = start; j < i; ++j) blank(j);
             at_line_start = false;
             continue;
         }
@@ -135,7 +127,7 @@ Masks build_masks(const std::string& s) {
                 if (s[i] == '\'') { ++i; break; }
                 ++i;
             }
-            for (size_t j = start; j < i; ++j) blank(j, false);
+            for (size_t j = start; j < i; ++j) blank(j);
             at_line_start = false;
             continue;
         }
@@ -194,6 +186,33 @@ bool plausible_return_type(const std::string& t) {
         word.clear();
     }
     return check();
+}
+
+// Removes default arguments from a parameter list `(int a, int b = 3)`. A
+// default may be given only once in a translation unit, so the forward
+// declaration must drop what the definition already states.
+std::string strip_default_args(const std::string& params) {
+    std::string out;
+    int depth = 0;
+    bool skipping = false;
+    for (char c : params) {
+        if (c == '(' || c == '[' || c == '{') { ++depth; }
+        else if (c == ')' || c == ']' || c == '}') { --depth; }
+
+        if (skipping) {
+            // A default argument ends at the comma separating the next
+            // parameter, or at the closing paren of the list itself.
+            if (depth == 1 && c == ',') skipping = false;
+            else if (depth == 0) skipping = false;
+            else continue;
+        } else if (depth == 1 && c == '=') {
+            skipping = true;
+            while (!out.empty() && is_space(out.back())) out.pop_back();
+            continue;
+        }
+        out += c;
+    }
+    return out;
 }
 
 struct FunctionDef {
@@ -269,8 +288,6 @@ SketchResult preprocess_sketch(const std::string& ino_source) {
             if (p == ';' || p == '{' || p == '}') break;
             --decl_start;
         }
-        // Taken from `code`, not `uncomment`: any preprocessor directive
-        // between the previous statement and this one is blank there.
         std::string ret = code.substr(decl_start, name_start - decl_start);
         if (!plausible_return_type(ret)) continue;
 
@@ -279,7 +296,8 @@ SketchResult preprocess_sketch(const std::string& ino_source) {
         while (decl_start < name_start && is_space(code[decl_start])) ++decl_start;
 
         std::string decl = squeeze(ret) + " " +
-                           squeeze(masks.uncomment.substr(name_start, rparen + 1 - name_start));
+                           squeeze(strip_default_args(
+                               code.substr(name_start, rparen + 1 - name_start)));
         if (!tail.empty()) decl += " " + tail;
         decl += ";";
 

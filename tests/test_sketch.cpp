@@ -113,10 +113,18 @@ TEST(sketch_multiline_signature_is_collapsed) {
     CHECK(contains(r.source, "int add(int a, int b);"));
 }
 
-TEST(sketch_keeps_string_default_argument) {
-    SketchResult r = preprocess_sketch("void say(const char* s = \"hi\") {\n}\n");
+TEST(sketch_strips_default_arguments) {
+    // A default argument may appear only once per translation unit, so the
+    // generated declaration must not repeat what the definition says.
+    SketchResult r = preprocess_sketch("void say(const char* s = \"hi\", int n = 1) {\n}\n");
     CHECK(r.ok);
-    CHECK(contains(r.source, "void say(const char* s = \"hi\");"));
+    CHECK(contains(r.source, "void say(const char* s, int n);"));
+}
+
+TEST(sketch_strips_default_argument_containing_a_call) {
+    SketchResult r = preprocess_sketch("void wait(unsigned long t = millis(), int n = 2) {\n}\n");
+    CHECK(r.ok);
+    CHECK(contains(r.source, "void wait(unsigned long t, int n);"));
 }
 
 // --------------------------------------------------------------- literals ---

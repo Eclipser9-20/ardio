@@ -101,6 +101,75 @@ int instruction_words(const std::string& m) {
     return (m == "call" || m == "jmp" || m == "lds" || m == "sts") ? 2 : 1;
 }
 
+// Pointer-register addressing modes: ld/st X, X+, -X, Y, Y+, -Y, Z, Z+, -Z.
+struct PointerMode {
+    char reg = 0;      // 'X', 'Y' or 'Z'
+    int mode = 0;      // 0 = plain, 1 = post-increment, 2 = pre-decrement
+};
+
+bool parse_pointer(const std::string& s, PointerMode& out) {
+    if (s.empty()) return false;
+    if (s[0] == '-') {
+        if (s.size() != 2) return false;
+        char r = char(std::toupper(static_cast<unsigned char>(s[1])));
+        if (r != 'X' && r != 'Y' && r != 'Z') return false;
+        out = {r, 2};
+        return true;
+    }
+    char r = char(std::toupper(static_cast<unsigned char>(s[0])));
+    if (r != 'X' && r != 'Y' && r != 'Z') return false;
+    if (s.size() == 1) { out = {r, 0}; return true; }
+    if (s.size() == 2 && s[1] == '+') { out = {r, 1}; return true; }
+    return false;
+}
+
+// Encodes ld/st for the pointer modes. Returns false for combinations the
+// architecture does not provide (X has no displacement form, and plain
+// Y/Z here are handled by ldd/std with q=0).
+bool encode_pointer_access(bool load, int reg, const PointerMode& p, uint16_t& out) {
+    uint16_t base = load ? 0x9000 : 0x9200;
+    uint16_t rbits = uint16_t(reg << 4);
+    if (p.reg == 'X') {
+        uint16_t tail = p.mode == 0 ? 0x000C : p.mode == 1 ? 0x000D : 0x000E;
+        out = uint16_t(base | rbits | tail);
+        return true;
+    }
+    if (p.reg == 'Y') {
+        if (p.mode == 0) { out = uint16_t((load ? 0x8008 : 0x8208) | rbits); return true; }
+        uint16_t tail = p.mode == 1 ? 0x0009 : 0x000A;
+        out = uint16_t(base | rbits | tail);
+        return true;
+    }
+    // Z
+    if (p.mode == 0) { out = uint16_t((load ? 0x8000 : 0x8200) | rbits); return true; }
+    uint16_t tail = p.mode == 1 ? 0x0001 : 0x0002;
+    out = uint16_t(base | rbits | tail);
+    return true;
+}
+
+// Single-bit SREG and register-bit instructions.
+bool encode_bit_op(const std::string& m, uint16_t& out) {
+    if (m == "sec") { out = 0x9408; return true; }
+    if (m == "clc") { out = 0x9488; return true; }
+    if (m == "sen") { out = 0x9428; return true; }
+    if (m == "cln") { out = 0x94A8; return true; }
+    if (m == "sez") { out = 0x9418; return true; }
+    if (m == "clz") { out = 0x9498; return true; }
+    if (m == "ses") { out = 0x9448; return true; }
+    if (m == "cls") { out = 0x94C8; return true; }
+    if (m == "sev") { out = 0x9438; return true; }
+    if (m == "clv") { out = 0x94B8; return true; }
+    if (m == "set") { out = 0x9468; return true; }
+    if (m == "clt") { out = 0x94E8; return true; }
+    if (m == "seh") { out = 0x9458; return true; }
+    if (m == "clh") { out = 0x94D8; return true; }
+    if (m == "lpm") { out = 0x95C8; return true; }   // implicit R0 <- Z
+    if (m == "ijmp"){ out = 0x9409; return true; }
+    if (m == "icall"){out = 0x9509; return true; }
+    if (m == "break"){out = 0x9598; return true; }
+    return false;
+}
+
 // -------------------------------------------------------------- operands ---
 
 struct Ctx {
@@ -296,8 +365,50 @@ AssembleResult assemble(std::string_view source) {
         bool encoded = false, two_words = false;
 
         uint16_t base = 0;
-        if (encode_no_operand(m, word)) {
+        PointerMode pmode;
+        if (encode_no_operand(m, word) || encode_bit_op(m, word)) {
             encoded = true;
+        } else if (m == "ld" || m == "st") {
+            // "ld Rd, X+" / "st -Y, Rr" -- the register and pointer swap sides.
+            int r = 0;
+            bool form_ok = true;
+            if (m == "ld") {
+                r = need_register(ctx, ops, 0, "destination register");
+                if (ops.size() < 2 || !parse_pointer(ops[1], pmode)) form_ok = false;
+            } else {
+                if (ops.empty() || !parse_pointer(ops[0], pmode)) form_ok = false;
+                r = need_register(ctx, ops, 1, "source register");
+            }
+            if (!form_ok) ctx.fail("expected X, X+, -X, Y, Y+, -Y, Z, Z+ or -Z");
+            if (!ctx.failed() && encode_pointer_access(m == "ld", r, pmode, word))
+                encoded = true;
+        } else if (m == "cpse") {
+            int d = need_register(ctx, ops, 0, "first register");
+            int r = need_register(ctx, ops, 1, "second register");
+            if (!ctx.failed()) {
+                word = uint16_t(0x1000 | ((r & 0x10) << 5) | (d << 4) | (r & 0x0F));
+                encoded = true;
+            }
+        } else if (m == "bst" || m == "bld") {
+            int d = need_register(ctx, ops, 0, "register");
+            long b = need_number(ctx, ops, 1, "bit number");
+            if (!ctx.failed()) check_range(ctx, b, 0, 7, "bit number");
+            if (!ctx.failed()) {
+                word = uint16_t((m == "bst" ? 0xFA00 : 0xF800) | (d << 4) | b);
+                encoded = true;
+            }
+        } else if (m == "cbr" || m == "sbr") {
+            // Aliases for andi with the complement, and ori.
+            int d = need_register(ctx, ops, 0, "destination register");
+            long k = need_number(ctx, ops, 1, "bit mask");
+            if (!ctx.failed() && d < 16)
+                ctx.fail(m + " can only target r16-r31, not r" + std::to_string(d));
+            if (!ctx.failed()) {
+                unsigned kk = m == "cbr" ? (~unsigned(k) & 0xFF) : (unsigned(k) & 0xFF);
+                uint16_t bb = m == "cbr" ? 0x7000 : 0x6000;
+                word = uint16_t(bb | ((kk & 0xF0) << 4) | ((d - 16) << 4) | (kk & 0x0F));
+                encoded = true;
+            }
         } else if (m == "clr" || m == "tst" || m == "lsl" || m == "rol") {
             // Aliases that repeat their single operand as both sources.
             int d = need_register(ctx, ops, 0, "register");

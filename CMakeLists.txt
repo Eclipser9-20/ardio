@@ -34,6 +34,11 @@ add_library(libardio STATIC
     src/avr/assembler.cpp
     src/avr/lexer.cpp
     src/avr/preprocess.cpp
+    src/avr/parser.cpp
+    src/avr/type.cpp
+    src/avr/sema.cpp
+    src/avr/codegen_expr.cpp
+    src/avr/sketch.cpp
     src/build/compile.cpp
     src/cli/args.cpp
     src/cli/commands.cpp
@@ -85,6 +90,13 @@ add_executable(ardio_tests
     tests/test_lexer.cpp
     tests/test_preprocess.cpp
     tests/test_runtime_core.cpp
+    tests/test_parser.cpp
+    tests/test_type.cpp
+    tests/test_sema.cpp
+    tests/test_codegen_expr.cpp
+    tests/test_runtime_motors.cpp
+    tests/test_runtime_io.cpp
+    tests/test_sketch.cpp
 )
 target_link_libraries(ardio_tests PRIVATE libardio)
 target_include_directories(ardio_tests PRIVATE tests)

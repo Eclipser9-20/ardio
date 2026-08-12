@@ -38,6 +38,8 @@
 ;     0x0344  current phase index (0..3)
 ;     0x0345  step delay, low byte  (microseconds)
 ;     0x0346  step delay, high byte
+;     0x0347  direction of the run in progress (1 forward, 0 reverse)
+;     0x0348  coil pattern of the phase being applied
 ;
 ; ABI: avr-gcc's. Args in r24:r25, r22:r23, r20:r21, r18:r19; return r24:r25;
 ; r1 is always zero; r18-r27, r30, r31 are call-clobbered.
@@ -173,9 +175,12 @@ ap_try3:
         ldi     r31, 0b1001
 
 ap_drive:
-        mov     r17, r31                ; r17 survives the coil helpers
+        sts     0x0348, r31             ; the coil helpers clobber every
+                                        ; scratch register, so the pattern is
+                                        ; re-read from SRAM for each coil
         lds     r24, 0x0340
-        sbrc    r17, 0
+        lds     r18, 0x0348
+        sbrc    r18, 0
         rjmp    ap_c1_on
         rcall   coil_off
         rjmp    ap_c2
@@ -183,7 +188,8 @@ ap_c1_on:
         rcall   coil_on
 ap_c2:
         lds     r24, 0x0341
-        sbrc    r17, 1
+        lds     r18, 0x0348
+        sbrc    r18, 1
         rjmp    ap_c2_on
         rcall   coil_off
         rjmp    ap_c3
@@ -191,7 +197,8 @@ ap_c2_on:
         rcall   coil_on
 ap_c3:
         lds     r24, 0x0342
-        sbrc    r17, 2
+        lds     r18, 0x0348
+        sbrc    r18, 2
         rjmp    ap_c3_on
         rcall   coil_off
         rjmp    ap_c4
@@ -199,7 +206,8 @@ ap_c3_on:
         rcall   coil_on
 ap_c4:
         lds     r24, 0x0343
-        sbrc    r17, 3
+        lds     r18, 0x0348
+        sbrc    r18, 3
         rjmp    ap_c4_on
         rcall   coil_off
         ret
