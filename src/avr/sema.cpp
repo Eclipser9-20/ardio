@@ -409,7 +409,12 @@ private:
         case ExprKind::Member:      e.type = check_member(e); break;
         case ExprKind::Conditional: e.type = check_conditional(e); break;
 
-        case ExprKind::Cast:
+        case ExprKind::InitList:
+        // Aggregate initialisers are checked where they are used (a variable
+        // declaration knows the target type); on their own they have none.
+        return nullptr;
+
+    case ExprKind::Cast:
             if (!e.lhs) fail(e.line, "cast without an operand");
             check(*e.lhs);
             if (!e.type) fail(e.line, "cast without a target type");
