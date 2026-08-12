@@ -11,14 +11,14 @@ $ ardio build examples/label_maker/label_maker.ino
 built .ardio-build/label_maker.hex
 ```
 
-25060 bytes of flash, so it fits an ATmega328P with room to spare even behind
-the stock 2 KB Nano bootloader.
+9248 bytes of flash: 30% of the 30720 bytes an ATmega328P has behind the
+stock 2 KB Nano bootloader.
 
 This is the largest sketch in the tree, and it is the one that leans hardest
-on the compiler: a four-state machine, forty glyph routines, pointer walking
-over a text buffer, and integer division in the inner loop. It is written
-against what ardio's compiler actually supports, which is still short of C++
-in a few places that matter.
+on the compiler: a four-state machine, a stroke font in a flat byte table,
+pointer walking over a text buffer, and integer division in the inner loop. It
+is written against what ardio's compiler actually supports, which is still
+short of C++ in a few places that matter.
 
 ## What this port changes, and why
 
@@ -54,15 +54,19 @@ stepping, same release-the-coils-when-idle discipline. What changed:
   `millis() % 600 < 400` becomes `blink_tick % 12 < 8`.
 * **`String text` is `char text[17]`.** No heap, no `String`; the display is
   sixteen columns wide anyway, and the label is capped to match.
-* **The font is new, and it is code rather than data.** Two separate reasons.
-  The original's table is not ours to redistribute, so the glyphs here are an
-  independently drawn stroke font covering A–Z, 0–9, `-`, `.`, `!` and `?` in
-  the same encoding: hundreds digit means pen down, tens is x, ones is y, 200
-  ends a glyph, 222 stamps a dot, lower case folds to upper. And it is forty
-  small functions behind a `switch` rather than a `const int[40][14]` because
-  ardio has no aggregate initialisers — an array can be declared and indexed,
-  but nothing can put values in it at compile time, and filling a table this
-  size at run time would cost 1120 of the part's 2048 bytes of SRAM.
+* **The font is new, and it is one flat table.** The original's table is not
+  ours to redistribute, so the glyphs here are an independently drawn stroke
+  font covering A–Z, 0–9, `-`, `.`, `!` and `?`. One byte per pen move: bit 6
+  means pen down, bits 3..5 are x, bits 0..2 are y, and 126 stamps a dot; lower
+  case folds to upper. `stroke[242]` holds every glyph end to end and
+  `glyph_start[41]` says where each one begins, so the entry after a slot is
+  where that slot ends and no terminator byte is needed. The offsets are
+  stored biased by -121 to keep them inside a signed `char`.
+
+  This was forty small functions behind a `switch` until aggregate
+  initialisers landed in the compiler; the shapes are unchanged, only the
+  storage. It was worth doing: the table form is 6272 bytes of flash smaller
+  than the functions were, which is most of this sketch's total saving.
 * **The fractional fudge factors are gone.** There is no floating point, so
   `y * 3.5` is `y * 7 / 2`, and the `pos -= (scale*4) / 1.1` kerning nudges for
   `I` and `,` are dropped.
@@ -78,47 +82,71 @@ stepping, same release-the-coils-when-idle discipline. What changed:
 
 Ordered by how much they cost this sketch.
 
-1. **No aggregate initialisers.** `int t[3] = {1,2,3};` fails with `cannot
-   initialise int[3] from int`, at global and local scope alike, and
-   `char s[] = "AB"` fails with `cannot initialise char[0] from char[3]` (no
-   size deduction either). Arrays are otherwise fine now — declared, indexed,
-   assigned — so this is the one gap that reshapes the design, and it is what
-   turns a 63x14 font table into forty functions.
-2. **No `#include` and no `#define`.** Directives are blanked before parsing,
+1. **No `#include` and no `#define`.** Directives are blanked before parsing,
    so the runtime's own headers in `runtime/include/` cannot be used, and
    neither can the library classes they declare.
-3. **No `enum`.** `enum State { ... };` is `line 2: expected a type name`, so
-   the two state enumerations are `const int` groups. `switch`/`case` over
+2. **No `enum`.** `enum State { ... };` is `line 2: expected a type name`, so
+   the two state enumerations are `const char` groups. `switch`/`case` over
    those constants works.
-4. **No floating point at any level** — not even in the lexer, where `3.5`
+3. **No floating point at any level** — not even in the lexer, where `3.5`
    comes out as three separate tokens.
-5. **No 32-bit locals or parameters**: `only 8- and 16-bit locals are
+4. **No 32-bit locals or parameters**: `only 8- and 16-bit locals are
    supported`. The original's `long over`, `long dx`, `long dy` in Bresenham
    are `int` here. The values stay inside 16 bits at this machine's scale, but
    that is arithmetic that had to be checked by hand rather than a guarantee.
-6. **Globals initialise only from integer literals.** `int angle =
-   PEN_UP_ANGLE;` compiles cleanly and silently leaves `angle` at zero. It is
-   the only item on this list with no diagnostic at all, and it is the one
-   that cost the most debugging.
-7. **The runtime is thinner than its headers.** `LiquidCrystal_I2C.h` declares
+5. **`char` is signed and there is no `unsigned char`.** Bytes only reach 127,
+   which is why the font's stroke bytes are packed into seven bits and its
+   offsets are stored biased.
+6. **The runtime is thinner than its headers.** `LiquidCrystal_I2C.h` declares
    `lcd_write_str`, `lcd_home`, `lcd_create_char` and friends, but `lcd.S`
    defines only a handful; calling one of the others fails at assembly time
    with `undefined label 'lcd_write_str'`. Printing a string is therefore a
    loop in the sketch. Worth knowing before designing against the headers.
-8. **No `analogRead` and no `millis`/`micros`** in the runtime.
-9. **The stepper runtime is single-instance** — fixed SRAM addresses, one set
+7. **No `analogRead` and no `millis`/`micros`** in the runtime.
+8. **The stepper runtime is single-instance** — fixed SRAM addresses, one set
    of coil pins — so a two-axis machine cannot use it.
-10. **No `sizeof`**, no `typedef`, no function overloading, no default
-    arguments. All four appear in the original; none is load-bearing.
-11. **Long if-chains are expensive in flash** (see above). Not a correctness
+9. **No `sizeof`**, no `typedef`. Both appear in the original; neither is
+   load-bearing.
+10. **Long if-chains are expensive in flash** (see above). Not a correctness
     limit, but it decides what fits in the part.
 
-Two things that blocked an earlier draft of this port have since been fixed in
-the compiler and are no longer limitations: array indexing and assignment, and
-`/` and `%`. Conditional branches used to be emitted without relaxation, so any
-`if` or loop body over 63 words failed to assemble (`branch offset 82 is out of
-range`) and had to be split into extra functions; that is fixed too, and the
-state machine is now written inline the way the original is.
+Four things that blocked an earlier draft of this port have since been fixed in
+the compiler and are no longer limitations: array indexing and assignment; `/`
+and `%`; aggregate initialisers, which is what let the font become a table;
+and globals initialised from a named constant rather than a literal, which
+used to compile cleanly and silently leave the global at zero.
+
+Conditional branches used to be emitted without relaxation, so any `if` or loop
+body over 63 words failed to assemble (`branch offset 82 is out of range`) and
+had to be split into extra functions; that is fixed too, and the state machine
+is now written inline the way the original is.
+
+## Where the flash went
+
+Measured with `ardio build`, summing the data records in the generated hex.
+The sketch started at 16660 bytes and finished at 9248, a 44% cut, with no
+feature removed and no glyph redrawn:
+
+| change | bytes | after |
+| --- | ---: | ---: |
+| forty glyph functions and their `switch` become `stroke[]` + `glyph_start[]` | -6272 | 10388 |
+| `coil_pattern` switch becomes a table; one `drive_coils` for both motors | -118 | 10270 |
+| the redundant `angle` global, and `pen_up`/`pen_down` | -62 | 10208 |
+| `setup` walks pin tables instead of writing out thirteen calls | -182 | 10026 |
+| `show_choices` and `blink_cursor` replace three and two copies of themselves | -214 | 9812 |
+| `glyph_start` stored as biased bytes rather than words | -236 | 9576 |
+| small `const int` constants become `const char` | -40 | 9536 |
+| `drive_coils` indexes the pin table instead of taking four pin arguments | -288 | 9248 |
+
+Four things that looked like wins and measured as losses, so they are not in
+the sketch: a `marks[4]` table replacing the four punctuation comparisons in
+`alphabet` and `glyph_slot` (+12), a `go(next, from)` helper for the four state
+transitions (+46), reading the buttons through `button_pins[]` at the five call
+sites in `loop` (+140), and dropping `button_pins` in favour of five written-out
+`button_init` calls (+68). On this compiler an array index costs more than a
+comparison and a call costs more than three inline statements, so a table only
+pays when it replaces a lot of code at once — which is exactly why the font,
+which replaced forty functions, paid so enormously.
 
 ## Not implemented
 

@@ -63,6 +63,42 @@ int class_field_offset(const std::string& class_name, const std::string& field) 
 
 void clear_class_layouts() { class_layouts().clear(); }
 
+// ------------------------------------------------------- flash residency ---
+//
+// A global array that is only ever read can live in flash instead of SRAM,
+// which is the scarcer resource by a factor of sixteen on an ATmega328P: 2 KB
+// against 32 KB. A Type has no bit for "lives in flash", and adding one would
+// mean every pass agreeing on it, so residency is tracked in a table beside
+// the generator exactly as class field offsets are: the driver decides which
+// globals qualify and publishes them here before any code refers to them.
+//
+// The value stored is the assembler label the table's bytes are emitted under.
+// Everything about the byte-versus-word conversion happens at the point of
+// use, in gen_flash_address(); the table itself just names the label.
+
+namespace {
+
+std::map<std::string, std::string>& flash_globals() {
+    static std::map<std::string, std::string> tables;
+    return tables;
+}
+
+// The label a global's bytes are emitted under, or null if it lives in SRAM.
+const std::string* flash_label(const std::string& name) {
+    auto it = flash_globals().find(name);
+    return it == flash_globals().end() ? nullptr : &it->second;
+}
+
+} // namespace
+
+void set_flash_global(const std::string& name, const std::string& label) {
+    flash_globals()[name] = label;
+}
+
+bool is_flash_global(const std::string& name) { return flash_label(name) != nullptr; }
+
+void clear_flash_globals() { flash_globals().clear(); }
+
 // ------------------------------------------------------------- plumbing ----
 
 void CodeGen::emit(const std::string& line) { out += line; out += '\n'; }
@@ -686,6 +722,117 @@ void load_through_address(CodeGen& g, int size, bool is_signed) {
     else g.widen_to_16(is_signed);
 }
 
+// --------------------------------------------------------- flash tables ----
+//
+// LPM reads flash through Z, and Z there is a BYTE address, while every label
+// the assembler hands out is a WORD address -- the whole instruction stream is
+// 16 bits wide, so that is the only numbering that makes sense for a branch
+// target. The two are converted at exactly one place, here: the byte address
+// of a table is `label * 2`. A label is always word-aligned (the assembler
+// rounds up to a word before recording one, so a table that follows an
+// odd-length run of data still starts on a word boundary), so the conversion
+// is exact in both directions and no low bit is ever lost.
+//
+// lo8()/hi8() then split that byte address across the two LDI instructions
+// that load Z, which is the same shape as loading any other 16-bit address.
+
+// The identifier a chain of subscripts is rooted at, or null if the base is
+// not a plain name.
+const Expr* subscript_root(const Expr& e) {
+    const Expr* p = &e;
+    while (p->kind == ExprKind::Index) {
+        if (!p->lhs) return nullptr;
+        p = p->lhs.get();
+    }
+    return p->kind == ExprKind::Identifier ? p : nullptr;
+}
+
+// The flash label a subscript chain reads from, or null if it reads SRAM.
+const std::string* flash_table_of(const Expr& e) {
+    const Expr* root = subscript_root(e);
+    return root ? flash_label(root->name) : nullptr;
+}
+
+// Leaves the flash BYTE address a subscript chain denotes in r24:r25.
+bool gen_flash_address(CodeGen& g, const Expr& e) {
+    if (g.failed()) return false;
+
+    if (e.kind == ExprKind::Identifier) {
+        const std::string* label = flash_label(e.name);
+        if (!label) {
+            g.fail("'" + e.name + "' is not a table held in flash");
+            return false;
+        }
+        // Word address to byte address. See the note above.
+        g.emit("ldi r24, lo8(" + *label + " * 2)");
+        g.emit("ldi r25, hi8(" + *label + " * 2)");
+        return true;
+    }
+
+    if (e.kind != ExprKind::Index || !e.lhs || !e.rhs) {
+        g.fail("malformed subscript of a table held in flash");
+        return false;
+    }
+    if (!gen_flash_address(g, *e.lhs)) return false;
+    g.emit("push r24");
+    g.emit("push r25");
+    g.gen_expr(*e.rhs);                         // the subscript
+    if (g.failed()) return false;
+    // Byte addresses throughout, so a row of a 2-D table scales by the row's
+    // size in bytes just as a scalar element scales by its own size.
+    scale_index(g, e.type ? e.type->size() : 1);
+    g.emit("movw r22, r24");
+    g.emit("pop r25");
+    g.emit("pop r24");
+    g.emit("add r24, r22");
+    g.emit("adc r25, r23");
+    return true;
+}
+
+// Reads `size` bytes of flash from the byte address in r24:r25 back into
+// r24:r25 (or r22..r25 for a long). The assembler provides LPM in its implicit
+// form only -- R0 <- (Z) -- so each byte lands in r0 and is moved on, and Z is
+// stepped by hand between bytes.
+void load_from_flash(CodeGen& g, int size, bool is_signed) {
+    g.emit("movw r30, r24");
+    if (size == 4) {
+        for (int i = 0; i < 4; ++i) {
+            if (i) g.emit("adiw r30, 1");
+            g.emit("lpm");
+            g.emit(std::string("mov ") + kWideRegs[i] + ", r0");
+        }
+        return;
+    }
+    g.emit("lpm");
+    g.emit("mov r24, r0");
+    if (size == 2) {
+        g.emit("adiw r30, 1");
+        g.emit("lpm");
+        g.emit("mov r25, r0");
+    } else {
+        g.widen_to_16(is_signed);
+    }
+}
+
+// Reads one element of a table held in flash.
+void gen_flash_load(CodeGen& g, const Expr& e) {
+    if (is_array(e)) {
+        // Only fully subscripted reads are ever placed in flash: a partial
+        // subscript would decay to an address that a plain LD cannot follow.
+        // The driver refuses flash placement in that case, so reaching here
+        // means the two disagree -- say so rather than emit a wrong address.
+        g.fail("a table held in flash cannot decay to a pointer");
+        return;
+    }
+    const int size = CodeGen::expr_size(e);
+    if (e.type && e.type->size() != size) {
+        g.fail("only 8-, 16- and 32-bit values can be read from flash");
+        return;
+    }
+    if (!gen_flash_address(g, e)) return;
+    load_from_flash(g, size, CodeGen::expr_is_signed(e));
+}
+
 // The class a member expression's object belongs to, or "" if it has none.
 std::string member_class(const Expr& e) {
     if (!e.lhs || !e.lhs->type) return {};
@@ -700,6 +847,14 @@ bool gen_address(CodeGen& g, const Expr& e) {
 
     switch (e.kind) {
     case ExprKind::Identifier: {
+        // A table in flash has no SRAM address at all. The driver only places
+        // one there when every use is a fully subscripted read, so this is a
+        // consistency check, not a reachable diagnostic: better a refusal than
+        // an SRAM address that was never written.
+        if (is_flash_global(e.name)) {
+            g.fail("'" + e.name + "' is held in flash and has no data address");
+            return false;
+        }
         int off = g.local_offset(e.name);
         if (off >= 0) {
             g.emit("movw r24, r28");            // Y, the frame pointer
@@ -770,6 +925,9 @@ bool gen_address(CodeGen& g, const Expr& e) {
 
 // Reads an lvalue that is not a plain named variable.
 void gen_indirect_load(CodeGen& g, const Expr& e) {
+    // A subscript rooted at a table that was placed in flash reads through
+    // LPM; nothing about it is in SRAM to address.
+    if (e.kind == ExprKind::Index && flash_table_of(e)) { gen_flash_load(g, e); return; }
     if (is_array(e)) { gen_address(g, e); return; }   // an array decays
     int size = CodeGen::expr_size(e);
     if (e.type && e.type->size() != size) {

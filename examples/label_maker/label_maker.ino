@@ -33,34 +33,35 @@ void servo_write(int angle);
 int button_init(int pin, int debounce_ms);
 int button_pressed(int pin);
 
-const int OUTPUT_MODE = 1;
+const char OUTPUT_MODE = 1;
 
 // ------------------------------------------------------------ hardware -----
+//
+// Pin numbers are tables rather than eight and five separate constants,
+// because setup walks them in a loop and drive_coils walks four at a time.
 
-const int X_PIN1 = 6;           // X carriage motor coils
-const int X_PIN2 = 8;
-const int X_PIN3 = 7;
-const int X_PIN4 = 9;
-
-const int Y_PIN1 = 2;           // Y lead screw motor coils
-const int Y_PIN2 = 4;
-const int Y_PIN3 = 3;
-const int Y_PIN4 = 5;
-
-const int SERVO_PIN = 13;
+// Coil 1 to coil 4 of the X carriage motor, then the same for the Y lead
+// screw. X_MOTOR and Y_MOTOR are where each motor's four start.
+const char motor_pins[8] = {6, 8, 7, 9, 2, 4, 3, 5};
+const char X_MOTOR = 0;
+const char Y_MOTOR = 4;
 
 // The joystick of the original, as five contacts to ground: there is no
-// analogRead in the runtime to read a real one with.
-const int BTN_OK    = 14;       // A0, the click
-const int BTN_UP    = 15;       // A1
-const int BTN_DOWN  = 16;       // A2
-const int BTN_LEFT  = 17;       // A3
-const int BTN_RIGHT = 10;
-const int DEBOUNCE_MS = 50;
+// analogRead in the runtime to read a real one with. A0 is the click, then
+// A1, A2 and A3 for up, down and left, and D10 for right.
+const char button_pins[5] = {14, 15, 16, 17, 10};
+const char BTN_OK    = 14;
+const char BTN_UP    = 15;
+const char BTN_DOWN  = 16;
+const char BTN_LEFT  = 17;
+const char BTN_RIGHT = 10;
+const char DEBOUNCE_MS = 50;
 
-const int LCD_ADDR = 39;        // 0x27, the usual PCF8574 backpack address
-const int PEN_UP_ANGLE   = 25;
-const int PEN_DOWN_ANGLE = 80;
+const char SERVO_PIN = 13;
+
+const char LCD_ADDR = 39;     // 0x27, the usual PCF8574 backpack address
+const char PEN_UP_ANGLE   = 25;
+const char PEN_DOWN_ANGLE = 80;
 
 // Step timing. The original asks the Stepper library for 10 and 12 rpm; at
 // 2048 steps per revolution that is about 2.9 ms and 2.4 ms per step, and this
@@ -76,7 +77,6 @@ const int space = 1150;         // x_scale * 5: one character cell, in steps
 
 int xpos = 0;                   // where the carriage is now, in steps
 int ypos = 0;
-int angle = 25;                 // PEN_UP_ANGLE; only literals initialise globals
 bool pen_on_paper = false;
 
 int x_phase = 0;                // full-drive phase index of each motor
@@ -84,10 +84,10 @@ int y_phase = 0;
 
 // ---------------------------------------------------------- menu state -----
 
-const int MAIN_MENU = 0;
-const int EDITING = 1;
-const int PRINT_CONFIRM = 2;
-const int PRINTING = 3;
+const char MAIN_MENU = 0;
+const char EDITING = 1;
+const char PRINT_CONFIRM = 2;
+const char PRINTING = 3;
 
 int state = 0;                  // MAIN_MENU
 int prev_state = 3;             // PRINTING, so the first pass paints the menu
@@ -101,7 +101,7 @@ bool blink_on = false;
 // The String of the original. A fixed buffer instead: there is no heap, and
 // the display is only 16 columns wide in any case.
 
-const int TEXT_MAX = 16;
+const char TEXT_MAX = 16;
 char text[17];
 int text_len = 0;
 
@@ -144,21 +144,26 @@ void show_text() {
     print_text();
 }
 
-void reset_screen() {
-    lcd_clear();
-    lcd_set_cursor(0, 0);
-    print_str(": ");
-    lcd_set_cursor(1, 0);
-    cursor_position = 1;
+// The second row of the print prompt, and the blinking '>' that both menus
+// park on the current choice. Each was written out at three call sites.
+void show_choices() {
+    lcd_set_cursor(0, 1);
+    print_str("   YES     NO   ");
+}
+
+void blink_cursor() {
+    lcd_set_cursor(cursor_position, 1);
+    if (blink_on) lcd_write_char(62);      // '>'
+    else lcd_write_char(32);
 }
 
 // --------------------------------------------------- the editing menu -----
 //
 // Slot 0 is a space, then A..Z, then 0..9, then four marks. Written as
-// arithmetic rather than a lookup table because every comparison in a chain
-// this long costs about twenty-five instructions of flash.
+// arithmetic rather than a lookup table because on this compiler an array
+// index costs more than the subtraction it would replace.
 
-const int ALPHABET_SIZE = 41;
+const char ALPHABET_SIZE = 41;
 
 int alphabet(int i) {
     if (i <= 0) return 32;              // space
@@ -172,18 +177,14 @@ int alphabet(int i) {
 
 // ----------------------------------------------------------- the font -----
 //
-// Each entry encodes one move of the pen: the hundreds digit means draw while
-// moving, the tens digit is x and the ones digit is y, both on the 0..4 grid
-// that the scale factors multiply up into motor steps. 200 ends a glyph and
-// 222 stamps a single dot.
+// Each byte encodes one move of the pen: bit 6 means draw while moving, bits
+// 3..5 are x and bits 0..2 are y, both on the 0..4 grid that the scale factors
+// multiply up into motor steps. 126 stamps a single dot instead of moving.
 //
-// It is a pile of functions rather than the obvious const array because ardio
-// has no aggregate initialisers yet -- an array can be declared and indexed,
-// but there is no way to give it its contents at compile time, and filling a
-// 40x14 table at run time would eat more than half of this part's SRAM.
+// The glyph shapes are the ones this sketch has always drawn; only the storage
+// changed, from forty small functions behind a switch to one flat table.
 
-const int GLYPH_END = 200;
-const int GLYPH_DOT = 222;
+const char GLYPH_DOT = 126;
 
 // ASCII to glyph slot, or -1 for "nothing to draw". The slots run A..Z, 0..9,
 // '-', '.', '!', '?', so the two big ranges are subtractions.
@@ -198,453 +199,63 @@ int glyph_slot(int c) {
     return -1;
 }
 
-int glyph_0(int i) {   // 'A'
-    if (i == 0) return 0;
-    if (i == 1) return 103;
-    if (i == 2) return 114;
-    if (i == 3) return 134;
-    if (i == 4) return 143;
-    if (i == 5) return 140;
-    if (i == 6) return 2;
-    if (i == 7) return 142;
-    return GLYPH_END;
-}
+// Every stroke of every glyph, end to end, one byte each. glyph_start says
+// where each slot begins, and the slot after it says where it ends, so no
+// terminator byte is needed.
+const char stroke[242] = {
+    0, 67, 76, 92, 99, 96, 2, 98,            // 'A'
+    0, 68, 92, 99, 90, 66, 26, 97, 88, 64,   // 'B'
+    36, 76, 67, 65, 72, 96,                  // 'C'
+    0, 68, 92, 99, 97, 88, 64,               // 'D'
+    36, 68, 64, 96, 2, 90,                   // 'E'
+    0, 68, 100, 2, 90,                       // 'F'
+    36, 76, 67, 65, 72, 96, 98, 82,          // 'G'
+    0, 68, 2, 98, 36, 96,                    // 'H'
+    0, 68,                                   // 'I'
+    1, 72, 88, 97, 100,                      // 'J'
+    0, 68, 2, 100, 2, 96,                    // 'K'
+    4, 64, 96,                               // 'L'
+    0, 68, 82, 100, 96,                      // 'M'
+    0, 68, 96, 100,                          // 'N'
+    8, 65, 67, 76, 92, 99, 97, 88, 72,       // 'O'
+    0, 68, 92, 99, 90, 66,                   // 'P'
+    8, 65, 67, 76, 92, 99, 97, 88, 72, 17, 96, // 'Q'
+    0, 68, 92, 99, 90, 66, 18, 96,           // 'R'
+    1, 72, 88, 97, 90, 74, 67, 76, 92, 99,   // 'S'
+    4, 100, 20, 80,                          // 'T'
+    4, 65, 72, 88, 97, 100,                  // 'U'
+    4, 80, 100,                              // 'V'
+    4, 72, 82, 88, 100,                      // 'W'
+    0, 100, 4, 96,                           // 'X'
+    4, 82, 100, 18, 80,                      // 'Y'
+    4, 100, 64, 96,                          // 'Z'
+    8, 65, 67, 76, 92, 99, 97, 88, 72,       // '0'
+    3, 84, 80,                               // '1'
+    3, 76, 92, 99, 64, 96,                   // '2'
+    4, 100, 82, 97, 88, 72, 65,              // '3'
+    24, 92, 65, 97,                          // '4'
+    36, 68, 66, 90, 97, 88, 72, 65,          // '5'
+    36, 76, 67, 65, 72, 88, 97, 90, 66,      // '6'
+    4, 100, 72,                              // '7'
+    10, 67, 76, 92, 99, 90, 74, 65, 72, 88, 97, 90, // '8'
+    0, 88, 97, 99, 92, 76, 67, 74, 98,       // '9'
+    2, 98,                                   // '-'
+    0, 126,                                  // '.'
+    1, 68, 0, 126,                           // '!'
+    3, 76, 92, 99, 82, 81, 16, 126,          // '?'
+};
 
-int glyph_1(int i) {   // 'B'
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 132;
-    if (i == 5) return 102;
-    if (i == 6) return 32;
-    if (i == 7) return 141;
-    if (i == 8) return 130;
-    if (i == 9) return 100;
-    return GLYPH_END;
-}
-
-int glyph_2(int i) {   // 'C'
-    if (i == 0) return 44;
-    if (i == 1) return 114;
-    if (i == 2) return 103;
-    if (i == 3) return 101;
-    if (i == 4) return 110;
-    if (i == 5) return 140;
-    return GLYPH_END;
-}
-
-int glyph_3(int i) {   // 'D'
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 141;
-    if (i == 5) return 130;
-    if (i == 6) return 100;
-    return GLYPH_END;
-}
-
-int glyph_4(int i) {   // 'E'
-    if (i == 0) return 44;
-    if (i == 1) return 104;
-    if (i == 2) return 100;
-    if (i == 3) return 140;
-    if (i == 4) return 2;
-    if (i == 5) return 132;
-    return GLYPH_END;
-}
-
-int glyph_5(int i) {   // 'F'
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 144;
-    if (i == 3) return 2;
-    if (i == 4) return 132;
-    return GLYPH_END;
-}
-
-int glyph_6(int i) {   // 'G'
-    if (i == 0) return 44;
-    if (i == 1) return 114;
-    if (i == 2) return 103;
-    if (i == 3) return 101;
-    if (i == 4) return 110;
-    if (i == 5) return 140;
-    if (i == 6) return 142;
-    if (i == 7) return 122;
-    return GLYPH_END;
-}
-
-int glyph_7(int i) {   // 'H'
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 2;
-    if (i == 3) return 142;
-    if (i == 4) return 44;
-    if (i == 5) return 140;
-    return GLYPH_END;
-}
-
-int glyph_8(int i) {   // 'I'
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    return GLYPH_END;
-}
-
-int glyph_9(int i) {   // 'J'
-    if (i == 0) return 1;
-    if (i == 1) return 110;
-    if (i == 2) return 130;
-    if (i == 3) return 141;
-    if (i == 4) return 144;
-    return GLYPH_END;
-}
-
-int glyph_10(int i) {   // 'K'
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 2;
-    if (i == 3) return 144;
-    if (i == 4) return 2;
-    if (i == 5) return 140;
-    return GLYPH_END;
-}
-
-int glyph_11(int i) {   // 'L'
-    if (i == 0) return 4;
-    if (i == 1) return 100;
-    if (i == 2) return 140;
-    return GLYPH_END;
-}
-
-int glyph_12(int i) {   // 'M'
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 122;
-    if (i == 3) return 144;
-    if (i == 4) return 140;
-    return GLYPH_END;
-}
-
-int glyph_13(int i) {   // 'N'
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 140;
-    if (i == 3) return 144;
-    return GLYPH_END;
-}
-
-int glyph_14(int i) {   // 'O'
-    if (i == 0) return 10;
-    if (i == 1) return 101;
-    if (i == 2) return 103;
-    if (i == 3) return 114;
-    if (i == 4) return 134;
-    if (i == 5) return 143;
-    if (i == 6) return 141;
-    if (i == 7) return 130;
-    if (i == 8) return 110;
-    return GLYPH_END;
-}
-
-int glyph_15(int i) {   // 'P'
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 132;
-    if (i == 5) return 102;
-    return GLYPH_END;
-}
-
-int glyph_16(int i) {   // 'Q'
-    if (i == 0) return 10;
-    if (i == 1) return 101;
-    if (i == 2) return 103;
-    if (i == 3) return 114;
-    if (i == 4) return 134;
-    if (i == 5) return 143;
-    if (i == 6) return 141;
-    if (i == 7) return 130;
-    if (i == 8) return 110;
-    if (i == 9) return 21;
-    if (i == 10) return 140;
-    return GLYPH_END;
-}
-
-int glyph_17(int i) {   // 'R'
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 132;
-    if (i == 5) return 102;
-    if (i == 6) return 22;
-    if (i == 7) return 140;
-    return GLYPH_END;
-}
-
-int glyph_18(int i) {   // 'S'
-    if (i == 0) return 1;
-    if (i == 1) return 110;
-    if (i == 2) return 130;
-    if (i == 3) return 141;
-    if (i == 4) return 132;
-    if (i == 5) return 112;
-    if (i == 6) return 103;
-    if (i == 7) return 114;
-    if (i == 8) return 134;
-    if (i == 9) return 143;
-    return GLYPH_END;
-}
-
-int glyph_19(int i) {   // 'T'
-    if (i == 0) return 4;
-    if (i == 1) return 144;
-    if (i == 2) return 24;
-    if (i == 3) return 120;
-    return GLYPH_END;
-}
-
-int glyph_20(int i) {   // 'U'
-    if (i == 0) return 4;
-    if (i == 1) return 101;
-    if (i == 2) return 110;
-    if (i == 3) return 130;
-    if (i == 4) return 141;
-    if (i == 5) return 144;
-    return GLYPH_END;
-}
-
-int glyph_21(int i) {   // 'V'
-    if (i == 0) return 4;
-    if (i == 1) return 120;
-    if (i == 2) return 144;
-    return GLYPH_END;
-}
-
-int glyph_22(int i) {   // 'W'
-    if (i == 0) return 4;
-    if (i == 1) return 110;
-    if (i == 2) return 122;
-    if (i == 3) return 130;
-    if (i == 4) return 144;
-    return GLYPH_END;
-}
-
-int glyph_23(int i) {   // 'X'
-    if (i == 0) return 0;
-    if (i == 1) return 144;
-    if (i == 2) return 4;
-    if (i == 3) return 140;
-    return GLYPH_END;
-}
-
-int glyph_24(int i) {   // 'Y'
-    if (i == 0) return 4;
-    if (i == 1) return 122;
-    if (i == 2) return 144;
-    if (i == 3) return 22;
-    if (i == 4) return 120;
-    return GLYPH_END;
-}
-
-int glyph_25(int i) {   // 'Z'
-    if (i == 0) return 4;
-    if (i == 1) return 144;
-    if (i == 2) return 100;
-    if (i == 3) return 140;
-    return GLYPH_END;
-}
-
-int glyph_26(int i) {   // '0'
-    if (i == 0) return 10;
-    if (i == 1) return 101;
-    if (i == 2) return 103;
-    if (i == 3) return 114;
-    if (i == 4) return 134;
-    if (i == 5) return 143;
-    if (i == 6) return 141;
-    if (i == 7) return 130;
-    if (i == 8) return 110;
-    return GLYPH_END;
-}
-
-int glyph_27(int i) {   // '1'
-    if (i == 0) return 3;
-    if (i == 1) return 124;
-    if (i == 2) return 120;
-    return GLYPH_END;
-}
-
-int glyph_28(int i) {   // '2'
-    if (i == 0) return 3;
-    if (i == 1) return 114;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 100;
-    if (i == 5) return 140;
-    return GLYPH_END;
-}
-
-int glyph_29(int i) {   // '3'
-    if (i == 0) return 4;
-    if (i == 1) return 144;
-    if (i == 2) return 122;
-    if (i == 3) return 141;
-    if (i == 4) return 130;
-    if (i == 5) return 110;
-    if (i == 6) return 101;
-    return GLYPH_END;
-}
-
-int glyph_30(int i) {   // '4'
-    if (i == 0) return 30;
-    if (i == 1) return 134;
-    if (i == 2) return 101;
-    if (i == 3) return 141;
-    return GLYPH_END;
-}
-
-int glyph_31(int i) {   // '5'
-    if (i == 0) return 44;
-    if (i == 1) return 104;
-    if (i == 2) return 102;
-    if (i == 3) return 132;
-    if (i == 4) return 141;
-    if (i == 5) return 130;
-    if (i == 6) return 110;
-    if (i == 7) return 101;
-    return GLYPH_END;
-}
-
-int glyph_32(int i) {   // '6'
-    if (i == 0) return 44;
-    if (i == 1) return 114;
-    if (i == 2) return 103;
-    if (i == 3) return 101;
-    if (i == 4) return 110;
-    if (i == 5) return 130;
-    if (i == 6) return 141;
-    if (i == 7) return 132;
-    if (i == 8) return 102;
-    return GLYPH_END;
-}
-
-int glyph_33(int i) {   // '7'
-    if (i == 0) return 4;
-    if (i == 1) return 144;
-    if (i == 2) return 110;
-    return GLYPH_END;
-}
-
-int glyph_34(int i) {   // '8'
-    if (i == 0) return 12;
-    if (i == 1) return 103;
-    if (i == 2) return 114;
-    if (i == 3) return 134;
-    if (i == 4) return 143;
-    if (i == 5) return 132;
-    if (i == 6) return 112;
-    if (i == 7) return 101;
-    if (i == 8) return 110;
-    if (i == 9) return 130;
-    if (i == 10) return 141;
-    if (i == 11) return 132;
-    return GLYPH_END;
-}
-
-int glyph_35(int i) {   // '9'
-    if (i == 0) return 0;
-    if (i == 1) return 130;
-    if (i == 2) return 141;
-    if (i == 3) return 143;
-    if (i == 4) return 134;
-    if (i == 5) return 114;
-    if (i == 6) return 103;
-    if (i == 7) return 112;
-    if (i == 8) return 142;
-    return GLYPH_END;
-}
-
-int glyph_36(int i) {   // '-'
-    if (i == 0) return 2;
-    if (i == 1) return 142;
-    return GLYPH_END;
-}
-
-int glyph_37(int i) {   // '.'
-    if (i == 0) return 0;
-    if (i == 1) return 222;
-    return GLYPH_END;
-}
-
-int glyph_38(int i) {   // '!'
-    if (i == 0) return 1;
-    if (i == 1) return 104;
-    if (i == 2) return 0;
-    if (i == 3) return 222;
-    return GLYPH_END;
-}
-
-int glyph_39(int i) {   // '?'
-    if (i == 0) return 3;
-    if (i == 1) return 114;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 122;
-    if (i == 5) return 121;
-    if (i == 6) return 20;
-    if (i == 7) return 222;
-    return GLYPH_END;
-}
-
-int glyph(int slot, int i) {
-    switch (slot) {
-    case 0: return glyph_0(i);
-    case 1: return glyph_1(i);
-    case 2: return glyph_2(i);
-    case 3: return glyph_3(i);
-    case 4: return glyph_4(i);
-    case 5: return glyph_5(i);
-    case 6: return glyph_6(i);
-    case 7: return glyph_7(i);
-    case 8: return glyph_8(i);
-    case 9: return glyph_9(i);
-    case 10: return glyph_10(i);
-    case 11: return glyph_11(i);
-    case 12: return glyph_12(i);
-    case 13: return glyph_13(i);
-    case 14: return glyph_14(i);
-    case 15: return glyph_15(i);
-    case 16: return glyph_16(i);
-    case 17: return glyph_17(i);
-    case 18: return glyph_18(i);
-    case 19: return glyph_19(i);
-    case 20: return glyph_20(i);
-    case 21: return glyph_21(i);
-    case 22: return glyph_22(i);
-    case 23: return glyph_23(i);
-    case 24: return glyph_24(i);
-    case 25: return glyph_25(i);
-    case 26: return glyph_26(i);
-    case 27: return glyph_27(i);
-    case 28: return glyph_28(i);
-    case 29: return glyph_29(i);
-    case 30: return glyph_30(i);
-    case 31: return glyph_31(i);
-    case 32: return glyph_32(i);
-    case 33: return glyph_33(i);
-    case 34: return glyph_34(i);
-    case 35: return glyph_35(i);
-    case 36: return glyph_36(i);
-    case 37: return glyph_37(i);
-    case 38: return glyph_38(i);
-    case 39: return glyph_39(i);
-    default: return GLYPH_END;
-    }
-}
+// Where each slot starts in the table above, biased by -121: the table is
+// 242 bytes long and a char only reaches 127, so the bias is what lets the
+// offsets be bytes rather than words. The entry after a slot is where it
+// ends, which is why there are forty-one of them.
+const char glyph_start[41] = {
+    -121, -113, -103, -97, -90, -84, -79, -71, -65, -63,
+    -58, -52, -49, -44, -40, -31, -25, -14, -6, 4,
+    8, 14, 17, 22, 26, 31, 35, 44, 47, 53,
+    60, 64, 72, 81, 84, 96, 105, 107, 109, 113,
+    121
+};
 
 // ------------------------------------------------------------- motors -----
 //
@@ -654,33 +265,30 @@ int glyph(int slot, int i) {
 // pair walks one coil at a time, and running the phase index downwards
 // reverses the motor.
 
-// Bit 0 is coil 1, bit 3 is coil 4.
-int coil_pattern(int phase) {
-    switch (phase) {
-    case 1: return 6;                   // coils 2 and 3
-    case 2: return 12;                  // coils 3 and 4
-    case 3: return 9;                   // coils 4 and 1
-    default: return 3;                  // coils 1 and 2
-    }
+// One phase per entry; bit 0 is coil 1 and bit 3 is coil 4, so each entry
+// energises the pair of coils that phase drives.
+const char coil_pattern[4] = {
+    3,                                  // coils 1 and 2
+    6,                                  // coils 2 and 3
+    12,                                 // coils 3 and 4
+    9                                   // coils 4 and 1
+};
+
+// The two motors differ only in where their four pins sit in motor_pins, so
+// one routine drives either of them: base 0 is X, base 4 is Y.
+void drive_coils(int base, int p) {
+    for (int i = 0; i < 4; i++) digitalWrite(motor_pins[base + i], (p >> i) & 1);
 }
 
 void x_step(int dir) {
     x_phase = (x_phase + dir) & 3;
-    int p = coil_pattern(x_phase);
-    digitalWrite(X_PIN1, p & 1);
-    digitalWrite(X_PIN2, (p >> 1) & 1);
-    digitalWrite(X_PIN3, (p >> 2) & 1);
-    digitalWrite(X_PIN4, (p >> 3) & 1);
+    drive_coils(X_MOTOR, coil_pattern[x_phase]);
     delay(X_STEP_MS);
 }
 
 void y_step(int dir) {
     y_phase = (y_phase + dir) & 3;
-    int p = coil_pattern(y_phase);
-    digitalWrite(Y_PIN1, p & 1);
-    digitalWrite(Y_PIN2, (p >> 1) & 1);
-    digitalWrite(Y_PIN3, (p >> 2) & 1);
-    digitalWrite(Y_PIN4, (p >> 3) & 1);
+    drive_coils(Y_MOTOR, coil_pattern[y_phase]);
     delay(Y_STEP_MS);
 }
 
@@ -692,24 +300,18 @@ void y_run(int steps) {
 
 // Dropping every coil stops the motors cooking while the machine sits idle.
 void release_motors() {
-    digitalWrite(X_PIN1, 0); digitalWrite(X_PIN2, 0);
-    digitalWrite(X_PIN3, 0); digitalWrite(X_PIN4, 0);
-    digitalWrite(Y_PIN1, 0); digitalWrite(Y_PIN2, 0);
-    digitalWrite(Y_PIN3, 0); digitalWrite(Y_PIN4, 0);
+    drive_coils(X_MOTOR, 0);
+    drive_coils(Y_MOTOR, 0);
 }
 
 // ---------------------------------------------------------------- pen -----
 
 void plot(bool down) {
-    if (down) angle = PEN_DOWN_ANGLE;
-    else angle = PEN_UP_ANGLE;
-    servo_write(angle);
+    if (down) servo_write(PEN_DOWN_ANGLE);
+    else servo_write(PEN_UP_ANGLE);
     if (down != pen_on_paper) delay(50);   // let the servo actually get there
     pen_on_paper = down;
 }
-
-void pen_up() { servo_write(PEN_UP_ANGLE); }
-void pen_down() { servo_write(PEN_DOWN_ANGLE); }
 
 void home_y_axis() {
     y_run(-3000);                          // wind the carriage down to the stop
@@ -764,9 +366,9 @@ void plot_character(int c, int x, int y) {
     int slot = glyph_slot(c);
     if (slot < 0) return;
 
-    for (int i = 0; i < 14; i++) {
-        int v = glyph(slot, i);
-        if (v == GLYPH_END) return;
+    int end = glyph_start[slot + 1] + 121;
+    for (int i = glyph_start[slot] + 121; i < end; i++) {
+        int v = stroke[i];
 
         if (v == GLYPH_DOT) {              // a full stop, and the dot of a '!'
             plot(true);
@@ -776,12 +378,12 @@ void plot_character(int c, int x, int y) {
         }
 
         bool draw = false;
-        if (v > 99) {
+        if (v > 63) {
             draw = true;
-            v = v - 100;
+            v = v - 64;
         }
-        int cx = v / 10;
-        int cy = v % 10;
+        int cx = v / 8;
+        int cy = v % 8;
         // Y is multiplied by 7/2 because the lead screw covers about 3.5 times
         // less distance per step than the X wheel does.
         line(x + cx * x_scale, y + cy * y_scale * 7 / 2, draw);
@@ -806,22 +408,13 @@ void setup() {
     lcd_set_cursor(0, 0);
     print_str("Initializing... ");
 
-    pinMode(X_PIN1, OUTPUT_MODE); pinMode(X_PIN2, OUTPUT_MODE);
-    pinMode(X_PIN3, OUTPUT_MODE); pinMode(X_PIN4, OUTPUT_MODE);
-    pinMode(Y_PIN1, OUTPUT_MODE); pinMode(Y_PIN2, OUTPUT_MODE);
-    pinMode(Y_PIN3, OUTPUT_MODE); pinMode(Y_PIN4, OUTPUT_MODE);
+    for (int i = 0; i < 8; i++) pinMode(motor_pins[i], OUTPUT_MODE);
 
-    button_init(BTN_OK, DEBOUNCE_MS);      // debounce stops one click counting twice
-    button_init(BTN_UP, DEBOUNCE_MS);
-    button_init(BTN_DOWN, DEBOUNCE_MS);
-    button_init(BTN_LEFT, DEBOUNCE_MS);
-    button_init(BTN_RIGHT, DEBOUNCE_MS);
+    // Debounce stops one click counting twice.
+    for (int i = 0; i < 5; i++) button_init(button_pins[i], DEBOUNCE_MS);
 
     servo_attach(SERVO_PIN);
-    servo_write(angle);
     plot(false);                           // pen clear of the tape, so one can be loaded
-
-    pen_up();
     home_y_axis();
     xpos = 0;
     ypos = 0;
@@ -858,9 +451,7 @@ void loop() {
             prev_state = MAIN_MENU;
         }
 
-        lcd_set_cursor(cursor_position, 1);
-        if (blink_on) lcd_write_char(62);   // '>'
-        else lcd_write_char(32);
+        blink_cursor();
 
         if (ok) {
             lcd_clear();
@@ -914,27 +505,19 @@ void loop() {
         if (prev_state == EDITING) {
             lcd_set_cursor(0, 0);
             print_str("  PRINT LABEL?  ");
-            lcd_set_cursor(0, 1);
-            print_str("   YES     NO   ");
+            show_choices();
             cursor_position = 2;
             prev_state = PRINT_CONFIRM;
         }
 
-        if (left) {
-            lcd_set_cursor(0, 1);
-            print_str("   YES     NO   ");
-            cursor_position = 2;
-            delay(200);
-        } else if (right) {
-            lcd_set_cursor(0, 1);
-            print_str("   YES     NO   ");
-            cursor_position = 10;
+        if (left || right) {
+            show_choices();
+            if (left) cursor_position = 2;
+            else cursor_position = 10;
             delay(200);
         }
 
-        lcd_set_cursor(cursor_position, 1);
-        if (blink_on) lcd_write_char(62);
-        else lcd_write_char(32);
+        blink_cursor();
 
         if (ok) {
             if (cursor_position == 2) {     // YES

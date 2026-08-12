@@ -58,4 +58,13 @@ TEST(label_maker_example_compiles) {
     CHECK(compiled.assembly.find("setup:") != std::string::npos);
     CHECK(compiled.assembly.find("loop:") != std::string::npos);
     CHECK(compiled.assembly.find("plot_character:") != std::string::npos);
+
+    // The font is one flat table of stroke bytes rather than a function per
+    // glyph. That is what keeps the sketch inside a Nano, so it is worth
+    // pinning down: the table is in the source, the per-glyph routines are
+    // not, and no label for one of them is emitted.
+    CHECK(source.find("const char stroke[") != std::string::npos);
+    CHECK(source.find("const char glyph_start[41]") != std::string::npos);
+    CHECK(source.find("int glyph_0(") == std::string::npos);
+    CHECK(compiled.assembly.find("glyph_0:") == std::string::npos);
 }

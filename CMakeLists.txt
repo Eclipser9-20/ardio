@@ -115,6 +115,7 @@ add_executable(ardio_tests
     tests/test_runtime_serial.cpp
     tests/test_lightweight.cpp
     tests/test_peephole.cpp
+    tests/test_flash_data.cpp
 )
 target_link_libraries(ardio_tests PRIVATE libardio)
 target_include_directories(ardio_tests PRIVATE tests)
