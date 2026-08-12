@@ -166,12 +166,35 @@ void CodeGen::store_to_variable(const std::string& name, int size) {
 
 // ------------------------------------------------------------------ calls --
 
+// Defined below: leaves an lvalue's address in r24:r25.
+namespace { bool gen_address(CodeGen& g, const Expr& e); }
+
 void CodeGen::gen_call(const Expr& e) {
+    // A method call carries the object in `lhs`. `this` is the implicit first
+    // argument, so it takes r24:r25 and pushes the declared arguments down one
+    // slot each. The label is ClassName__method, because the assembler has no
+    // symbol mangling and ':' is its label separator.
+    const bool is_method = e.lhs != nullptr;
+    std::string class_name;
+    if (is_method) {
+        const TypePtr& obj_type = e.lhs->type;
+        if (obj_type && obj_type->kind == TypeKind::Class) {
+            class_name = obj_type->class_name;
+        } else if (obj_type && obj_type->kind == TypeKind::Pointer && obj_type->pointee &&
+                   obj_type->pointee->kind == TypeKind::Class) {
+            class_name = obj_type->pointee->class_name;
+        } else {
+            fail("cannot work out which class '" + e.name + "' belongs to");
+            return;
+        }
+    }
+
     // Arguments are evaluated left to right onto the stack, then popped into
     // their ABI registers: register 26 minus the running total of each
     // argument's size rounded up to an even number of bytes.
     std::vector<int> arg_regs;
     int reg = 26;
+    if (is_method) reg -= 2;                  // `this` occupies r24:r25
     for (const ExprPtr& a : e.args) {
         int size = a ? expr_size(*a) : 2;
         int slot = size <= 2 ? 2 : ((size + 1) & ~1);
@@ -192,6 +215,19 @@ void CodeGen::gen_call(const Expr& e) {
         int r = arg_regs[i];
         emit("pop r" + imm(r + 1));
         emit("pop r" + imm(r));
+    }
+
+    if (is_method) {
+        // The object's address goes in last, so evaluating it cannot clobber
+        // the argument registers already loaded.
+        if (e.lhs->type && e.lhs->type->kind == TypeKind::Pointer) {
+            gen_expr(*e.lhs);                 // a pointer already *is* the address
+        } else {
+            gen_address(*this, *e.lhs);
+        }
+        if (failed()) return;
+        emit("call " + class_name + "__" + e.name);
+        return;
     }
 
     emit("call " + e.name);

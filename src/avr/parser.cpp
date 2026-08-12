@@ -1026,12 +1026,19 @@ private:
                 auto call = make_expr(ExprKind::Call, op_line);
                 if (expr->kind == ExprKind::Identifier || expr->kind == ExprKind::Member)
                     call->name = expr->name;
-                // A plain named call carries its callee in `name` only. Keeping
-                // the identifier as `lhs` too would make semantic analysis look
-                // the function up as if it were a variable. Member calls do keep
-                // their object expression.
-                if (expr->kind == ExprKind::Identifier)
+                if (expr->kind == ExprKind::Identifier) {
+                    // A plain named call carries its callee in `name` only.
+                    // Keeping the identifier as `lhs` too would make semantic
+                    // analysis look the function up as if it were a variable.
                     expr.reset();
+                } else if (expr->kind == ExprKind::Member) {
+                    // A method call carries the *object* in `lhs`, not the
+                    // member access itself -- otherwise semantic analysis types
+                    // the member and sees the method's return type instead of
+                    // the object's class.
+                    call->through_pointer = expr->through_pointer;
+                    expr = std::move(expr->lhs);
+                }
                 call->lhs = std::move(expr);
                 if (!is_punct(")")) {
                     for (;;) {

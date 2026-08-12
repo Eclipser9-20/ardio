@@ -170,51 +170,19 @@ void text_backspace() {
     text_set(text_len, 32);
 }
 
-// The character menu you scroll through while editing.
+// The character menu you scroll through while editing: slot 0 is a space,
+// then A..Z, then 0..9, then four marks. An if-chain over 41 entries costs
+// about two kilobytes of flash here, so it is arithmetic instead.
 const int ALPHABET_SIZE = 41;
 
 int alphabet(int i) {
-    if (i == 0) return 32;   // space
-    if (i == 1) return 65;   // A
-    if (i == 2) return 66;   // B
-    if (i == 3) return 67;   // C
-    if (i == 4) return 68;   // D
-    if (i == 5) return 69;   // E
-    if (i == 6) return 70;   // F
-    if (i == 7) return 71;   // G
-    if (i == 8) return 72;   // H
-    if (i == 9) return 73;   // I
-    if (i == 10) return 74;   // J
-    if (i == 11) return 75;   // K
-    if (i == 12) return 76;   // L
-    if (i == 13) return 77;   // M
-    if (i == 14) return 78;   // N
-    if (i == 15) return 79;   // O
-    if (i == 16) return 80;   // P
-    if (i == 17) return 81;   // Q
-    if (i == 18) return 82;   // R
-    if (i == 19) return 83;   // S
-    if (i == 20) return 84;   // T
-    if (i == 21) return 85;   // U
-    if (i == 22) return 86;   // V
-    if (i == 23) return 87;   // W
-    if (i == 24) return 88;   // X
-    if (i == 25) return 89;   // Y
-    if (i == 26) return 90;   // Z
-    if (i == 27) return 48;   // 0
-    if (i == 28) return 49;   // 1
-    if (i == 29) return 50;   // 2
-    if (i == 30) return 51;   // 3
-    if (i == 31) return 52;   // 4
-    if (i == 32) return 53;   // 5
-    if (i == 33) return 54;   // 6
-    if (i == 34) return 55;   // 7
-    if (i == 35) return 56;   // 8
-    if (i == 36) return 57;   // 9
-    if (i == 37) return 45;   // -
-    if (i == 38) return 46;   // .
-    if (i == 39) return 33;   // !
-    if (i == 40) return 63;   // ?
+    if (i <= 0) return 32;              // space
+    if (i < 27) return i + 64;          // 'A' .. 'Z'
+    if (i < 37) return i + 21;          // '0' .. '9'
+    if (i == 37) return 45;             // '-'
+    if (i == 38) return 46;             // '.'
+    if (i == 39) return 33;             // '!'
+    if (i == 40) return 63;             // '?'
     return 32;
 }
 
@@ -248,73 +216,158 @@ int abs_i(int v) {
 const int GLYPH_END = 200;
 const int GLYPH_DOT = 222;
 
-// Maps an ASCII code to a glyph slot, or -1 for "nothing to draw".
+// Maps an ASCII code to a glyph slot, or -1 for "nothing to draw". The slots
+// are laid out A..Z, 0..9, '-', '.', '!', '?' so that the two big ranges fall
+// out of subtraction rather than another long chain of comparisons.
 int glyph_slot(int c) {
-    if (c > 96 && c < 123) c = c - 32;      // fold lower case up
-    if (c == 33) return 0;   // !
-    if (c == 45) return 1;   // -
-    if (c == 46) return 2;   // .
-    if (c == 48) return 3;   // 0
-    if (c == 49) return 4;   // 1
-    if (c == 50) return 5;   // 2
-    if (c == 51) return 6;   // 3
-    if (c == 52) return 7;   // 4
-    if (c == 53) return 8;   // 5
-    if (c == 54) return 9;   // 6
-    if (c == 55) return 10;   // 7
-    if (c == 56) return 11;   // 8
-    if (c == 57) return 12;   // 9
-    if (c == 63) return 13;   // ?
-    if (c == 65) return 14;   // A
-    if (c == 66) return 15;   // B
-    if (c == 67) return 16;   // C
-    if (c == 68) return 17;   // D
-    if (c == 69) return 18;   // E
-    if (c == 70) return 19;   // F
-    if (c == 71) return 20;   // G
-    if (c == 72) return 21;   // H
-    if (c == 73) return 22;   // I
-    if (c == 74) return 23;   // J
-    if (c == 75) return 24;   // K
-    if (c == 76) return 25;   // L
-    if (c == 77) return 26;   // M
-    if (c == 78) return 27;   // N
-    if (c == 79) return 28;   // O
-    if (c == 80) return 29;   // P
-    if (c == 81) return 30;   // Q
-    if (c == 82) return 31;   // R
-    if (c == 83) return 32;   // S
-    if (c == 84) return 33;   // T
-    if (c == 85) return 34;   // U
-    if (c == 86) return 35;   // V
-    if (c == 87) return 36;   // W
-    if (c == 88) return 37;   // X
-    if (c == 89) return 38;   // Y
-    if (c == 90) return 39;   // Z
+    if (c > 96 && c < 123) c = c - 32;  // fold lower case up
+    if (c > 64 && c < 91) return c - 65;
+    if (c > 47 && c < 58) return c - 22;
+    if (c == 45) return 36;
+    if (c == 46) return 37;
+    if (c == 33) return 38;
+    if (c == 63) return 39;
     return -1;
 }
 
-int glyph_0(int i) {   // !
-    if (i == 0) return 1;
-    if (i == 1) return 104;
-    if (i == 2) return 0;
-    if (i == 3) return 222;
-    return GLYPH_END;
-}
-
-int glyph_1(int i) {   // -
-    if (i == 0) return 2;
-    if (i == 1) return 142;
-    return GLYPH_END;
-}
-
-int glyph_2(int i) {   // .
+int glyph_0(int i) {   // A
     if (i == 0) return 0;
-    if (i == 1) return 222;
+    if (i == 1) return 103;
+    if (i == 2) return 114;
+    if (i == 3) return 134;
+    if (i == 4) return 143;
+    if (i == 5) return 140;
+    if (i == 6) return 2;
+    if (i == 7) return 142;
     return GLYPH_END;
 }
 
-int glyph_3(int i) {   // 0
+int glyph_1(int i) {   // B
+    if (i == 0) return 0;
+    if (i == 1) return 104;
+    if (i == 2) return 134;
+    if (i == 3) return 143;
+    if (i == 4) return 132;
+    if (i == 5) return 102;
+    if (i == 6) return 32;
+    if (i == 7) return 141;
+    if (i == 8) return 130;
+    if (i == 9) return 100;
+    return GLYPH_END;
+}
+
+int glyph_2(int i) {   // C
+    if (i == 0) return 44;
+    if (i == 1) return 114;
+    if (i == 2) return 103;
+    if (i == 3) return 101;
+    if (i == 4) return 110;
+    if (i == 5) return 140;
+    return GLYPH_END;
+}
+
+int glyph_3(int i) {   // D
+    if (i == 0) return 0;
+    if (i == 1) return 104;
+    if (i == 2) return 134;
+    if (i == 3) return 143;
+    if (i == 4) return 141;
+    if (i == 5) return 130;
+    if (i == 6) return 100;
+    return GLYPH_END;
+}
+
+int glyph_4(int i) {   // E
+    if (i == 0) return 44;
+    if (i == 1) return 104;
+    if (i == 2) return 100;
+    if (i == 3) return 140;
+    if (i == 4) return 2;
+    if (i == 5) return 132;
+    return GLYPH_END;
+}
+
+int glyph_5(int i) {   // F
+    if (i == 0) return 0;
+    if (i == 1) return 104;
+    if (i == 2) return 144;
+    if (i == 3) return 2;
+    if (i == 4) return 132;
+    return GLYPH_END;
+}
+
+int glyph_6(int i) {   // G
+    if (i == 0) return 44;
+    if (i == 1) return 114;
+    if (i == 2) return 103;
+    if (i == 3) return 101;
+    if (i == 4) return 110;
+    if (i == 5) return 140;
+    if (i == 6) return 142;
+    if (i == 7) return 122;
+    return GLYPH_END;
+}
+
+int glyph_7(int i) {   // H
+    if (i == 0) return 0;
+    if (i == 1) return 104;
+    if (i == 2) return 2;
+    if (i == 3) return 142;
+    if (i == 4) return 44;
+    if (i == 5) return 140;
+    return GLYPH_END;
+}
+
+int glyph_8(int i) {   // I
+    if (i == 0) return 0;
+    if (i == 1) return 104;
+    return GLYPH_END;
+}
+
+int glyph_9(int i) {   // J
+    if (i == 0) return 1;
+    if (i == 1) return 110;
+    if (i == 2) return 130;
+    if (i == 3) return 141;
+    if (i == 4) return 144;
+    return GLYPH_END;
+}
+
+int glyph_10(int i) {   // K
+    if (i == 0) return 0;
+    if (i == 1) return 104;
+    if (i == 2) return 2;
+    if (i == 3) return 144;
+    if (i == 4) return 2;
+    if (i == 5) return 140;
+    return GLYPH_END;
+}
+
+int glyph_11(int i) {   // L
+    if (i == 0) return 4;
+    if (i == 1) return 100;
+    if (i == 2) return 140;
+    return GLYPH_END;
+}
+
+int glyph_12(int i) {   // M
+    if (i == 0) return 0;
+    if (i == 1) return 104;
+    if (i == 2) return 122;
+    if (i == 3) return 144;
+    if (i == 4) return 140;
+    return GLYPH_END;
+}
+
+int glyph_13(int i) {   // N
+    if (i == 0) return 0;
+    if (i == 1) return 104;
+    if (i == 2) return 140;
+    if (i == 3) return 144;
+    return GLYPH_END;
+}
+
+int glyph_14(int i) {   // O
     if (i == 0) return 10;
     if (i == 1) return 101;
     if (i == 2) return 103;
@@ -327,14 +380,137 @@ int glyph_3(int i) {   // 0
     return GLYPH_END;
 }
 
-int glyph_4(int i) {   // 1
+int glyph_15(int i) {   // P
+    if (i == 0) return 0;
+    if (i == 1) return 104;
+    if (i == 2) return 134;
+    if (i == 3) return 143;
+    if (i == 4) return 132;
+    if (i == 5) return 102;
+    return GLYPH_END;
+}
+
+int glyph_16(int i) {   // Q
+    if (i == 0) return 10;
+    if (i == 1) return 101;
+    if (i == 2) return 103;
+    if (i == 3) return 114;
+    if (i == 4) return 134;
+    if (i == 5) return 143;
+    if (i == 6) return 141;
+    if (i == 7) return 130;
+    if (i == 8) return 110;
+    if (i == 9) return 21;
+    if (i == 10) return 140;
+    return GLYPH_END;
+}
+
+int glyph_17(int i) {   // R
+    if (i == 0) return 0;
+    if (i == 1) return 104;
+    if (i == 2) return 134;
+    if (i == 3) return 143;
+    if (i == 4) return 132;
+    if (i == 5) return 102;
+    if (i == 6) return 22;
+    if (i == 7) return 140;
+    return GLYPH_END;
+}
+
+int glyph_18(int i) {   // S
+    if (i == 0) return 1;
+    if (i == 1) return 110;
+    if (i == 2) return 130;
+    if (i == 3) return 141;
+    if (i == 4) return 132;
+    if (i == 5) return 112;
+    if (i == 6) return 103;
+    if (i == 7) return 114;
+    if (i == 8) return 134;
+    if (i == 9) return 143;
+    return GLYPH_END;
+}
+
+int glyph_19(int i) {   // T
+    if (i == 0) return 4;
+    if (i == 1) return 144;
+    if (i == 2) return 24;
+    if (i == 3) return 120;
+    return GLYPH_END;
+}
+
+int glyph_20(int i) {   // U
+    if (i == 0) return 4;
+    if (i == 1) return 101;
+    if (i == 2) return 110;
+    if (i == 3) return 130;
+    if (i == 4) return 141;
+    if (i == 5) return 144;
+    return GLYPH_END;
+}
+
+int glyph_21(int i) {   // V
+    if (i == 0) return 4;
+    if (i == 1) return 120;
+    if (i == 2) return 144;
+    return GLYPH_END;
+}
+
+int glyph_22(int i) {   // W
+    if (i == 0) return 4;
+    if (i == 1) return 110;
+    if (i == 2) return 122;
+    if (i == 3) return 130;
+    if (i == 4) return 144;
+    return GLYPH_END;
+}
+
+int glyph_23(int i) {   // X
+    if (i == 0) return 0;
+    if (i == 1) return 144;
+    if (i == 2) return 4;
+    if (i == 3) return 140;
+    return GLYPH_END;
+}
+
+int glyph_24(int i) {   // Y
+    if (i == 0) return 4;
+    if (i == 1) return 122;
+    if (i == 2) return 144;
+    if (i == 3) return 22;
+    if (i == 4) return 120;
+    return GLYPH_END;
+}
+
+int glyph_25(int i) {   // Z
+    if (i == 0) return 4;
+    if (i == 1) return 144;
+    if (i == 2) return 100;
+    if (i == 3) return 140;
+    return GLYPH_END;
+}
+
+int glyph_26(int i) {   // 0
+    if (i == 0) return 10;
+    if (i == 1) return 101;
+    if (i == 2) return 103;
+    if (i == 3) return 114;
+    if (i == 4) return 134;
+    if (i == 5) return 143;
+    if (i == 6) return 141;
+    if (i == 7) return 130;
+    if (i == 8) return 110;
+    return GLYPH_END;
+}
+
+int glyph_27(int i) {   // 1
     if (i == 0) return 3;
     if (i == 1) return 124;
     if (i == 2) return 120;
     return GLYPH_END;
 }
 
-int glyph_5(int i) {   // 2
+int glyph_28(int i) {   // 2
     if (i == 0) return 3;
     if (i == 1) return 114;
     if (i == 2) return 134;
@@ -344,7 +520,7 @@ int glyph_5(int i) {   // 2
     return GLYPH_END;
 }
 
-int glyph_6(int i) {   // 3
+int glyph_29(int i) {   // 3
     if (i == 0) return 4;
     if (i == 1) return 144;
     if (i == 2) return 122;
@@ -355,7 +531,7 @@ int glyph_6(int i) {   // 3
     return GLYPH_END;
 }
 
-int glyph_7(int i) {   // 4
+int glyph_30(int i) {   // 4
     if (i == 0) return 30;
     if (i == 1) return 134;
     if (i == 2) return 101;
@@ -363,7 +539,7 @@ int glyph_7(int i) {   // 4
     return GLYPH_END;
 }
 
-int glyph_8(int i) {   // 5
+int glyph_31(int i) {   // 5
     if (i == 0) return 44;
     if (i == 1) return 104;
     if (i == 2) return 102;
@@ -375,7 +551,7 @@ int glyph_8(int i) {   // 5
     return GLYPH_END;
 }
 
-int glyph_9(int i) {   // 6
+int glyph_32(int i) {   // 6
     if (i == 0) return 44;
     if (i == 1) return 114;
     if (i == 2) return 103;
@@ -388,14 +564,14 @@ int glyph_9(int i) {   // 6
     return GLYPH_END;
 }
 
-int glyph_10(int i) {   // 7
+int glyph_33(int i) {   // 7
     if (i == 0) return 4;
     if (i == 1) return 144;
     if (i == 2) return 110;
     return GLYPH_END;
 }
 
-int glyph_11(int i) {   // 8
+int glyph_34(int i) {   // 8
     if (i == 0) return 12;
     if (i == 1) return 103;
     if (i == 2) return 114;
@@ -411,7 +587,7 @@ int glyph_11(int i) {   // 8
     return GLYPH_END;
 }
 
-int glyph_12(int i) {   // 9
+int glyph_35(int i) {   // 9
     if (i == 0) return 0;
     if (i == 1) return 130;
     if (i == 2) return 141;
@@ -424,7 +600,27 @@ int glyph_12(int i) {   // 9
     return GLYPH_END;
 }
 
-int glyph_13(int i) {   // ?
+int glyph_36(int i) {   // -
+    if (i == 0) return 2;
+    if (i == 1) return 142;
+    return GLYPH_END;
+}
+
+int glyph_37(int i) {   // .
+    if (i == 0) return 0;
+    if (i == 1) return 222;
+    return GLYPH_END;
+}
+
+int glyph_38(int i) {   // !
+    if (i == 0) return 1;
+    if (i == 1) return 104;
+    if (i == 2) return 0;
+    if (i == 3) return 222;
+    return GLYPH_END;
+}
+
+int glyph_39(int i) {   // ?
     if (i == 0) return 3;
     if (i == 1) return 114;
     if (i == 2) return 134;
@@ -433,266 +629,6 @@ int glyph_13(int i) {   // ?
     if (i == 5) return 121;
     if (i == 6) return 20;
     if (i == 7) return 222;
-    return GLYPH_END;
-}
-
-int glyph_14(int i) {   // A
-    if (i == 0) return 0;
-    if (i == 1) return 103;
-    if (i == 2) return 114;
-    if (i == 3) return 134;
-    if (i == 4) return 143;
-    if (i == 5) return 140;
-    if (i == 6) return 2;
-    if (i == 7) return 142;
-    return GLYPH_END;
-}
-
-int glyph_15(int i) {   // B
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 132;
-    if (i == 5) return 102;
-    if (i == 6) return 32;
-    if (i == 7) return 141;
-    if (i == 8) return 130;
-    if (i == 9) return 100;
-    return GLYPH_END;
-}
-
-int glyph_16(int i) {   // C
-    if (i == 0) return 44;
-    if (i == 1) return 114;
-    if (i == 2) return 103;
-    if (i == 3) return 101;
-    if (i == 4) return 110;
-    if (i == 5) return 140;
-    return GLYPH_END;
-}
-
-int glyph_17(int i) {   // D
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 141;
-    if (i == 5) return 130;
-    if (i == 6) return 100;
-    return GLYPH_END;
-}
-
-int glyph_18(int i) {   // E
-    if (i == 0) return 44;
-    if (i == 1) return 104;
-    if (i == 2) return 100;
-    if (i == 3) return 140;
-    if (i == 4) return 2;
-    if (i == 5) return 132;
-    return GLYPH_END;
-}
-
-int glyph_19(int i) {   // F
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 144;
-    if (i == 3) return 2;
-    if (i == 4) return 132;
-    return GLYPH_END;
-}
-
-int glyph_20(int i) {   // G
-    if (i == 0) return 44;
-    if (i == 1) return 114;
-    if (i == 2) return 103;
-    if (i == 3) return 101;
-    if (i == 4) return 110;
-    if (i == 5) return 140;
-    if (i == 6) return 142;
-    if (i == 7) return 122;
-    return GLYPH_END;
-}
-
-int glyph_21(int i) {   // H
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 2;
-    if (i == 3) return 142;
-    if (i == 4) return 44;
-    if (i == 5) return 140;
-    return GLYPH_END;
-}
-
-int glyph_22(int i) {   // I
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    return GLYPH_END;
-}
-
-int glyph_23(int i) {   // J
-    if (i == 0) return 1;
-    if (i == 1) return 110;
-    if (i == 2) return 130;
-    if (i == 3) return 141;
-    if (i == 4) return 144;
-    return GLYPH_END;
-}
-
-int glyph_24(int i) {   // K
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 2;
-    if (i == 3) return 144;
-    if (i == 4) return 2;
-    if (i == 5) return 140;
-    return GLYPH_END;
-}
-
-int glyph_25(int i) {   // L
-    if (i == 0) return 4;
-    if (i == 1) return 100;
-    if (i == 2) return 140;
-    return GLYPH_END;
-}
-
-int glyph_26(int i) {   // M
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 122;
-    if (i == 3) return 144;
-    if (i == 4) return 140;
-    return GLYPH_END;
-}
-
-int glyph_27(int i) {   // N
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 140;
-    if (i == 3) return 144;
-    return GLYPH_END;
-}
-
-int glyph_28(int i) {   // O
-    if (i == 0) return 10;
-    if (i == 1) return 101;
-    if (i == 2) return 103;
-    if (i == 3) return 114;
-    if (i == 4) return 134;
-    if (i == 5) return 143;
-    if (i == 6) return 141;
-    if (i == 7) return 130;
-    if (i == 8) return 110;
-    return GLYPH_END;
-}
-
-int glyph_29(int i) {   // P
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 132;
-    if (i == 5) return 102;
-    return GLYPH_END;
-}
-
-int glyph_30(int i) {   // Q
-    if (i == 0) return 10;
-    if (i == 1) return 101;
-    if (i == 2) return 103;
-    if (i == 3) return 114;
-    if (i == 4) return 134;
-    if (i == 5) return 143;
-    if (i == 6) return 141;
-    if (i == 7) return 130;
-    if (i == 8) return 110;
-    if (i == 9) return 21;
-    if (i == 10) return 140;
-    return GLYPH_END;
-}
-
-int glyph_31(int i) {   // R
-    if (i == 0) return 0;
-    if (i == 1) return 104;
-    if (i == 2) return 134;
-    if (i == 3) return 143;
-    if (i == 4) return 132;
-    if (i == 5) return 102;
-    if (i == 6) return 22;
-    if (i == 7) return 140;
-    return GLYPH_END;
-}
-
-int glyph_32(int i) {   // S
-    if (i == 0) return 1;
-    if (i == 1) return 110;
-    if (i == 2) return 130;
-    if (i == 3) return 141;
-    if (i == 4) return 132;
-    if (i == 5) return 112;
-    if (i == 6) return 103;
-    if (i == 7) return 114;
-    if (i == 8) return 134;
-    if (i == 9) return 143;
-    return GLYPH_END;
-}
-
-int glyph_33(int i) {   // T
-    if (i == 0) return 4;
-    if (i == 1) return 144;
-    if (i == 2) return 24;
-    if (i == 3) return 120;
-    return GLYPH_END;
-}
-
-int glyph_34(int i) {   // U
-    if (i == 0) return 4;
-    if (i == 1) return 101;
-    if (i == 2) return 110;
-    if (i == 3) return 130;
-    if (i == 4) return 141;
-    if (i == 5) return 144;
-    return GLYPH_END;
-}
-
-int glyph_35(int i) {   // V
-    if (i == 0) return 4;
-    if (i == 1) return 120;
-    if (i == 2) return 144;
-    return GLYPH_END;
-}
-
-int glyph_36(int i) {   // W
-    if (i == 0) return 4;
-    if (i == 1) return 110;
-    if (i == 2) return 122;
-    if (i == 3) return 130;
-    if (i == 4) return 144;
-    return GLYPH_END;
-}
-
-int glyph_37(int i) {   // X
-    if (i == 0) return 0;
-    if (i == 1) return 144;
-    if (i == 2) return 4;
-    if (i == 3) return 140;
-    return GLYPH_END;
-}
-
-int glyph_38(int i) {   // Y
-    if (i == 0) return 4;
-    if (i == 1) return 122;
-    if (i == 2) return 144;
-    if (i == 3) return 22;
-    if (i == 4) return 120;
-    return GLYPH_END;
-}
-
-int glyph_39(int i) {   // Z
-    if (i == 0) return 4;
-    if (i == 1) return 144;
-    if (i == 2) return 100;
-    if (i == 3) return 140;
     return GLYPH_END;
 }
 
@@ -1222,23 +1158,33 @@ void glyph_move(int v, int x, int y) {
     line(x + cx * x_scale, y + ((cy * y_scale * 7) >> 1), draw);
 }
 
+// Draws entry i of a glyph and answers whether there is more to come.
+int glyph_step(int slot, int i, int x, int y) {
+    int v = glyph(slot, i);
+    if (v == GLYPH_END) return 0;
+    if (v == GLYPH_DOT) dot();
+    else glyph_move(v, x, y);
+    return 1;
+}
+
 void plot_character(int c, int x, int y) {
     int slot = glyph_slot(c);
     if (slot < 0) return;
-
     for (int i = 0; i < 14; i++) {
-        int v = glyph(slot, i);
-        if (v == GLYPH_END) return;
-        if (v == GLYPH_DOT) dot();
-        else glyph_move(v, x, y);
+        if (!glyph_step(slot, i, x, y)) return;
     }
+}
+
+// A space just advances the carriage; everything else gets drawn.
+void plot_one(int i, int x, int y) {
+    int c = text_get(i);
+    if (c != 32) plot_character(c, x, y);
 }
 
 void plot_text(int x, int y) {
     int pos = 0;
     for (int i = 0; i < text_len; i++) {
-        int c = text_get(i);
-        if (c != 32) plot_character(c, x + pos, y);
+        plot_one(i, x + pos, y);
         pos = pos + space;
     }
     release_motors();
