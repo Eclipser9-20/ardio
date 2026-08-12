@@ -12,6 +12,8 @@
 #include "ardio/avr/sema.h"
 #include "ardio/avr/token.h"
 
+#include <map>
+
 namespace ardio {
 
 // Implemented in codegen_class.cpp: emits constructor calls for globals of
@@ -52,6 +54,54 @@ std::string blank_directives(std::string_view source) {
         i = end + 1;
     }
     return out;
+}
+
+// Folds a global's initialiser to a constant. Globals are stored before the
+// entry point runs, standing in for the .data image a linker would normally
+// produce, so an initialiser has to be computable now. Anything that is not
+// becomes a diagnostic rather than a silent zero.
+bool fold_constant(const Expr& e, const std::map<std::string, long>& known, long& out) {
+    switch (e.kind) {
+    case ExprKind::IntLiteral:
+        out = e.int_value;
+        return true;
+    case ExprKind::Identifier: {
+        auto it = known.find(e.name);
+        if (it == known.end()) return false;
+        out = it->second;
+        return true;
+    }
+    case ExprKind::Unary: {
+        long v = 0;
+        if (!e.lhs || !fold_constant(*e.lhs, known, v)) return false;
+        if (e.op == "-") { out = -v; return true; }
+        if (e.op == "+") { out = v;  return true; }
+        if (e.op == "~") { out = ~v; return true; }
+        if (e.op == "!") { out = !v; return true; }
+        return false;
+    }
+    case ExprKind::Binary: {
+        long a = 0, b = 0;
+        if (!e.lhs || !e.rhs) return false;
+        if (!fold_constant(*e.lhs, known, a)) return false;
+        if (!fold_constant(*e.rhs, known, b)) return false;
+        if (e.op == "+")  { out = a + b;  return true; }
+        if (e.op == "-")  { out = a - b;  return true; }
+        if (e.op == "*")  { out = a * b;  return true; }
+        if (e.op == "/")  { if (b == 0) return false; out = a / b; return true; }
+        if (e.op == "%")  { if (b == 0) return false; out = a % b; return true; }
+        if (e.op == "<<") { out = a << b; return true; }
+        if (e.op == ">>") { out = a >> b; return true; }
+        if (e.op == "&")  { out = a & b;  return true; }
+        if (e.op == "|")  { out = a | b;  return true; }
+        if (e.op == "^")  { out = a ^ b;  return true; }
+        return false;
+    }
+    case ExprKind::Cast:
+        return e.lhs && fold_constant(*e.lhs, known, out);
+    default:
+        return false;
+    }
 }
 
 bool has_function(const Program& p, const std::string& name) {
@@ -124,12 +174,22 @@ CompileResult compile_avr(std::string_view source) {
 
     // Globals with constant initialisers are stored before the entry point
     // runs, standing in for the .data copy a linker would normally perform.
+    std::map<std::string, long> constant_globals;
     for (const Global& g : parsed.program.globals) {
-        if (!g.init || g.init->kind != ExprKind::IntLiteral) continue;
+        if (!g.init) continue;
         int size = g.type ? g.type->size() : 2;
         int addr = gen.global_address(g.name);
         if (addr < 0) continue;
-        long v = g.init->int_value;
+
+        long v = 0;
+        if (!fold_constant(*g.init, constant_globals, v)) {
+            result.error = "line " + std::to_string(g.line) + ": initialiser for '" +
+                           g.name + "' is not a constant. Globals are stored before " +
+                           "the program starts, so their initialisers must be " +
+                           "computable at compile time.";
+            return result;
+        }
+        constant_globals[g.name] = v;
         gen.emit("    ldi  r24, " + std::to_string(v & 0xFF));
         gen.emit("    sts  " + std::to_string(addr) + ", r24");
         if (size >= 2) {

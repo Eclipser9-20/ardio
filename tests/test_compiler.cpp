@@ -132,3 +132,28 @@ TEST(compiler_generates_globals_in_sram) {
     if (!ok) std::printf("    %s\n", why.c_str());
     CHECK(ok);
 }
+
+TEST(compiler_folds_constant_global_initialisers) {
+    auto r = ardio::compile_avr(
+        "const int BASE = 90;\n"
+        "int angle = BASE;\n"
+        "int doubled = 2 * 21;\n"
+        "int shifted = 1 << 5;\n"
+        "int main() { return angle; }\n");
+    CHECK(r.ok);
+    // Each global is stored before the entry point runs. A global initialised
+    // from another global must get that value, not zero.
+    CHECK(r.assembly.find("ldi  r24, 90") != std::string::npos);
+    CHECK(r.assembly.find("ldi  r24, 42") != std::string::npos);
+    CHECK(r.assembly.find("ldi  r24, 32") != std::string::npos);
+}
+
+TEST(compiler_rejects_a_global_initialiser_it_cannot_fold) {
+    // Silently storing zero here would be far worse than refusing.
+    auto r = ardio::compile_avr(
+        "int f() { return 7; }\n"
+        "int x = f();\n"
+        "int main() { return x; }\n");
+    CHECK(!r.ok);
+    CHECK(r.error.find("not a constant") != std::string::npos);
+}
