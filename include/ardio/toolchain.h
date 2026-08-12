@@ -60,6 +60,32 @@ struct FetchResult {
     std::string installed_to;
 };
 
+// ------------------------------------------------- building from source -----
+
+// An upstream source tarball, pinned by checksum.
+struct SourcePackage {
+    std::string name;       // "binutils"
+    std::string version;
+    std::string url;
+    std::string sha256;
+    std::string unpacks_to; // top-level directory inside the archive
+};
+
+// The three stages of an AVR cross-toolchain, in build order: binutils
+// provides the assembler gcc needs, and avr-libc is compiled by the gcc that
+// stage 2 produces.
+const std::vector<SourcePackage>& toolchain_sources();
+
+std::vector<std::string> binutils_configure_args(const std::string& prefix);
+std::vector<std::string> gcc_configure_args(const std::string& prefix);
+std::vector<std::string> avr_libc_configure_args(const std::string& prefix);
+
+// Downloads, verifies, and builds a complete AVR cross-toolchain into
+// `prefix`. Long-running (tens of minutes). Requires the caller to have
+// already obtained the user's consent.
+FetchResult build_avr_toolchain(const std::string& prefix, const std::string& work_dir,
+                                const std::function<void(const std::string&)>& progress);
+
 // Downloads, verifies, and unpacks `tool` under `dest_root`. Requires the
 // caller to have already obtained the user's consent -- this function does not
 // prompt. `progress` may be nullptr.
