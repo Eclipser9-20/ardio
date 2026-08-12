@@ -1,0 +1,216 @@
+// Lightweight/Vector -- fixed-capacity, heap-free sequences for sketches.
+//
+//      #include <Lightweight/Vector>
+//
+//      LW_VECTOR_INT(samples);             // 16 ints, no heap
+//      samples.push_back(analogRead(0));
+//      total = total + samples.at(0);
+//
+//      LW_VECTOR_BYTE(packet);             // 16 bytes, no heap
+//      packet.push_back(0x40);
+//
+// WHY NOT std::vector
+// -------------------
+// std::vector grows by reallocating. On an ATmega328P with 2 KB of SRAM that
+// means an allocator, fragmentation, and a sketch that runs for an hour and
+// then dies. It also reports a failed growth by throwing, and there are no
+// exceptions here. LwVector keeps the interface and drops the growth: the
+// capacity is a compile-time constant and a full vector rejects the push.
+//
+// ONE CLASS PER ELEMENT TYPE -- THERE IS NO OTHER WAY
+// ---------------------------------------------------
+// ardio's compiler has no templates. `vector<T>` cannot be written at all, so
+// a template-free library has to ship a separate concrete class for every
+// element type it supports, each one a hand-written copy of the same code with
+// a different element type. Two are provided:
+//
+//      LwVectorInt     16 x int            (16-bit signed, 32 bytes)
+//      LwVectorByte    16 x unsigned char  (8-bit unsigned, 16 bytes)
+//
+// Adding a third means copying one of them and changing the element type. That
+// is the honest cost of no templates, and it is why the set is deliberately
+// small rather than exhaustive.
+//
+// WHY THE STORAGE IS PASSED IN
+// ----------------------------
+// ardio's code generator supports 8- and 16-bit class fields only: a class can
+// store into an array member but cannot read one back out from inside a method
+// (`field 'data_' of class 'X': only 8- and 16-bit fields are supported`). So
+// a vector cannot carry its own `int data_[16]`. It holds a pointer instead,
+// and the macros below declare the array and the vector together.
+//
+// Always declare one with LW_VECTOR_INT / LW_VECTOR_BYTE. Handing the
+// constructor a shorter array of your own is the one way to defeat the bounds
+// checking here.
+//
+// Part of ardio. Licensed under the GNU General Public License v3.
+
+#ifndef ARDIO_LIGHTWEIGHT_VECTOR
+#define ARDIO_LIGHTWEIGHT_VECTOR
+
+// ---------------------------------------------------------------------------
+// CAPACITY -- fixed at compile time, the same for both vectors.
+//
+// 16 elements: 32 bytes of SRAM for an LwVectorInt, 16 for an LwVectorByte.
+// Enough for a rolling window of sensor samples or a short I2C frame, and
+// small enough that a handful of them still fit on a 2 KB part.
+// ---------------------------------------------------------------------------
+#define LW_VECTOR_CAPACITY 16
+
+// ---------------------------------------------------------------------------
+// BEHAVIOUR WHEN FULL, AND AT THE BOUNDARY -- no exceptions, no crash.
+//
+//   push_back on a full vector    does nothing and returns false. The existing
+//                                 elements and size_ are untouched; nothing is
+//                                 written past the end of the storage.
+//   at(i) with i >= size()        returns 0.
+//   set(i, v) with i >= size()    does nothing and returns false.
+//   pop_back() when empty         does nothing and returns false.
+//
+// Every mutator that can refuse returns bool, so a sketch that cares can check
+// and one that does not simply drops the sample instead of corrupting memory.
+// ---------------------------------------------------------------------------
+
+// ------------------------------------------------------------ LwVectorInt ---
+class LwVectorInt {
+public:
+    // `storage` must be an array of LW_VECTOR_CAPACITY ints -- use the macro.
+    LwVectorInt(int *storage) {
+        data_ = storage;
+        size_ = 0;
+    }
+
+    unsigned int size() const { return size_; }
+    unsigned int capacity() const { return LW_VECTOR_CAPACITY; }
+    bool empty() const { return size_ == 0; }
+    bool full() const { return size_ >= LW_VECTOR_CAPACITY; }
+
+    void clear() { size_ = 0; }
+
+    // false when the vector is already full; nothing is written in that case.
+    bool push_back(int value) {
+        if (size_ >= LW_VECTOR_CAPACITY) return false;
+        data_[size_] = value;
+        size_ = size_ + 1;
+        return true;
+    }
+
+    // false when the vector is empty.
+    bool pop_back() {
+        if (size_ == 0) return false;
+        size_ = size_ - 1;
+        return true;
+    }
+
+    // Out of range reads as 0.
+    int at(unsigned int index) const {
+        if (index >= size_) return 0;
+        return data_[index];
+    }
+
+    // Out of range writes nothing and returns false.
+    bool set(unsigned int index, int value) {
+        if (index >= size_) return false;
+        data_[index] = value;
+        return true;
+    }
+
+    int front() const { return at(0); }
+
+    int back() const {
+        if (size_ == 0) return 0;
+        return data_[size_ - 1];
+    }
+
+    // Index of the first element equal to `value`, or -1.
+    int indexOf(int value) const {
+        unsigned int i = 0;
+        while (i < size_) {
+            if (data_[i] == value) return (int)i;
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    bool contains(int value) const { return indexOf(value) >= 0; }
+
+    // The storage, so a sketch can hand the elements to a C API.
+    int *data_;
+    unsigned int size_;
+};
+
+// ----------------------------------------------------------- LwVectorByte ---
+// The same class over `unsigned char`. Copied rather than shared, because
+// there are no templates; keep the two in step when editing either.
+class LwVectorByte {
+public:
+    // `storage` must be an array of LW_VECTOR_CAPACITY bytes -- use the macro.
+    LwVectorByte(unsigned char *storage) {
+        data_ = storage;
+        size_ = 0;
+    }
+
+    unsigned int size() const { return size_; }
+    unsigned int capacity() const { return LW_VECTOR_CAPACITY; }
+    bool empty() const { return size_ == 0; }
+    bool full() const { return size_ >= LW_VECTOR_CAPACITY; }
+
+    void clear() { size_ = 0; }
+
+    bool push_back(unsigned char value) {
+        if (size_ >= LW_VECTOR_CAPACITY) return false;
+        data_[size_] = value;
+        size_ = size_ + 1;
+        return true;
+    }
+
+    bool pop_back() {
+        if (size_ == 0) return false;
+        size_ = size_ - 1;
+        return true;
+    }
+
+    unsigned char at(unsigned int index) const {
+        if (index >= size_) return 0;
+        return data_[index];
+    }
+
+    bool set(unsigned int index, unsigned char value) {
+        if (index >= size_) return false;
+        data_[index] = value;
+        return true;
+    }
+
+    unsigned char front() const { return at(0); }
+
+    unsigned char back() const {
+        if (size_ == 0) return 0;
+        return data_[size_ - 1];
+    }
+
+    int indexOf(unsigned char value) const {
+        unsigned int i = 0;
+        while (i < size_) {
+            if (data_[i] == value) return (int)i;
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    bool contains(unsigned char value) const { return indexOf(value) >= 0; }
+
+    unsigned char *data_;
+    unsigned int size_;
+};
+
+// Declare a vector together with the array it lives in. These are the only
+// declarations that guarantee the storage is the size every method assumes.
+#define LW_VECTOR_INT(name)                                                    \
+    int name##_lw_storage[LW_VECTOR_CAPACITY];                                 \
+    LwVectorInt name(name##_lw_storage)
+
+#define LW_VECTOR_BYTE(name)                                                   \
+    unsigned char name##_lw_storage[LW_VECTOR_CAPACITY];                       \
+    LwVectorByte name(name##_lw_storage)
+
+#endif // ARDIO_LIGHTWEIGHT_VECTOR

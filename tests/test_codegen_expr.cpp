@@ -204,28 +204,52 @@ TEST(codegen_char_local_is_sign_extended) {
     CHECK(contains(text, "com r25"));
 }
 
-TEST(codegen_addition_16bit) {
+// Two int locals and a char local, for tests whose subject is the general
+// operand sequence. Literal operands would be folded away before reaching it,
+// so anything meaning to exercise a real instruction uses names instead.
+static CodeGen with_locals() {
     CodeGen cg;
     cg.set_local_offset("a", 0);
     cg.set_local_offset("b", 2);
+    cg.set_local_offset("c", 4);
+    cg.set_local_offset("d", 5);
+    return cg;
+}
+
+TEST(codegen_addition_16bit) {
+    CodeGen cg = with_locals();
     std::string text = gen(*binary("+", identifier("a"), identifier("b")), cg);
-    CHECK(contains(text, "push r24"));
     CHECK(contains(text, "movw r22, r24"));
-    CHECK(contains(text, "pop r24"));
     CHECK(contains(text, "add r24, r22"));
     CHECK(contains(text, "adc r25, r23"));
+    // A plain name on the left never needs the stack: the right side is
+    // evaluated first and the left loaded afterwards.
+    CHECK(!contains(text, "push r24"));
+    CHECK(!contains(text, "pop r24"));
+}
+
+TEST(codegen_nested_left_operand_still_uses_the_stack) {
+    // The left operand is itself an operation, so it has to be parked while
+    // the right one is worked out.
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("-", binary("*", identifier("a"), identifier("b")),
+                                   identifier("a")), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "push r24"));
+    CHECK(contains(text, "pop r24"));
+    CHECK(contains(text, "sub r24, r22"));
 }
 
 TEST(codegen_subtraction_uses_sub_sbc) {
-    CodeGen cg;
-    std::string text = gen(*binary("-", literal(9), literal(3)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("-", identifier("a"), identifier("b")), cg);
     CHECK(contains(text, "sub r24, r22"));
     CHECK(contains(text, "sbc r25, r23"));
 }
 
 TEST(codegen_multiply_16bit_clears_r1) {
-    CodeGen cg;
-    std::string text = gen(*binary("*", literal(6), literal(7)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("*", identifier("a"), identifier("b")), cg);
     CHECK(contains(text, "mul r24, r22"));
     CHECK(contains(text, "movw r18, r0"));
     CHECK(contains(text, "mul r25, r22"));
@@ -235,9 +259,10 @@ TEST(codegen_multiply_16bit_clears_r1) {
 }
 
 TEST(codegen_multiply_8bit) {
-    CodeGen cg;
+    CodeGen cg = with_locals();
     std::string text = gen(
-        *binary("*", literal(3, char_type()), literal(4, char_type()), char_type()), cg);
+        *binary("*", identifier("c", char_type()), identifier("d", char_type()),
+                char_type()), cg);
     CHECK(contains(text, "mul r24, r22"));
     CHECK(contains(text, "mov r24, r0"));
     CHECK(contains(text, "clr r1"));
@@ -245,17 +270,20 @@ TEST(codegen_multiply_8bit) {
 }
 
 TEST(codegen_bitwise_operators) {
-    CodeGen cg;
-    CHECK(contains(gen(*binary("&", literal(1), literal(2)), cg), "and r24, r22"));
-    CodeGen cg2;
-    CHECK(contains(gen(*binary("|", literal(1), literal(2)), cg2), "or r25, r23"));
-    CodeGen cg3;
-    CHECK(contains(gen(*binary("^", literal(1), literal(2)), cg3), "eor r24, r22"));
+    CodeGen cg = with_locals();
+    CHECK(contains(gen(*binary("&", identifier("a"), identifier("b")), cg),
+                   "and r24, r22"));
+    CodeGen cg2 = with_locals();
+    CHECK(contains(gen(*binary("|", identifier("a"), identifier("b")), cg2),
+                   "or r25, r23"));
+    CodeGen cg3 = with_locals();
+    CHECK(contains(gen(*binary("^", identifier("a"), identifier("b")), cg3),
+                   "eor r24, r22"));
 }
 
 TEST(codegen_shift_left_loops) {
-    CodeGen cg;
-    std::string text = gen(*binary("<<", literal(1), literal(3)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("<<", identifier("a"), identifier("b")), cg);
     CHECK(contains(text, "tst r22"));
     CHECK(contains(text, "lsl r24"));
     CHECK(contains(text, "rol r25"));
@@ -264,15 +292,15 @@ TEST(codegen_shift_left_loops) {
 }
 
 TEST(codegen_shift_right_signed_uses_asr) {
-    CodeGen cg;
-    std::string text = gen(*binary(">>", literal(16), literal(2)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary(">>", identifier("a"), identifier("b")), cg);
     CHECK(contains(text, "asr r25"));
     CHECK(contains(text, "ror r24"));
 }
 
 TEST(codegen_comparison_yields_zero_or_one) {
-    CodeGen cg;
-    std::string text = gen(*binary("==", literal(1), literal(2)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("==", identifier("a"), identifier("b")), cg);
     CHECK(contains(text, "cp r24, r22"));
     CHECK(contains(text, "cpc r25, r23"));
     CHECK(contains(text, "ldi r24, 1"));
@@ -281,8 +309,8 @@ TEST(codegen_comparison_yields_zero_or_one) {
 }
 
 TEST(codegen_greater_than_swaps_operands) {
-    CodeGen cg;
-    std::string text = gen(*binary(">", literal(1), literal(2)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary(">", identifier("a"), identifier("b")), cg);
     CHECK(contains(text, "cp r22, r24"));
     CHECK(contains(text, "cpc r23, r25"));
     CHECK(contains(text, "brlt"));
@@ -290,15 +318,15 @@ TEST(codegen_greater_than_swaps_operands) {
 
 TEST(codegen_unsigned_comparison_uses_brlo) {
     TypePtr u = make_type(TypeKind::UInt);
-    CodeGen cg;
-    std::string text = gen(*binary("<", literal(1, u), literal(2, u)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("<", identifier("a", u), identifier("b", u)), cg);
     CHECK(contains(text, "brlo"));
     CHECK(!contains(text, "brlt"));
 }
 
 TEST(codegen_logical_and_short_circuits) {
-    CodeGen cg;
-    std::string text = gen(*binary("&&", literal(1), literal(0)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("&&", identifier("a"), identifier("b")), cg);
     CHECK(contains(text, "or r24, r25"));
     CHECK(contains(text, "breq"));
     // The right operand is generated after the first branch, not before it.
@@ -309,32 +337,32 @@ TEST(codegen_logical_and_short_circuits) {
 }
 
 TEST(codegen_logical_or_short_circuits) {
-    CodeGen cg;
-    std::string text = gen(*binary("||", literal(0), literal(1)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("||", identifier("a"), identifier("b")), cg);
     CHECK(contains(text, "brne"));
     CHECK(contains(text, "ldi r25, 0"));
 }
 
 TEST(codegen_unary_negate_16bit) {
-    CodeGen cg;
-    std::string text = gen(*unary("-", literal(5)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*unary("-", identifier("a")), cg);
     CHECK(contains(text, "com r25"));
     CHECK(contains(text, "neg r24"));
     CHECK(contains(text, "sbci r25, -1"));
 }
 
 TEST(codegen_unary_not) {
-    CodeGen cg;
-    std::string text = gen(*unary("!", literal(5)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*unary("!", identifier("a")), cg);
     CHECK(contains(text, "or r24, r25"));
     CHECK(contains(text, "brne"));
     CHECK(contains(text, "ldi r24, 1"));
 }
 
 TEST(codegen_unary_complement) {
-    CodeGen cg;
-    std::string text = gen(*unary("~", literal(5)), cg);
-    CHECK(text == "ldi r24, 5\nldi r25, 0\ncom r24\ncom r25\n");
+    CodeGen cg = with_locals();
+    std::string text = gen(*unary("~", identifier("a")), cg);
+    CHECK(text == "ldd r24, Y+0\nldd r25, Y+1\ncom r24\ncom r25\n");
 }
 
 TEST(codegen_pre_increment_stores_new_value) {
@@ -379,10 +407,19 @@ TEST(codegen_assignment_to_global) {
 TEST(codegen_compound_assignment) {
     CodeGen cg;
     cg.set_local_offset("x", 0);
-    std::string text = gen(*assign("+=", identifier("x"), literal(1)), cg);
+    cg.set_local_offset("y", 2);
+    std::string text = gen(*assign("+=", identifier("x"), identifier("y")), cg);
     CHECK(contains(text, "ldd r24, Y+0"));
     CHECK(contains(text, "add r24, r22"));
     CHECK(contains(text, "std Y+0, r24"));
+}
+
+TEST(codegen_compound_assignment_of_a_constant_uses_an_immediate) {
+    CodeGen cg;
+    cg.set_local_offset("x", 0);
+    std::string text = gen(*assign("+=", identifier("x"), literal(1)), cg);
+    CHECK(text == "ldd r24, Y+0\nldd r25, Y+1\nadiw r24, 1\n"
+                  "std Y+0, r24\nstd Y+1, r25\n");
 }
 
 TEST(codegen_call_marshals_abi_registers) {
@@ -430,8 +467,8 @@ TEST(codegen_conditional_expression) {
 // ---- division and modulo ----------------------------------------------------
 
 TEST(codegen_division_calls_the_signed_helper) {
-    CodeGen cg;
-    std::string text = gen(*binary("/", literal(100), literal(7)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("/", identifier("a"), identifier("b")), cg);
     CHECK(cg.error.empty());
     // The operands are already where the helper wants them.
     CHECK(contains(text, "movw r22, r24"));
@@ -440,31 +477,32 @@ TEST(codegen_division_calls_the_signed_helper) {
 }
 
 TEST(codegen_modulo_takes_the_remainder) {
-    CodeGen cg;
-    std::string text = gen(*binary("%", literal(100), literal(7)), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("%", identifier("a"), identifier("b")), cg);
     CHECK(contains(text, "call __ardio_divmod16"));
     CHECK(contains(text, "movw r24, r18"));
 }
 
 TEST(codegen_unsigned_division_calls_the_unsigned_helper) {
-    CodeGen cg;
-    std::string text = gen(*binary("/", literal(100, uint_type()),
-                                   literal(7, uint_type()), uint_type()), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("/", identifier("a", uint_type()),
+                                   identifier("b", uint_type()), uint_type()), cg);
     CHECK(contains(text, "call __ardio_udivmod16"));
     CHECK(!contains(text, "call __ardio_divmod16"));
 }
 
 TEST(codegen_char_division_rewidens_the_result) {
-    CodeGen cg;
-    std::string text = gen(*binary("/", literal(9, char_type()),
-                                   literal(2, char_type()), char_type()), cg);
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("/", identifier("c", char_type()),
+                                   identifier("d", char_type()), char_type()), cg);
     CHECK(contains(text, "call __ardio_divmod16"));
     CHECK(contains(text, "sbrc r24, 7"));         // sign-extend back to 16 bits
 }
 
 TEST(codegen_division_output_assembles) {
-    CodeGen cg;
-    cg.gen_expr(*binary("%", binary("/", literal(1000), literal(3)), literal(7)));
+    CodeGen cg = with_locals();
+    cg.gen_expr(*binary("%", binary("/", identifier("a"), identifier("b")),
+                        identifier("c", char_type())));
     CHECK(cg.error.empty());
     std::string error;
     bool ok = assembles_with_math(cg.out, error);
@@ -1370,8 +1408,10 @@ TEST(codegen_long_shift_right_of_an_unsigned_value_does_not_sign_extend) {
 
 TEST(codegen_long_multiply_calls_the_helper) {
     CodeGen cg;
-    std::string text = gen(*binary("*", literal(3, long_type()),
-                                   literal(4, long_type()), long_type()), cg);
+    cg.set_local_offset("p", 0);
+    cg.set_local_offset("q", 4);
+    std::string text = gen(*binary("*", identifier("p", long_type()),
+                                   identifier("q", long_type()), long_type()), cg);
     CHECK(cg.error.empty());
     CHECK(contains(text, "call __ardio_mul32"));
 }
@@ -1467,18 +1507,25 @@ TEST(codegen_long_division_leaves_r1_zero) {
 
 TEST(codegen_widening_an_int_to_a_long_sign_extends) {
     CodeGen cg;
+    cg.set_local_offset("i", 0);
     auto c = std::make_unique<Expr>();
     c->kind = ExprKind::Cast;
-    c->lhs = literal(-2, int_type());
+    c->lhs = identifier("i", int_type());
     c->type = long_type();
     std::string text = gen(*c, cg);
     CHECK(cg.error.empty());
     CHECK(contains(text, "movw r22, r24"));
     CHECK(contains(text, "sbrc r23, 7"));
 
+    // The same widening of a known value is worked out at compile time, and
+    // has to arrive at the same answer.
+    auto k = std::make_unique<Expr>();
+    k->kind = ExprKind::Cast;
+    k->lhs = literal(-2, int_type());
+    k->type = long_type();
     uint32_t got = 0;
     std::string why;
-    if (!eval32(*c, got, why)) { std::printf("    %s\n", why.c_str());
+    if (!eval32(*k, got, why)) { std::printf("    %s\n", why.c_str());
                                  CHECK(why == "skip"); return; }
     CHECK_EQ(got, uint32_t(-2));
 }
@@ -1509,36 +1556,52 @@ TEST(codegen_widening_a_char_to_a_long_sign_extends) {
 
 TEST(codegen_narrowing_a_long_to_an_int_keeps_the_low_half) {
     CodeGen cg;
+    cg.set_local_offset("w", 0);
     auto c = std::make_unique<Expr>();
     c->kind = ExprKind::Cast;
-    c->lhs = literal(0x12345678L, long_type());
+    c->lhs = identifier("w", long_type());
     c->type = int_type();
     std::string text = gen(*c, cg);
     CHECK(cg.error.empty());
     CHECK(contains(text, "movw r24, r22"));
 
+    CodeGen folded;
+    auto k = std::make_unique<Expr>();
+    k->kind = ExprKind::Cast;
+    k->lhs = literal(0x12345678L, long_type());
+    k->type = int_type();
+    folded.gen_expr(*k);
+    CHECK(folded.error.empty());
     sim::Cpu cpu;
     std::string why;
-    if (!run_snippet(cg.out, cpu, why)) { std::printf("    %s\n", why.c_str());
-                                          CHECK(why == "skip"); return; }
+    if (!run_snippet(folded.out, cpu, why)) { std::printf("    %s\n", why.c_str());
+                                              CHECK(why == "skip"); return; }
     CHECK_EQ(unsigned(cpu.r[24] | (cpu.r[25] << 8)), 0x5678u);
 }
 
 TEST(codegen_narrowing_a_long_to_a_char_re_extends) {
+    CodeGen cg;
+    cg.set_local_offset("w", 0);
     auto c = std::make_unique<Expr>();
     c->kind = ExprKind::Cast;
-    c->lhs = literal(0x12345680L, long_type());
+    c->lhs = identifier("w", long_type());
     c->type = char_type();
-    CodeGen cg;
     std::string text = gen(*c, cg);
     CHECK(cg.error.empty());
     CHECK(contains(text, "movw r24, r22"));
     CHECK(contains(text, "sbrc r24, 7"));
 
+    CodeGen folded;
+    auto k = std::make_unique<Expr>();
+    k->kind = ExprKind::Cast;
+    k->lhs = literal(0x12345680L, long_type());
+    k->type = char_type();
+    folded.gen_expr(*k);
+    CHECK(folded.error.empty());
     sim::Cpu cpu;
     std::string why;
-    if (!run_snippet(cg.out, cpu, why)) { std::printf("    %s\n", why.c_str());
-                                          CHECK(why == "skip"); return; }
+    if (!run_snippet(folded.out, cpu, why)) { std::printf("    %s\n", why.c_str());
+                                              CHECK(why == "skip"); return; }
     CHECK_EQ(unsigned(cpu.r[24] | (cpu.r[25] << 8)), 0xFF80u);   // sign-extended
 }
 
@@ -1593,16 +1656,23 @@ TEST(codegen_long_comparisons_compare_all_four_bytes) {
 
 TEST(codegen_unsigned_long_comparison_does_not_use_a_signed_branch) {
     CodeGen cg;
-    std::string text = gen(*binary("<", literal(1L, ulong_type()),
-                                   literal(0xFFFFFFFFL, ulong_type()), int_type()), cg);
+    cg.set_local_offset("p", 0);
+    cg.set_local_offset("q", 4);
+    std::string text = gen(*binary("<", identifier("p", ulong_type()),
+                                   identifier("q", ulong_type()), int_type()), cg);
     CHECK(cg.error.empty());
     CHECK(contains(text, "brlo"));
     CHECK(!contains(text, "brlt"));
 
+    // Folded, the same comparison must agree: 1 < 0xFFFFFFFF is true unsigned.
+    CodeGen folded;
+    folded.gen_expr(*binary("<", literal(1L, ulong_type()),
+                            literal(0xFFFFFFFFL, ulong_type()), int_type()));
+    CHECK(folded.error.empty());
     sim::Cpu cpu;
     std::string why;
-    if (!run_snippet(cg.out, cpu, why)) { std::printf("    %s\n", why.c_str());
-                                          CHECK(why == "skip"); return; }
+    if (!run_snippet(folded.out, cpu, why)) { std::printf("    %s\n", why.c_str());
+                                              CHECK(why == "skip"); return; }
     CHECK_EQ(unsigned(cpu.r[24] | (cpu.r[25] << 8)), 1u);
 }
 
@@ -1940,5 +2010,627 @@ TEST(runtime_math32_agrees_with_the_hosts_arithmetic_over_a_sweep) {
                             unsigned(ub), unsigned(got), unsigned(t.want));
             CHECK_EQ(got, t.want);
         }
+    }
+}
+
+// ====================== narrow expressions, run for real =====================
+//
+// The optimisations below replace a push/evaluate/pop round trip with immediate
+// instructions, shifts, or a value worked out at compile time. Every one of
+// them is a chance to get signedness or a carry chain wrong in a way that still
+// assembles, so each is checked by running the generated machine code on the
+// interpreter and comparing the answer -- against the unoptimised sequence, and
+// against an independent model.
+
+namespace {
+
+// A global at a fixed address the snippets below preload before evaluating.
+const int kVarX = 0x0200;
+const int kVarY = 0x0202;
+
+// Assembles and runs a 16-bit snippet with both runtimes appended, so a
+// division that survived folding still finds its helper.
+bool run_narrow(const std::string& text, unsigned& value, std::string& why) {
+    std::string math, math32;
+    if (!read_runtime("runtime/math.S", math) ||
+        !read_runtime("runtime/math32.S", math32)) {
+        why = "skip";
+        return false;
+    }
+    AssembleResult r = assemble(text + "\nret\n" + math + "\n" + math32 + "\n");
+    if (!r.ok) { why = "assembler: " + r.error; return false; }
+    sim::Cpu cpu;
+    cpu.r[1] = 0;
+    if (!sim::run(cpu, r.code, why)) return false;
+    if (cpu.r[1] != 0) { why = "r1 was left non-zero"; return false; }
+    value = unsigned(cpu.r[24] | (cpu.r[25] << 8));
+    return true;
+}
+
+// Evaluates `e` with the globals `x` and `y` preloaded, and hands back r24:r25.
+bool eval_vars(const Expr& e, unsigned xv, unsigned yv, unsigned& value,
+               std::string& why) {
+    CodeGen cg;
+    cg.set_global_address("x", kVarX);
+    cg.set_global_address("y", kVarY);
+    const unsigned bytes[4] = {xv & 0xFF, (xv >> 8) & 0xFF,
+                               yv & 0xFF, (yv >> 8) & 0xFF};
+    for (int i = 0; i < 4; ++i) {
+        cg.emit("ldi r24, " + std::to_string(bytes[i]));
+        cg.emit("sts " + std::to_string(kVarX + i) + ", r24");
+    }
+    cg.gen_expr(e);
+    if (!cg.error.empty()) { why = "codegen: " + cg.error; return false; }
+    return run_narrow(cg.out, value, why);
+}
+
+// The operators that take two integers and give one back.
+const char* const kBinaryOps[] = {"+", "-", "*", "/", "%", "&", "|", "^",
+                                  "<<", ">>", "==", "!=", "<", ">", "<=", ">="};
+
+bool is_shift(const char* op) {
+    return std::string(op) == "<<" || std::string(op) == ">>";
+}
+
+bool is_divide(const char* op) {
+    return std::string(op) == "/" || std::string(op) == "%";
+}
+
+// The values worth trying: the ends of the range, the boundaries between the
+// two bytes, and a couple of ordinary numbers.
+const long kOperands[] = {0, 1, -1, 2, 3, 255, 256, 1000, -1000,
+                          32767, -32768, -12345};
+const long kConstants[] = {0, 1, -1, 2, 3, 4, 8, 16, 64, 100, 255, 256,
+                           1024, -7, -256, 32767, -32768};
+
+} // namespace
+
+// The heart of it: for every operator, every operand and every constant, the
+// code with the constant folded into an immediate has to compute exactly what
+// the general push/pop sequence computes. Nothing here trusts a model of the
+// machine -- it compares the new code against the old code, run for run.
+TEST(codegen_constant_right_operand_matches_the_general_sequence) {
+    bool skipped = false;
+    for (bool is_signed : {true, false}) {
+        TypePtr t = is_signed ? int_type() : uint_type();
+        for (const char* op : kBinaryOps) {
+            for (long xv : kOperands) {
+                for (long kv : kConstants) {
+                    if (is_divide(op) && (kv & 0xFFFF) == 0) continue;
+                    // INT16_MIN / -1 overflows; the helpers are free to differ.
+                    if (is_divide(op) && is_signed && (kv & 0xFFFF) == 0xFFFF &&
+                        (xv & 0xFFFF) == 0x8000) continue;
+                    if (is_shift(op) && (kv < 0 || kv > 20)) continue;
+
+                    const unsigned x = unsigned(xv) & 0xFFFF;
+                    const unsigned k = unsigned(kv) & 0xFFFF;
+
+                    unsigned fast = 0, slow = 0;
+                    std::string why;
+                    // x <op> <literal k>
+                    if (!eval_vars(*binary(op, identifier("x", t), literal(kv, t), t),
+                                   x, k, fast, why)) {
+                        if (why == "skip") { skipped = true; break; }
+                        std::printf("    %s\n", why.c_str());
+                        CHECK(why == "skip");
+                        return;
+                    }
+                    // x <op> y, with y holding the same value
+                    if (!eval_vars(*binary(op, identifier("x", t),
+                                           identifier("y", t), t),
+                                   x, k, slow, why)) {
+                        std::printf("    %s\n", why.c_str());
+                        CHECK(why == "skip");
+                        return;
+                    }
+                    if (fast != slow)
+                        std::printf("    %s%s: 0x%04X %s 0x%04X gave 0x%04X, "
+                                    "the general sequence gave 0x%04X\n",
+                                    is_signed ? "s" : "u", op, x, op, k, fast, slow);
+                    CHECK_EQ(fast, slow);
+                }
+                if (skipped) break;
+            }
+            if (skipped) break;
+        }
+        if (skipped) break;
+    }
+    if (skipped) std::printf("  skip a runtime file was not found\n");
+}
+
+// The same comparison for the other rearrangement: a plain name on the left is
+// loaded after the right side rather than parked on the stack.
+TEST(codegen_simple_left_operand_matches_the_general_sequence) {
+    bool skipped = false;
+    for (bool is_signed : {true, false}) {
+        TypePtr t = is_signed ? int_type() : uint_type();
+        for (const char* op : kBinaryOps) {
+            for (long xv : kOperands) {
+                for (long yv : kOperands) {
+                    if (is_divide(op) && (yv & 0xFFFF) == 0) continue;
+                    if (is_divide(op) && is_signed && (yv & 0xFFFF) == 0xFFFF &&
+                        (xv & 0xFFFF) == 0x8000) continue;
+                    if (is_shift(op) && (yv < 0 || yv > 20)) continue;
+
+                    const unsigned x = unsigned(xv) & 0xFFFF;
+                    const unsigned y = unsigned(yv) & 0xFFFF;
+
+                    unsigned reordered = 0, spilled = 0;
+                    std::string why;
+                    // x <op> y: the left side is a name, so it is loaded last.
+                    if (!eval_vars(*binary(op, identifier("x", t),
+                                           identifier("y", t), t),
+                                   x, y, reordered, why)) {
+                        if (why == "skip") { skipped = true; break; }
+                        std::printf("    %s\n", why.c_str());
+                        CHECK(why == "skip");
+                        return;
+                    }
+                    // (x | x) <op> y: the left side is now an operation, which
+                    // forces the original stack sequence, but has the value of
+                    // x and is not something the folder can collapse.
+                    auto left = binary("|", identifier("x", t),
+                                       identifier("x", t), t);
+                    if (!eval_vars(*binary(op, std::move(left),
+                                           identifier("y", t), t),
+                                   x, y, spilled, why)) {
+                        std::printf("    %s\n", why.c_str());
+                        CHECK(why == "skip");
+                        return;
+                    }
+                    if (reordered != spilled)
+                        std::printf("    %s%s: 0x%04X %s 0x%04X gave 0x%04X, "
+                                    "the general sequence gave 0x%04X\n",
+                                    is_signed ? "s" : "u", op, x, op, y,
+                                    reordered, spilled);
+                    CHECK_EQ(reordered, spilled);
+                }
+                if (skipped) break;
+            }
+            if (skipped) break;
+        }
+        if (skipped) break;
+    }
+    if (skipped) std::printf("  skip a runtime file was not found\n");
+}
+
+// Comparing against the old code proves the two agree; this proves they are
+// both right, using arithmetic done in the host's own integer types.
+TEST(codegen_constant_right_operand_computes_the_arithmetic_answer) {
+    struct Case { const char* op; long x; long k; bool is_signed; unsigned want; };
+    const Case cases[] = {
+        {"+", 32767, 1, true, 0x8000u},              // wraps to INT16_MIN
+        {"+", -32768, -1, true, 0x7FFFu},
+        {"+", 1000, 0, true, 1000u},
+        {"-", -32768, 1, true, 0x7FFFu},
+        {"-", 5, 0, true, 5u},
+        {"*", -1, 3, true, 0xFFFDu},
+        {"*", 1234, 0, true, 0u},
+        {"*", 1234, 1, true, 1234u},
+        {"*", 300, 8, true, 2400u},                  // a power of two: shifts
+        {"*", -3, 4, true, unsigned(-12) & 0xFFFFu},
+        {"*", 0x1234, 16, true, 0x2340u},            // the top nibble falls off
+        {"/", 100, 8, false, 12u},                   // unsigned: a shift
+        {"/", 0xFFFF, 2, false, 0x7FFFu},
+        {"/", -9, 2, true, unsigned(-4) & 0xFFFFu},  // signed: rounds to zero
+        {"/", -9, 4, true, unsigned(-2) & 0xFFFFu},
+        {"/", 1234, 1, true, 1234u},
+        {"%", 0xFFFF, 16, false, 15u},               // unsigned: a mask
+        {"%", 1000, 256, false, 232u},
+        {"%", -9, 4, true, unsigned(-1) & 0xFFFFu},
+        {"%", 1234, 1, true, 0u},
+        {"&", 0xF0F0, 0, false, 0u},
+        {"&", 0xF0F0, 0xFF00, false, 0xF000u},
+        {"|", 0x00F0, 0, false, 0x00F0u},
+        {"|", 0x00F0, 0x0F00, false, 0x0FF0u},
+        {"^", 0x00F0, 0, false, 0x00F0u},
+        {"^", 0x00FF, 0xFFFF, false, 0xFF00u},
+        {"<<", 1, 0, false, 1u},
+        {"<<", 1, 15, false, 0x8000u},
+        {"<<", 1, 16, false, 0u},                    // shifted clean out
+        {"<<", 0x1234, 4, false, 0x2340u},
+        {">>", -16, 2, true, unsigned(-4) & 0xFFFFu},// arithmetic
+        {">>", 0xFFF0, 2, false, 0x3FFCu},           // logical
+        {">>", -1, 20, true, 0xFFFFu},               // saturates at the sign
+        {">>", 0xFFFF, 16, false, 0u},
+        {"<", -1, 0, true, 1u},
+        {"<", 0xFFFF, 0, false, 0u},                 // unsigned: 65535 < 0 is false
+        {">", -1, 0, true, 0u},
+        {">", 0xFFFF, 0, false, 1u},
+        {">", 32766, 32767, true, 0u},
+        {">", 32767, 32767, true, 0u},               // nothing exceeds the maximum
+        {"<=", 32767, 32767, true, 1u},
+        {"<=", 0xFFFF, 0xFFFF, false, 1u},
+        {">=", -32768, -32768, true, 1u},
+        {"==", 1000, 1000, true, 1u},
+        {"!=", 1000, 1000, true, 0u},
+    };
+    for (const Case& c : cases) {
+        TypePtr t = c.is_signed ? int_type() : uint_type();
+        unsigned got = 0;
+        std::string why;
+        if (!eval_vars(*binary(c.op, identifier("x", t), literal(c.k, t), t),
+                       unsigned(c.x) & 0xFFFF, 0, got, why)) {
+            std::printf("    %s\n", why.c_str());
+            CHECK(why == "skip");
+            return;
+        }
+        if (got != c.want)
+            std::printf("    0x%04X %s%s %ld gave 0x%04X, wanted 0x%04X\n",
+                        unsigned(c.x) & 0xFFFF, c.is_signed ? "s" : "u", c.op,
+                        c.k, got, c.want);
+        CHECK_EQ(got, c.want);
+    }
+}
+
+// ---- what the optimisations actually emit -----------------------------------
+
+TEST(codegen_constant_addition_uses_an_immediate) {
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("+", identifier("a"), literal(1000)), cg);
+    CHECK(cg.error.empty());
+    CHECK(text == "ldd r24, Y+0\nldd r25, Y+1\nsubi r24, 24\nsbci r25, 252\n");
+    CHECK(!contains(text, "push"));
+    CHECK(!contains(text, "ldi r22"));
+}
+
+TEST(codegen_small_constant_addition_uses_adiw) {
+    CodeGen cg = with_locals();
+    CHECK(contains(gen(*binary("+", identifier("a"), literal(5)), cg),
+                   "adiw r24, 5"));
+    CodeGen cg2 = with_locals();
+    CHECK(contains(gen(*binary("-", identifier("a"), literal(5)), cg2),
+                   "sbiw r24, 5"));
+    CodeGen cg3 = with_locals();
+    // Beyond 63 the immediate has to be a subtraction of the negation.
+    CHECK(contains(gen(*binary("+", identifier("a"), literal(64)), cg3),
+                   "subi r24, 192"));
+}
+
+TEST(codegen_constant_bitwise_uses_andi_and_ori) {
+    CodeGen cg = with_locals();
+    std::string masked = gen(*binary("&", identifier("a"), literal(0x0F0F)), cg);
+    CHECK(contains(masked, "andi r24, 15"));
+    CHECK(contains(masked, "andi r25, 15"));
+    CHECK(!contains(masked, "and r24, r22"));
+
+    CodeGen cg2 = with_locals();
+    std::string ored = gen(*binary("|", identifier("a"), literal(0x0080)), cg2);
+    CHECK(contains(ored, "ori r24, 128"));
+    CHECK(!contains(ored, "ori r25"));             // the high byte is untouched
+}
+
+TEST(codegen_constant_comparison_uses_cpi) {
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("<", identifier("a"), literal(10)), cg);
+    CHECK(contains(text, "cpi r24, 10"));
+    CHECK(contains(text, "cpc r25, r1"));          // the zero register, free
+    CHECK(contains(text, "brlt"));
+    CHECK(!contains(text, "cp r24, r22"));
+
+    CodeGen cg2 = with_locals();
+    std::string wide = gen(*binary("==", identifier("a"), literal(0x0400)), cg2);
+    CHECK(contains(wide, "cpi r24, 0"));
+    CHECK(contains(wide, "ldi r18, 4"));
+    CHECK(contains(wide, "cpc r25, r18"));
+}
+
+TEST(codegen_greater_than_a_constant_needs_no_swap) {
+    // 'a > k' is rewritten as 'a >= k + 1', which the immediate compare can do
+    // without putting the constant in a register.
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary(">", identifier("a"), literal(9)), cg);
+    CHECK(contains(text, "cpi r24, 10"));
+    CHECK(contains(text, "brge"));
+    CHECK(!contains(text, "cp r22, r24"));
+}
+
+TEST(codegen_unsigned_constant_comparison_stays_unsigned) {
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary(">", identifier("a", uint_type()),
+                                   literal(9, uint_type()), uint_type()), cg);
+    CHECK(contains(text, "brsh"));
+    CHECK(!contains(text, "brge"));
+    CHECK(!contains(text, "brlt"));
+}
+
+TEST(codegen_power_of_two_multiply_becomes_shifts) {
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("*", identifier("a"), literal(8)), cg);
+    CHECK(cg.error.empty());
+    CHECK(!contains(text, "mul"));
+    CHECK(text == "ldd r24, Y+0\nldd r25, Y+1\n"
+                  "lsl r24\nrol r25\nlsl r24\nrol r25\nlsl r24\nrol r25\n");
+    CHECK(contains(text, "lsl r24"));
+    CHECK(contains(text, "rol r25"));
+}
+
+TEST(codegen_power_of_two_unsigned_divide_becomes_shifts) {
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("/", identifier("a", uint_type()),
+                                   literal(4, uint_type()), uint_type()), cg);
+    CHECK(!contains(text, "call"));
+    CHECK(contains(text, "lsr r25"));
+    CHECK(contains(text, "ror r24"));
+}
+
+TEST(codegen_power_of_two_signed_divide_still_calls_the_helper) {
+    // Shifting rounds towards minus infinity where division rounds towards
+    // zero, so a signed divide cannot become a shift.
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("/", identifier("a"), literal(4)), cg);
+    CHECK(contains(text, "call __ardio_divmod16"));
+    CHECK(!contains(text, "lsr r25"));
+}
+
+TEST(codegen_power_of_two_unsigned_modulo_becomes_a_mask) {
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("%", identifier("a", uint_type()),
+                                   literal(16, uint_type()), uint_type()), cg);
+    CHECK(!contains(text, "call"));
+    CHECK(contains(text, "andi r24, 15"));
+    CHECK(contains(text, "andi r25, 0"));
+}
+
+TEST(codegen_constant_shift_is_unrolled) {
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("<<", identifier("a"), literal(3)), cg);
+    CHECK(!contains(text, "rjmp"));                // no loop
+    CHECK(!contains(text, "dec r22"));
+    CHECK(contains(text, "lsl r24"));
+
+    // A long shift is left as the loop, which is smaller than the unrolling.
+    CodeGen cg2 = with_locals();
+    std::string many = gen(*binary("<<", identifier("a"), literal(9)), cg2);
+    CHECK(contains(many, "dec r22"));
+}
+
+TEST(codegen_shift_past_the_width_is_zero) {
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("<<", identifier("a"), literal(16)), cg);
+    CHECK(contains(text, "ldi r24, 0"));
+    CHECK(contains(text, "ldi r25, 0"));
+    CHECK(!contains(text, "lsl"));
+}
+
+// ---- identities -------------------------------------------------------------
+
+TEST(codegen_identities_emit_nothing_extra) {
+    struct { const char* op; long k; } identities[] = {
+        {"+", 0}, {"-", 0}, {"*", 1}, {"|", 0}, {"^", 0}, {"/", 1},
+        {"<<", 0}, {">>", 0},
+    };
+    for (const auto& id : identities) {
+        CodeGen cg = with_locals();
+        std::string text = gen(*binary(id.op, identifier("a"), literal(id.k)), cg);
+        CHECK(cg.error.empty());
+        if (text != "ldd r24, Y+0\nldd r25, Y+1\n")
+            std::printf("    a %s %ld emitted:\n%s", id.op, id.k, text.c_str());
+        CHECK(text == "ldd r24, Y+0\nldd r25, Y+1\n");
+    }
+}
+
+TEST(codegen_annihilators_reduce_to_zero) {
+    struct { const char* op; long k; } zeros[] = {{"*", 0}, {"&", 0}, {"%", 1}};
+    for (const auto& z : zeros) {
+        CodeGen cg = with_locals();
+        std::string text = gen(*binary(z.op, identifier("a"), literal(z.k)), cg);
+        CHECK(cg.error.empty());
+        CHECK(text == "ldd r24, Y+0\nldd r25, Y+1\nldi r24, 0\nldi r25, 0\n");
+    }
+}
+
+TEST(codegen_identity_on_a_char_keeps_the_extension) {
+    // An 8-bit result is carried extended into r25; x + 0 must not lose that.
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("+", identifier("c", char_type()),
+                                   literal(0, char_type()), char_type()), cg);
+    CHECK(contains(text, "sbrc r24, 7"));
+    CHECK(contains(text, "com r25"));
+}
+
+// ---- constant folding -------------------------------------------------------
+
+TEST(codegen_folds_a_constant_product) {
+    CodeGen cg;
+    std::string text = gen(*binary("*", literal(2), literal(3)), cg);
+    CHECK(cg.error.empty());
+    CHECK(text == "ldi r24, 6\nldi r25, 0\n");
+}
+
+TEST(codegen_folds_inside_a_larger_expression) {
+    CodeGen cg = with_locals();
+    // a + (2 * 3) collapses to a + 6, which is then an immediate.
+    std::string text = gen(*binary("+", identifier("a"),
+                                   binary("*", literal(2), literal(3))), cg);
+    CHECK(cg.error.empty());
+    CHECK(text == "ldd r24, Y+0\nldd r25, Y+1\nadiw r24, 6\n");
+}
+
+TEST(codegen_folds_every_operator_it_claims_to) {
+    struct { const char* op; long a; long b; long want; } cases[] = {
+        {"+", 2, 3, 5}, {"-", 2, 3, -1}, {"*", -4, 5, -20},
+        {"/", 7, 2, 3}, {"/", -7, 2, -3}, {"%", 7, 2, 1}, {"%", -7, 2, -1},
+        {"<<", 3, 4, 48}, {">>", -16, 2, -4}, {">>", 32767, 3, 4095},
+        {"&", 0x0FF0, 0x00FF, 0x00F0}, {"|", 0x0F00, 0x00F0, 0x0FF0},
+        {"^", 0x0FFF, 0x00FF, 0x0F00},
+        {"<", 1, 2, 1}, {"<", 2, 1, 0}, {">", 2, 1, 1}, {">=", 2, 2, 1},
+        {"<=", 3, 2, 0}, {"==", 4, 4, 1}, {"!=", 4, 4, 0},
+        {"&&", 1, 0, 0}, {"||", 1, 0, 1},
+        {"*", 30000, 3, long(int16_t(uint16_t(90000u)))},   // wraps, as C says
+    };
+    for (const auto& c : cases) {
+        CodeGen cg;
+        std::string text = gen(*binary(c.op, literal(c.a), literal(c.b)), cg);
+        CHECK(cg.error.empty());
+        const std::string want = "ldi r24, " + std::to_string(c.want & 0xFF) +
+                                 "\nldi r25, " +
+                                 std::to_string((c.want >> 8) & 0xFF) + "\n";
+        if (text != want)
+            std::printf("    %ld %s %ld emitted:\n%swanted:\n%s",
+                        c.a, c.op, c.b, text.c_str(), want.c_str());
+        CHECK(text == want);
+    }
+}
+
+TEST(codegen_folds_unsigned_operators_unsigned) {
+    // The same bits, read as unsigned: 0xFFF0 >> 2 is a logical shift, and
+    // 0xFFFF / 3 is a large positive number rather than zero.
+    struct { const char* op; long a; long b; long want; } cases[] = {
+        {">>", 0xFFF0, 2, 0x3FFC},
+        {"/", 0xFFFF, 3, 0x5555},
+        {"<", 0xFFFF, 1, 0},
+        {">", 0xFFFF, 1, 1},
+    };
+    for (const auto& c : cases) {
+        CodeGen cg;
+        std::string text = gen(*binary(c.op, literal(c.a, uint_type()),
+                                       literal(c.b, uint_type()), uint_type()), cg);
+        CHECK(cg.error.empty());
+        const std::string want = "ldi r24, " + std::to_string(c.want & 0xFF) +
+                                 "\nldi r25, " +
+                                 std::to_string((c.want >> 8) & 0xFF) + "\n";
+        if (text != want)
+            std::printf("    %ld %s %ld emitted:\n%swanted:\n%s",
+                        c.a, c.op, c.b, text.c_str(), want.c_str());
+        CHECK(text == want);
+    }
+}
+
+TEST(codegen_folds_unary_operators) {
+    CodeGen cg;
+    CHECK(gen(*unary("-", literal(5)), cg) == "ldi r24, 251\nldi r25, 255\n");
+    CodeGen cg2;
+    CHECK(gen(*unary("~", literal(5)), cg2) == "ldi r24, 250\nldi r25, 255\n");
+    CodeGen cg3;
+    CHECK(gen(*unary("!", literal(5)), cg3) == "ldi r24, 0\nldi r25, 0\n");
+    CodeGen cg4;
+    CHECK(gen(*unary("!", literal(0)), cg4) == "ldi r24, 1\nldi r25, 0\n");
+}
+
+TEST(codegen_does_not_fold_a_division_by_zero) {
+    // Nothing sensible can be folded, so the helper decides at run time.
+    for (const char* op : {"/", "%"}) {
+        CodeGen cg;
+        std::string text = gen(*binary(op, literal(10), literal(0)), cg);
+        CHECK(cg.error.empty());
+        CHECK(contains(text, "call __ardio_divmod16"));
+    }
+}
+
+TEST(codegen_folded_expressions_still_assemble) {
+    CodeGen cg = with_locals();
+    cg.gen_expr(*binary("+", binary("*", literal(6), literal(7)),
+                        binary("<<", identifier("a"), literal(2))));
+    CHECK(cg.error.empty());
+    AssembleResult r = assemble(cg.out);
+    if (!r.ok) std::printf("    assembler said: %s\n", r.error.c_str());
+    CHECK(r.ok);
+}
+
+TEST(codegen_immediate_forms_still_assemble) {
+    for (const char* op : kBinaryOps) {
+        for (long k : {0L, 1L, 3L, 8L, 100L, 1000L, -1L}) {
+            CodeGen cg = with_locals();
+            cg.gen_expr(*binary(op, identifier("a"), literal(k)));
+            CHECK(cg.error.empty());
+            std::string error;
+            bool ok = assembles_with_math(cg.out, error);
+            if (!ok) std::printf("    a %s %ld: %s\n", op, k, error.c_str());
+            CHECK(ok);
+        }
+    }
+}
+
+// ---- side effects keep their order ------------------------------------------
+
+namespace {
+
+ExprPtr call_of(const std::string& name) {
+    auto e = std::make_unique<Expr>();
+    e->kind = ExprKind::Call;
+    e->name = name;
+    e->type = int_type();
+    return e;
+}
+
+} // namespace
+
+TEST(codegen_a_call_on_the_right_keeps_the_stack_sequence) {
+    // Loading the left operand after a call would read it at the wrong time,
+    // so the safe sequence has to stay.
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("+", identifier("a"), call_of("f")), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "push r24"));
+    CHECK(contains(text, "pop r24"));
+    const size_t call = text.find("call f");
+    const size_t load = text.find("ldd r24, Y+0");
+    CHECK(call != std::string::npos);
+    CHECK(load != std::string::npos);
+    CHECK(load < call);                            // the left side goes first
+}
+
+TEST(codegen_an_increment_on_the_right_keeps_the_stack_sequence) {
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("+", identifier("a"),
+                                   unary("++", identifier("b"))), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "push r24"));
+    CHECK(contains(text, "pop r24"));
+    CHECK(text.find("ldd r24, Y+0") < text.find("adiw r24, 1"));
+}
+
+TEST(codegen_a_nested_call_on_the_right_is_still_a_side_effect) {
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("+", identifier("a"),
+                                   binary("*", identifier("b"), call_of("f"))), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "push r24"));
+}
+
+TEST(codegen_a_string_literal_on_the_right_is_a_side_effect) {
+    // A string literal writes its bytes into SRAM through Z, so it is not a
+    // pure operand either.
+    CodeGen cg = with_locals();
+    std::string text = gen(*binary("+", identifier("a", make_pointer(char_type())),
+                                   string_literal("hi")), cg);
+    CHECK(cg.error.empty());
+    CHECK(contains(text, "push r24"));
+}
+
+// ---- 8-bit results ----------------------------------------------------------
+
+TEST(codegen_char_constant_operations_stay_correct) {
+    struct { const char* op; long x; long k; unsigned want; } cases[] = {
+        {"+", 100, 100, 0xFFC8u},                  // 200 wraps to -56
+        {"-", -128, 1, 0x007Fu},
+        {"*", 100, 4, 0xFF90u},                    // 400 keeps its low byte
+        {"&", -1, 0x0F, 0x000Fu},
+        {"|", 0x70, 0x0F, 0x007Fu},
+        {"<<", 1, 7, 0xFF80u},                     // the sign bit
+        {"<<", 1, 8, 0x0000u},
+        {">>", -8, 2, 0xFFFEu},                    // arithmetic
+        {"%", 100, 1, 0u},
+    };
+    for (const auto& c : cases) {
+        CodeGen cg;
+        cg.set_global_address("x", kVarX);
+        cg.emit("ldi r24, " + std::to_string(unsigned(c.x) & 0xFF));
+        cg.emit("sts " + std::to_string(kVarX) + ", r24");
+        cg.gen_expr(*binary(c.op, identifier("x", char_type()),
+                            literal(c.k, char_type()), char_type()));
+        CHECK(cg.error.empty());
+        unsigned got = 0;
+        std::string why;
+        if (!run_narrow(cg.out, got, why)) {
+            std::printf("    %s\n", why.c_str());
+            CHECK(why == "skip");
+            return;
+        }
+        if (got != c.want)
+            std::printf("    (char)%ld %s %ld gave 0x%04X, wanted 0x%04X\n",
+                        c.x, c.op, c.k, got, c.want);
+        CHECK_EQ(got, c.want);
     }
 }

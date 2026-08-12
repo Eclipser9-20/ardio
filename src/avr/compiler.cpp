@@ -8,6 +8,7 @@
 
 #include "ardio/avr/codegen.h"
 #include "ardio/avr/parser.h"
+#include "ardio/avr/peephole.h"
 #include "ardio/avr/preprocess.h"
 #include "ardio/avr/sema.h"
 #include "ardio/avr/token.h"
@@ -529,7 +530,7 @@ CompileResult compile_avr(std::string_view source) {
     }
 
     result.ok = true;
-    result.assembly = gen.out;
+    result.assembly = optimise_assembly(gen.out);
     return result;
 }
 

@@ -38,6 +38,7 @@ add_library(libardio STATIC
     src/avr/type.cpp
     src/avr/sema.cpp
     src/avr/codegen_expr.cpp
+    src/avr/peephole.cpp
     src/avr/sketch.cpp
     src/avr/codegen_stmt.cpp
     src/avr/codegen_class.cpp
@@ -98,6 +99,7 @@ add_executable(ardio_tests
     tests/test_type.cpp
     tests/test_sema.cpp
     tests/test_codegen_expr.cpp
+    tests/test_codegen_frame.cpp
     tests/test_runtime_motors.cpp
     tests/test_runtime_io.cpp
     tests/test_sketch.cpp
@@ -111,6 +113,8 @@ add_executable(ardio_tests
     tests/test_runtime_headers.cpp
     tests/test_runtime_ir.cpp
     tests/test_runtime_serial.cpp
+    tests/test_lightweight.cpp
+    tests/test_peephole.cpp
 )
 target_link_libraries(ardio_tests PRIVATE libardio)
 target_include_directories(ardio_tests PRIVATE tests)

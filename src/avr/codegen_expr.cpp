@@ -12,6 +12,7 @@
 
 #include "ardio/avr/codegen.h"
 
+#include <cstdint>
 #include <map>
 
 namespace ardio {
@@ -119,6 +120,227 @@ int CodeGen::expr_size(const Expr& e) {
 bool CodeGen::expr_is_signed(const Expr& e) {
     return e.type ? e.type->is_signed : true;
 }
+
+// ---------------------------------------------------- constant expressions --
+//
+// An expression built only from integer literals has an answer the generator
+// can work out for itself, so `2 * 3` need not cost a multiply. The rule the
+// folder follows is strict: it computes *exactly what the emitted code would
+// have left in the registers*, at the same width and with the same signedness,
+// so folding is a pure size optimisation and never a change of meaning. Where
+// that cannot be guaranteed -- division by zero, a signed overflow the
+// runtime helpers define for themselves -- the fold declines and the operation
+// is left to run time.
+
+namespace {
+
+// The value `size` bytes of register hold, read back as the type says. An
+// 8-bit value is carried sign- or zero-extended in r24:r25, so normalising to
+// one byte and normalising the pair agree.
+long normalize_const(long v, int size, bool is_signed) {
+    if (size >= 4) {
+        std::uint32_t m = static_cast<std::uint32_t>(v);
+        return is_signed ? long(static_cast<std::int32_t>(m)) : long(m);
+    }
+    if (size == 2) {
+        std::uint16_t m = static_cast<std::uint16_t>(v);
+        return is_signed ? long(static_cast<std::int16_t>(m)) : long(m);
+    }
+    std::uint8_t m = static_cast<std::uint8_t>(v);
+    return is_signed ? long(static_cast<std::int8_t>(m)) : long(m);
+}
+
+unsigned long width_mask(int w) {
+    return w >= 4 ? 0xFFFFFFFFul : (w == 2 ? 0xFFFFul : 0xFFul);
+}
+
+// One bit at a time, exactly as the emitted loop does it, so a count wider
+// than the value behaves the way the generated code behaves.
+long shift_const(long a, long count, int w, bool left, bool arithmetic) {
+    const unsigned long mask = width_mask(w);
+    const unsigned long top = (mask >> 1) + 1;
+    unsigned long v = static_cast<unsigned long>(a) & mask;
+    for (long i = 0; i < count; ++i) {
+        if (left) {
+            v = (v << 1) & mask;
+        } else {
+            const bool sign = arithmetic && (v & top) != 0;
+            v = (v >> 1) & mask;
+            if (sign) v |= top;
+        }
+    }
+    return long(v);
+}
+
+bool const_value(const Expr& e, long& out);
+
+bool const_binary(const Expr& e, long& out) {
+    if (!e.lhs || !e.rhs) return false;
+    long a = 0, b = 0;
+    if (!const_value(*e.lhs, a) || !const_value(*e.rhs, b)) return false;
+
+    const std::string& op = e.op;
+    int size = CodeGen::expr_size(e);
+    if (size > 2 && size != 4) size = 2;
+    const bool result_signed = CodeGen::expr_is_signed(e);
+    const bool lhs_signed = CodeGen::expr_is_signed(*e.lhs);
+    const bool rhs_signed = CodeGen::expr_is_signed(*e.rhs);
+    const int lhs_size = CodeGen::expr_size(*e.lhs);
+    const int rhs_size = CodeGen::expr_size(*e.rhs);
+    const bool comparison = is_comparison(op);
+    const bool wide = lhs_size == 4 || rhs_size == 4 || (!comparison && size == 4);
+
+    if (op == "&&" || op == "||") {
+        const long v = op == "&&" ? ((a != 0 && b != 0) ? 1 : 0)
+                                  : ((a != 0 || b != 0) ? 1 : 0);
+        out = normalize_const(v, size, result_signed);
+        return true;
+    }
+
+    if (comparison) {
+        // A narrow comparison that has to leave a 32-bit answer is a shape the
+        // generator does not widen; leave it alone rather than second-guess it.
+        if (!wide && size == 4) return false;
+        const int width = wide ? 4 : lhs_size;
+        const bool cmp_signed = lhs_signed && rhs_signed;
+        const long x = normalize_const(a, width, cmp_signed);
+        const long y = normalize_const(b, width, cmp_signed);
+        bool r;
+        if (op == "==") r = x == y;
+        else if (op == "!=") r = x != y;
+        else if (op == "<") r = x < y;
+        else if (op == ">") r = x > y;
+        else if (op == "<=") r = x <= y;
+        else r = x >= y;
+        out = normalize_const(r ? 1 : 0, size, result_signed);
+        return true;
+    }
+
+    // The width the operation itself is carried out at.
+    const int w = wide ? 4 : size;
+
+    if (op == "+" || op == "-" || op == "*" || op == "&" || op == "|" || op == "^") {
+        long v;
+        if (op == "+") v = long(static_cast<unsigned long>(a) + static_cast<unsigned long>(b));
+        else if (op == "-") v = long(static_cast<unsigned long>(a) - static_cast<unsigned long>(b));
+        else if (op == "*") v = long(static_cast<unsigned long>(a) * static_cast<unsigned long>(b));
+        else if (op == "&") v = a & b;
+        else if (op == "|") v = a | b;
+        else v = a ^ b;
+        out = normalize_const(v, size, result_signed);
+        return true;
+    }
+
+    if (op == "/" || op == "%") {
+        // Division always happens at 16 bits in the narrow path and at 32 in
+        // the wide one, with the signedness of the operands rather than of the
+        // result -- that is which helper gets called.
+        const int dw = wide ? 4 : 2;
+        const bool sgn = lhs_signed && rhs_signed;
+        const long x = normalize_const(a, dw, sgn);
+        const long y = normalize_const(b, dw, sgn);
+        if (y == 0) return false;                    // left to run time
+        if (sgn && y == -1 && x == -(1L << (8 * dw - 1))) return false;   // overflows
+        out = normalize_const(op == "/" ? x / y : x % y, size, result_signed);
+        return true;
+    }
+
+    if (op == "<<" || op == ">>") {
+        const long count = b & 0xFF;                 // the low byte drives the loop
+        const bool arith = wide ? (lhs_signed && rhs_signed)
+                                : (result_signed && lhs_signed);
+        out = normalize_const(shift_const(a, count, w, op == "<<", arith),
+                              size, result_signed);
+        return true;
+    }
+
+    return false;
+}
+
+bool const_unary(const Expr& e, long& out) {
+    if (!e.lhs) return false;
+    const std::string& op = e.op;
+    if (op == "&" || op == "*" || op == "++" || op == "--") return false;
+    long a = 0;
+    if (!const_value(*e.lhs, a)) return false;
+
+    const int usize = CodeGen::expr_size(e);
+    long v;
+    if (op == "+") v = a;
+    else if (op == "-") v = long(0ul - static_cast<unsigned long>(a));
+    else if (op == "~") v = ~a;
+    else if (op == "!") v = a == 0 ? 1 : 0;
+    else return false;
+    out = normalize_const(v, usize, CodeGen::expr_is_signed(e));
+    return true;
+}
+
+// The value an expression is known to have, or false if it is not a constant.
+bool const_value(const Expr& e, long& out) {
+    switch (e.kind) {
+    case ExprKind::IntLiteral:
+        out = normalize_const(e.int_value, CodeGen::expr_size(e),
+                              CodeGen::expr_is_signed(e));
+        return true;
+    case ExprKind::Cast: {
+        long a = 0;
+        if (!e.lhs || !const_value(*e.lhs, a)) return false;
+        out = normalize_const(a, CodeGen::expr_size(e), CodeGen::expr_is_signed(e));
+        return true;
+    }
+    case ExprKind::Unary:
+        return const_unary(e, out);
+    case ExprKind::Binary:
+        return const_binary(e, out);
+    default:
+        return false;
+    }
+}
+
+// Materialises a known value where an evaluated expression would have gone.
+void emit_constant(CodeGen& g, long v, int size) {
+    if (size == 4) {
+        g.emit("ldi r22, " + imm(v & 0xFF));
+        g.emit("ldi r23, " + imm((v >> 8) & 0xFF));
+        g.emit("ldi r24, " + imm((v >> 16) & 0xFF));
+        g.emit("ldi r25, " + imm((v >> 24) & 0xFF));
+        return;
+    }
+    g.emit("ldi r24, " + lo_byte(v));
+    g.emit("ldi r25, " + hi_byte(v));
+}
+
+// Whether evaluating the expression can be observed: a call, an assignment, an
+// increment, or a string literal, which writes its bytes into SRAM. Operand
+// order may only be rearranged when neither side is one of these.
+bool has_side_effects(const Expr& e) {
+    switch (e.kind) {
+    case ExprKind::Call:
+    case ExprKind::Assign:
+    case ExprKind::StringLiteral:
+    case ExprKind::InitList:
+        return true;
+    case ExprKind::Unary:
+        if (e.op == "++" || e.op == "--") return true;
+        break;
+    default:
+        break;
+    }
+    if (e.lhs && has_side_effects(*e.lhs)) return true;
+    if (e.rhs && has_side_effects(*e.rhs)) return true;
+    if (e.third && has_side_effects(*e.third)) return true;
+    for (const ExprPtr& a : e.args)
+        if (a && has_side_effects(*a)) return true;
+    return false;
+}
+
+// An operand whose evaluation touches nothing but r24:r25, so it can be loaded
+// after the other side is already parked in r22:r23.
+bool is_simple_operand(const Expr& e) {
+    return e.kind == ExprKind::IntLiteral || e.kind == ExprKind::Identifier;
+}
+
+} // namespace
 
 // -------------------------------------------------------------- widening ---
 
@@ -626,6 +848,20 @@ void gen_indirect_store(CodeGen& g, const Expr& target, int size) {
 void CodeGen::gen_expr(const Expr& e) {
     if (failed()) return;
 
+    // An expression whose value is known needs no code but the value itself.
+    // Only the composite kinds are worth asking about: a literal already emits
+    // exactly this, and nothing else can be constant.
+    if (e.kind == ExprKind::Binary || e.kind == ExprKind::Unary ||
+        e.kind == ExprKind::Cast) {
+        long folded = 0;
+        if (const_value(e, folded)) {
+            int size = expr_size(e);
+            if (size > 2 && size != 4) size = 2;
+            emit_constant(*this, folded, size);
+            return;
+        }
+    }
+
     switch (e.kind) {
 
     // ---- literals ---------------------------------------------------------
@@ -960,6 +1196,191 @@ void gen_wide_binary(CodeGen& g, const std::string& op, const Expr& lhs,
     g.fail("unsupported 32-bit binary operator '" + op + "'");
 }
 
+// ------------------------------------------------- immediate right operand --
+//
+// With the left operand already in r24:r25 and the right one a known constant,
+// there is nothing to spill: SUBI/SBCI, ANDI, ORI and CPI take their operand
+// from the instruction word. Those forms reach r16-r31 only, which r24, r25
+// and the r18 scratch all satisfy.
+//
+// Returns true when the operation is finished. Returning false leaves r24:r25
+// untouched and lets the caller fall back to loading the constant into
+// r22:r23 and running the general sequence.
+bool gen_const_rhs(CodeGen& g, const std::string& op, long k, int size,
+                   bool is_signed, bool operands_signed, int lhs_width) {
+    // An 8-bit result is carried extended into r25, exactly as the general
+    // sequence leaves it.
+    auto finish = [&] { if (size == 1) g.widen_to_16(is_signed); };
+    auto zero = [&] { g.emit("ldi r24, 0"); g.emit("ldi r25, 0"); };
+
+    const unsigned long ku = static_cast<unsigned long>(k) & 0xFFFFul;
+
+    if (op == "+" || op == "-") {
+        const long d = normalize_const(op == "+" ? k : -k, 2, true);
+        if (d == 0) { finish(); return true; }              // x + 0, x - 0
+        if (size == 2) {
+            if (d > 0 && d <= 63) { g.emit("adiw r24, " + imm(d)); return true; }
+            if (d < 0 && d >= -63) { g.emit("sbiw r24, " + imm(-d)); return true; }
+            // Adding a constant is subtracting its negation, which is the only
+            // immediate form the instruction set offers.
+            g.emit("subi r24, " + lo_byte(-d));
+            g.emit("sbci r25, " + hi_byte(-d));
+            return true;
+        }
+        g.emit("subi r24, " + lo_byte(-d));
+        finish();
+        return true;
+    }
+
+    if (op == "&") {
+        if (ku == 0) { zero(); return true; }               // x & 0
+        if ((ku & 0xFF) != 0xFF) g.emit("andi r24, " + lo_byte(long(ku)));
+        if (size == 2) {
+            if (((ku >> 8) & 0xFF) != 0xFF)
+                g.emit("andi r25, " + hi_byte(long(ku)));
+            return true;
+        }
+        finish();
+        return true;
+    }
+
+    if (op == "|") {
+        if (ku == 0) { finish(); return true; }             // x | 0
+        if ((ku & 0xFF) != 0) g.emit("ori r24, " + lo_byte(long(ku)));
+        if (size == 2) {
+            if (((ku >> 8) & 0xFF) != 0) g.emit("ori r25, " + hi_byte(long(ku)));
+            return true;
+        }
+        finish();
+        return true;
+    }
+
+    if (op == "^") {
+        if (ku == 0) { finish(); return true; }             // x ^ 0
+        return false;                                       // no immediate EOR
+    }
+
+    if (op == "*") {
+        if (ku == 0) { zero(); return true; }               // x * 0
+        if (ku == 1) { finish(); return true; }             // x * 1
+        if ((ku & (ku - 1)) == 0) {
+            int n = 0;
+            while ((1ul << n) != ku) ++n;
+            if (n >= 8 * size) { zero(); return true; }     // shifted clean out
+            if (n <= 4) {
+                for (int i = 0; i < n; ++i) {
+                    g.emit("lsl r24");
+                    if (size == 2) g.emit("rol r25");
+                }
+                finish();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (op == "/") {
+        if (ku == 1) { finish(); return true; }             // x / 1
+        // Only an unsigned divide is a shift: a signed one rounds towards zero
+        // where a shift rounds towards minus infinity.
+        if (!operands_signed && ku != 0 && (ku & (ku - 1)) == 0) {
+            int n = 0;
+            while ((1ul << n) != ku) ++n;
+            if (n <= 2) {                                   // beyond this a call is smaller
+                for (int i = 0; i < n; ++i) { g.emit("lsr r25"); g.emit("ror r24"); }
+                finish();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (op == "%") {
+        if (ku == 1) { zero(); return true; }               // x % 1
+        if (!operands_signed && ku != 0 && (ku & (ku - 1)) == 0) {
+            const unsigned long mask = ku - 1;
+            g.emit("andi r24, " + lo_byte(long(mask)));
+            g.emit("andi r25, " + hi_byte(long(mask)));
+            finish();
+            return true;
+        }
+        return false;
+    }
+
+    if (op == "<<" || op == ">>") {
+        long count = k & 0xFF;                              // as the loop reads it
+        const int bits = 8 * size;
+        if (count == 0) { finish(); return true; }
+        if (op == "<<") {
+            if (count >= bits) { zero(); return true; }
+        } else if (!is_signed) {
+            if (count >= bits) { zero(); return true; }
+        } else if (count > bits - 1) {
+            count = bits - 1;                               // ASR saturates at the sign
+        }
+        if (count > 4) return false;                        // the loop is smaller
+        for (long i = 0; i < count; ++i) {
+            if (op == "<<") {
+                g.emit("lsl r24");
+                if (size == 2) g.emit("rol r25");
+            } else if (size == 2) {
+                g.emit(is_signed ? "asr r25" : "lsr r25");
+                g.emit("ror r24");
+            } else {
+                g.emit(is_signed ? "asr r24" : "lsr r24");
+            }
+        }
+        finish();
+        return true;
+    }
+
+    if (is_comparison(op)) {
+        // A comparison happens at the operands' own width, and CPI/CPC set
+        // exactly the flags CP/CPC would. '>' and '<=' would need the operands
+        // the other way round, so they are rewritten against k + 1 instead --
+        // over the integers `a > k` and `a >= k + 1` are the same question.
+        const bool cmp_signed = operands_signed;
+        long kk = normalize_const(k, lhs_width, cmp_signed);
+        std::string effective = op;
+        if (op == ">" || op == "<=") {
+            const long top = cmp_signed ? ((1L << (8 * lhs_width - 1)) - 1)
+                                        : ((1L << (8 * lhs_width)) - 1);
+            if (kk == top) {                                // nothing exceeds the maximum
+                g.emit(std::string("ldi r24, ") + (op == ">" ? "0" : "1"));
+                g.emit("ldi r25, 0");
+                return true;
+            }
+            kk += 1;
+            effective = op == ">" ? ">=" : "<";
+        }
+        const Compare c = comparison_branch(effective, cmp_signed);
+        const unsigned long m =
+            static_cast<unsigned long>(kk) & width_mask(lhs_width);
+
+        g.emit("cpi r24, " + imm(long(m & 0xFF)));
+        if (lhs_width == 2) {
+            const long hi = long((m >> 8) & 0xFF);
+            // LDI sets no flags, so loading the scratch between CPI and CPC is
+            // safe; r1 is the zero register and saves the load outright.
+            if (hi == 0) {
+                g.emit("cpc r25, r1");
+            } else {
+                g.emit("ldi r18, " + imm(hi));
+                g.emit("cpc r25, r18");
+            }
+        }
+        const std::string done = g.new_label("cmp");
+        g.emit("ldi r24, 1");
+        g.emit("ldi r25, 0");
+        g.emit(std::string(c.branch) + " " + done);
+        g.emit("ldi r24, 0");
+        g.emit_label(done);
+        return true;
+    }
+
+    return false;
+}
+
 } // namespace
 
 void CodeGen::gen_binary(const std::string& op, const Expr& lhs, const Expr& rhs,
@@ -1010,17 +1431,40 @@ void CodeGen::gen_binary(const std::string& op, const Expr& lhs, const Expr& rhs
     }
 
     // Everything else: left in r24:r25, right in r22:r23.
-    gen_expr(lhs);
-    if (failed()) return;
-    emit("push r24");
-    emit("push r25");
-    gen_expr(rhs);
-    if (failed()) return;
-    emit("movw r22, r24");
-    emit("pop r25");
-    emit("pop r24");
-
     const bool is_signed = result_signed && expr_is_signed(lhs);
+    const bool operands_signed = expr_is_signed(lhs) && expr_is_signed(rhs);
+
+    long k = 0;
+    if (const_value(rhs, k)) {
+        // A constant right operand cannot disturb the left one, so the left
+        // stays in r24:r25 and most operators become an immediate form.
+        gen_expr(lhs);
+        if (failed()) return;
+        if (gen_const_rhs(*this, op, k, size, is_signed, operands_signed, lhs_size))
+            return;
+        emit("ldi r22, " + lo_byte(k));
+        emit("ldi r23, " + hi_byte(k));
+    } else if (is_simple_operand(lhs) && !has_side_effects(rhs)) {
+        // A plain name or literal on the left costs nothing to re-materialise
+        // and touches only r24:r25, so the right side can be evaluated first
+        // and parked in r22:r23 directly. Neither side may be observable, so
+        // swapping the order cannot be noticed.
+        gen_expr(rhs);
+        if (failed()) return;
+        emit("movw r22, r24");
+        gen_expr(lhs);
+        if (failed()) return;
+    } else {
+        gen_expr(lhs);
+        if (failed()) return;
+        emit("push r24");
+        emit("push r25");
+        gen_expr(rhs);
+        if (failed()) return;
+        emit("movw r22, r24");
+        emit("pop r25");
+        emit("pop r24");
+    }
 
     if (op == "+") {
         emit("add r24, r22");

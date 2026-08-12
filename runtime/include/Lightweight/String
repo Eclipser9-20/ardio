@@ -1,0 +1,206 @@
+// Lightweight/String -- a fixed-capacity, heap-free string for sketches.
+//
+//      #include <Lightweight/String>
+//
+//      LW_STRING(name);                    // 32 characters, no heap
+//      name.set("sensor ");
+//      name.appendInt(reading);
+//      lcd.print(name.c_str());
+//
+// WHY NOT std::string
+// -------------------
+// std::string grows on demand, which means an allocator, and on an ATmega328P
+// with 2 KB of SRAM an allocator means fragmentation and a sketch that dies
+// after an hour. It is also a template, and ardio's compiler has no templates
+// at all. LwString is the same idea with the growth removed: one fixed buffer,
+// decided at compile time, that can never be written past.
+//
+// WHY THE STORAGE IS PASSED IN
+// ----------------------------
+// ardio's code generator supports 8- and 16-bit class fields only. A class can
+// store into an array member but cannot read one back out from inside a method
+// -- `field 'data_' of class 'X': only 8- and 16-bit fields are supported` --
+// so an LwString cannot carry its own `char buffer_[33]`. It holds a `char *`
+// instead, and the LW_STRING macro below declares the array and the LwString
+// together so a sketch never has to size the buffer by hand.
+//
+// Consequences, stated plainly:
+//   * Always declare one with LW_STRING(name). Handing the constructor an
+//     array of your own that is shorter than LW_STRING_BUFFER bytes is the one
+//     way to defeat the bounds checking here.
+//   * The storage must outlive the LwString, exactly as for any array.
+//   * Everything truncates at LW_STRING_CAPACITY. Nothing ever fails loudly,
+//     allocates, or writes past the end; the characters that do not fit are
+//     dropped. Call length() if you need to know whether they all fit.
+//
+// NAMED METHODS, NO OVERLOADS
+// ---------------------------
+// ardio's compiler parses no operator overloads, and two methods (or two
+// constructors) sharing a name emit the same assembly label and collide at
+// assembly time. So every operation has its own name -- set/setInt,
+// append/appendInt/appendChar -- and there is exactly one constructor.
+//
+// The character work itself is runtime/string.S, assembled by ardio's own
+// assembler; this header is a thin shell over those routines.
+//
+// Part of ardio. Licensed under the GNU General Public License v3.
+
+#ifndef ARDIO_LIGHTWEIGHT_STRING
+#define ARDIO_LIGHTWEIGHT_STRING
+
+// ---------------------------------------------------------------------------
+// CAPACITY -- fixed at compile time, and the same for every LwString.
+//
+// 32 characters of text plus the terminator, so 33 bytes of SRAM per string.
+// That is two 16-column LCD lines, or a comfortable line of serial input, and
+// it costs about 1.6% of an ATmega328P's RAM. Text longer than this truncates.
+// ---------------------------------------------------------------------------
+#define LW_STRING_CAPACITY 32
+#define LW_STRING_BUFFER   33          // LW_STRING_CAPACITY + 1, terminator
+
+// Longest int16_t decimal is "-32768": six characters plus the terminator.
+#define LW_STRING_INT_BUFFER 7
+
+// ---------------------------------------------------------------------------
+// The primitives, implemented in runtime/string.S. `capacity` there always
+// means the size of the whole destination buffer, terminator included; copy
+// and append write at most capacity-1 characters and always terminate.
+//
+// Re-declared rather than reimplemented, so a sketch may include both this and
+// <WString.h> without either one defining a second copy of anything.
+// ---------------------------------------------------------------------------
+unsigned int str_len(const char *s);
+void str_copy(char *dst, const char *src, unsigned int capacity);
+void str_append(char *dst, const char *src, unsigned int capacity);
+int str_compare(const char *a, const char *b);
+void str_from_int(char *dst, int value);
+int str_index_of(const char *s, char c);
+int str_char_at(const char *s, unsigned int index);
+
+class LwString {
+public:
+    // `storage` must be an array of LW_STRING_BUFFER bytes -- use LW_STRING.
+    // The string starts empty.
+    LwString(char *storage) {
+        buffer_ = storage;
+        buffer_[0] = 0;
+    }
+
+    // ---- reading -----------------------------------------------------------
+
+    unsigned int length() const { return str_len(buffer_); }
+
+    // Characters this string can hold, terminator excluded. Always the same
+    // compile-time constant; it is a method so that the interface reads the
+    // way the standard containers do.
+    unsigned int capacity() const { return LW_STRING_CAPACITY; }
+
+    bool empty() const { return str_len(buffer_) == 0; }
+
+    bool full() const { return str_len(buffer_) >= LW_STRING_CAPACITY; }
+
+    const char *c_str() const { return buffer_; }
+
+    // ---- indexing ----------------------------------------------------------
+
+    // Out of range reads as 0 rather than running off the end of the buffer.
+    char at(unsigned int index) const {
+        return (char)str_char_at(buffer_, index);
+    }
+
+    // Out of range is ignored, so no write ever lands past the terminator.
+    // Writing 0 is refused too: it would shorten the string behind its back.
+    void setAt(unsigned int index, char c) {
+        if (c == 0) return;
+        if (index < str_len(buffer_)) buffer_[index] = c;
+    }
+
+    // ---- assigning (truncates at LW_STRING_CAPACITY) -----------------------
+
+    void clear() { buffer_[0] = 0; }
+
+    void set(const char *text) { str_copy(buffer_, text, LW_STRING_BUFFER); }
+
+    void setString(const LwString *other) { set(other->c_str()); }
+
+    void setInt(int value) {
+        char digits[LW_STRING_INT_BUFFER];
+        str_from_int(digits, value);
+        set(digits);
+    }
+
+    // ---- appending (truncates at LW_STRING_CAPACITY) -----------------------
+
+    void append(const char *text) { str_append(buffer_, text, LW_STRING_BUFFER); }
+
+    void appendString(const LwString *other) { append(other->c_str()); }
+
+    void appendChar(char c) {
+        if (c == 0) return;
+        char one[2];
+        one[0] = c;
+        one[1] = 0;
+        str_append(buffer_, one, LW_STRING_BUFFER);
+    }
+
+    void appendInt(int value) {
+        char digits[LW_STRING_INT_BUFFER];
+        str_from_int(digits, value);
+        str_append(buffer_, digits, LW_STRING_BUFFER);
+    }
+
+    // ---- comparing ---------------------------------------------------------
+
+    // Negative, zero or positive, like strcmp.
+    int compare(const char *text) const { return str_compare(buffer_, text); }
+
+    bool equals(const char *text) const { return str_compare(buffer_, text) == 0; }
+
+    bool equalsString(const LwString *other) const {
+        return str_compare(buffer_, other->c_str()) == 0;
+    }
+
+    bool startsWith(const char *prefix) const {
+        unsigned int i = 0;
+        unsigned int n = str_len(buffer_);
+        while (prefix[i] != 0) {
+            if (i >= n) return false;
+            if (buffer_[i] != prefix[i]) return false;
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // ---- searching and slicing ---------------------------------------------
+
+    // Index of the first `c`, or -1 when it does not occur.
+    int indexOf(char c) const { return str_index_of(buffer_, c); }
+
+    // Half-open [from, to) copied into `out`, which is cleared first. There is
+    // nowhere to allocate a returned string, so the destination -- with its own
+    // storage -- is passed in. `to` past the end is clamped, `from` past `to`
+    // yields an empty result, and the copy stops early if `out` fills up.
+    void substring(unsigned int from, unsigned int to, LwString *out) const {
+        out->clear();
+        unsigned int n = str_len(buffer_);
+        if (to > n) to = n;
+        unsigned int i = from;
+        while (i < to) {
+            out->appendChar((char)str_char_at(buffer_, i));
+            i = i + 1;
+        }
+    }
+
+    // The storage this string works in, so a sketch can hand the text to a C
+    // API without a method call. Its size is LW_STRING_BUFFER.
+    char *buffer_;
+};
+
+// Declares an LwString called `name` together with the array it lives in.
+// Use it everywhere; it is the only declaration that guarantees the buffer is
+// the size every method here assumes.
+#define LW_STRING(name)                                                        \
+    char name##_lw_storage[LW_STRING_BUFFER];                                  \
+    LwString name(name##_lw_storage)
+
+#endif // ARDIO_LIGHTWEIGHT_STRING
