@@ -77,6 +77,11 @@ public:
     // Marshals a call's arguments into the ABI registers and calls the target.
     void gen_call(const Expr& e);
 
+    // Generates one binary operation. The result width and signedness are
+    // passed separately so compound assignments can reuse this directly.
+    void gen_binary(const std::string& op, const Expr& lhs, const Expr& rhs,
+                    int size, bool is_signed);
+
     // Stores r24:r25 (or just r24 for size 1) into the named variable.
     void store_to_variable(const std::string& name, int size);
     void load_from_variable(const std::string& name, int size, bool is_signed);
