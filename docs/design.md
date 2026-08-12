@@ -18,9 +18,14 @@ run by users who do not own the hardware.
 
 ## Constraints
 
-**`ardio` is a public, standalone project.** It contains no third-party or privately-held
-code, and depends on no external toolchain of its own. Everything in this repository is
-original work written for `ardio`. It stands on its own.
+**`ardio` is a public project, licensed GPLv3.** Every line in this repository is written
+for `ardio`. Other implementations may be studied freely — copyright covers expression,
+not ideas — but code is not copied in verbatim; what ships here is ardio's own.
+
+**The long-term goal is self-containment.** `ardio` currently invokes an external
+`avr-g++` for code generation, and can fetch or build one on request. The intended end
+state is an AVR assembler and code generator living inside `libardio`, sharing its
+instruction tables with the emulator, so `ardio` needs no external compiler at all.
 
 **macOS is the first platform.** Linux and Windows follow. The platform layer is designed
 for all three from the start so later ports fill in interfaces rather than restructure

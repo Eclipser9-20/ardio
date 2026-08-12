@@ -138,6 +138,10 @@ The test suite runs entirely without hardware: the protocol encoders are pure fu
 tested against known-good byte sequences, and uploads are tested against a scripted
 in-memory bootloader.
 
+## Licence
+
+GPLv3. See [LICENSE](LICENSE).
+
 ## Library
 
 The CLI is a thin shell over `libardio`, which is installed alongside it. The board
