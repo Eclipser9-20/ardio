@@ -87,7 +87,7 @@ public:
                "correct but slow, and the oracle every other core is checked against)";
     }
 
-    void attach(Peripheral* p) {
+    void attach(Peripheral* p) override {
         if (p) peripherals_.push_back(p);
     }
 

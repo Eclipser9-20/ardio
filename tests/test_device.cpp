@@ -198,10 +198,12 @@ TEST(atmega8_keeps_its_peripherals_in_low_io_space) {
     CHECK_EQ(int(d.adcsra), 0x26);
     CHECK_EQ(int(d.admux), 0x27);
 
-    CHECK_EQ(int(d.tcnt0), 0x32);
-    CHECK_EQ(int(d.tccr0b), 0x33);
-    CHECK_EQ(int(d.tifr0), 0x38);
-    CHECK_EQ(int(d.timsk0), 0x39);
+    // High I/O, so the data-space addresses are 0x20 above the I/O ones the
+    // register summary lists first: TCNT0 is I/O 0x32 but data space 0x52.
+    CHECK_EQ(int(d.tcnt0), 0x52);
+    CHECK_EQ(int(d.tccr0b), 0x53);
+    CHECK_EQ(int(d.tifr0), 0x58);
+    CHECK_EQ(int(d.timsk0), 0x59);
     // There is no waveform-mode register for timer 0 on this part.
     CHECK_EQ(int(d.tccr0a), 0);
 
@@ -210,13 +212,16 @@ TEST(atmega8_keeps_its_peripherals_in_low_io_space) {
     CHECK_EQ(int(d.twdr), 0x23);
     CHECK_EQ(int(d.twcr), 0x56);
 
-    // The ports, by contrast, are exactly where the 328P has them, which is
-    // why the old boards share the modern silkscreen.
+    // The ports do not agree with the 328P either, and this is the trap: the
+    // old boards share the modern silkscreen, so the numbering carries over
+    // unchanged while the addresses behind it do not. On this part 0x23, 0x26
+    // and 0x29 are TWDR, ADCSRA and UBRRL.
     CHECK_EQ(d.pins.size(), size_t(20));
-    CHECK_EQ(int(d.pins[0].pin_reg), 0x29);
-    CHECK_EQ(int(d.pins[13].pin_reg), 0x23);
+    CHECK_EQ(int(d.pins[0].pin_reg), 0x30);    // PIND
+    CHECK_EQ(int(d.pins[13].pin_reg), 0x36);   // PINB
     CHECK_EQ(int(d.pins[13].bit), 5);
-    CHECK_EQ(int(d.pins[14].pin_reg), 0x26);
+    CHECK_EQ(int(d.pins[14].pin_reg), 0x33);   // PINC
+    CHECK_EQ(int(d.pins[14].bit), 0);
     CHECK_EQ(d.analog.size(), size_t(6));
 }
 
@@ -406,7 +411,7 @@ TEST(the_pin_at_the_analog_base_is_the_port_bit_a0_lives_on) {
     // the pin table rather than restated as a second number.
     CHECK_EQ(int(device("atmega328p").pins[14].pin_reg), 0x26);   // PC0
     CHECK_EQ(int(device("atmega328p").pins[14].bit), 0);
-    CHECK_EQ(int(device("atmega8").pins[14].pin_reg), 0x26);      // PC0
+    CHECK_EQ(int(device("atmega8").pins[14].pin_reg), 0x33);      // PC0
     CHECK_EQ(int(device("atmega32u4").pins[18].pin_reg), 0x2F);   // PF7
     CHECK_EQ(int(device("atmega32u4").pins[18].bit), 7);
     CHECK_EQ(int(device("atmega2560").pins[54].pin_reg), 0x2F);   // PF0
@@ -435,6 +440,41 @@ TEST(the_table_holds_every_part_ardio_claims_to_support) {
         CHECK(d.twcr != 0);
         CHECK(!d.pins.empty());
         CHECK(!d.analog.empty());
+    }
+}
+
+TEST(no_parts_pin_map_lands_on_that_parts_own_peripheral_registers) {
+    // The mistake this guards against is copying one part's port addresses
+    // into another part's row. It survives review easily, because the numbers
+    // look like port addresses -- they are, on some other chip. On the
+    // ATmega8, the 328P's 0x23, 0x26 and 0x29 are TWDR, ADCSRA and UBRRL, so
+    // a digitalWrite would have read-modify-written ADCH and the symptom
+    // would have surfaced in analogRead.
+    //
+    // A port occupies three consecutive addresses, PINx then DDRx then PORTx,
+    // and the runtime reaches all three off the one address the table stores,
+    // so all three have to be clear of every peripheral this part names.
+    for (const AvrDevice& d : ardio::avr::device_database()) {
+        const uint16_t peripherals[] = {
+            d.ucsra,  d.ucsrb,  d.ucsrc,  d.ubrrl,  d.ubrrh, d.udr,
+            d.admux,  d.adcsra, d.adcsrb, d.adcl,   d.adch,
+            d.tccr0a, d.tccr0b, d.tcnt0,  d.timsk0, d.tifr0,
+            d.twbr,   d.twsr,   d.twdr,   d.twcr,
+        };
+        for (size_t n = 0; n < d.pins.size(); ++n) {
+            uint16_t base = d.pins[n].pin_reg;
+            if (base == 0) continue;             // a pin the part does not have
+            for (uint16_t reg : peripherals) {
+                if (reg == 0) continue;          // a register the part lacks
+                for (uint16_t offset = 0; offset < 3; ++offset) {
+                    if (base + offset != reg) continue;
+                    static const char* const which[] = {"PINx", "DDRx", "PORTx"};
+                    ::ardio_test::fail(__FILE__, __LINE__,
+                                       d.name + ": pin " + std::to_string(n) + "'s " +
+                                           which[offset] + " is also a peripheral register");
+                }
+            }
+        }
     }
 }
 

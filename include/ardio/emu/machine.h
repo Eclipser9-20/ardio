@@ -151,6 +151,12 @@ struct RunResult {
     StopReason reason = StopReason::Deadline;
     std::string error;   // set when reason is IllegalOpcode or Error
     uint16_t pc = 0;     // where it stopped
+
+    // A run can end for one reason while another condition is also true --
+    // reaching the deadline with an interrupt already pending is the ordinary
+    // case. Reporting only the reason would make the caller re-derive that by
+    // polling every peripheral again, so it is recorded here instead.
+    bool interrupt_pending = false;
 };
 
 // The translating execution core.
@@ -161,6 +167,18 @@ struct RunResult {
 class Core {
 public:
     virtual ~Core() = default;
+
+    // Wires a peripheral in, so loads and stores to the addresses it claims
+    // route through it instead of hitting SRAM.
+    //
+    // This has to be on Core rather than on State, because a translator needs
+    // to know the claimed ranges at translation time, not at execution time: a
+    // load whose address it can prove is plain SRAM compiles to a native load,
+    // while one that might hit a peripheral has to compile to a call back out.
+    // Handing peripherals over per-run would mean re-translating whenever the
+    // wiring changed. The core does not own these; they must outlive it.
+    virtual void attach(Peripheral* peripheral) = 0;
+
     virtual RunResult run(State& state) = 0;
 
     // Drop cached translations covering this flash range. AVR code can rewrite

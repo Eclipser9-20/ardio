@@ -83,6 +83,17 @@ struct AvrDevice {
     // wrong. Nothing consumes this yet; millis() is not wired up.
     uint8_t timer0_ovf_vector = 0;
 
+    // True when each interrupt vector slot holds a two-word jmp rather than a
+    // one-word rjmp, which is what parts with more than 8 KB of flash need
+    // because rjmp cannot reach the whole address space.
+    //
+    // This is carried rather than inferred from flash_size. The inference
+    // happens to hold for every part in the table, but it is a correlation
+    // dressed up as a rule, and getting it wrong puts every interrupt handler
+    // at half or double its true address -- which does not fail cleanly, it
+    // jumps into the middle of unrelated code.
+    bool two_word_vectors = false;
+
     // --- two-wire -----------------------------------------------------
     uint16_t twbr = 0, twsr = 0, twdr = 0, twcr = 0;
 

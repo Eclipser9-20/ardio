@@ -724,8 +724,13 @@ TEST(atmega8_timer_has_no_output_compare_and_claims_no_zero_address) {
 
     // And nothing derived lands on a register that does exist: TCCR0 is at the
     // address a 328P-shaped derivation would have called OCR0A.
-    CHECK_EQ(int(mega8().tccr0b), 0x33);
-    CHECK_EQ(int(mega8().tcnt0), 0x32);
+    // These are data-space addresses. The datasheet lists TCNT0 and TCCR0 in
+    // the high-I/O summary as $32 and $33, and data space is I/O plus 0x20.
+    // They were briefly recorded here as the I/O values, which put TCNT0 on
+    // PORTD (0x30 + 2) and TIFR on PORTB (0x36 + 2) once the ATmega8's real
+    // port addresses landed -- the same class of mistake as the pin map's.
+    CHECK_EQ(int(mega8().tccr0b), 0x53);
+    CHECK_EQ(int(mega8().tcnt0), 0x52);
 }
 
 TEST(atmega8_timer_still_overflows_on_the_right_cycle) {
