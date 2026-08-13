@@ -8,6 +8,7 @@ struct Args {
     std::string command;     // "ports", "push", "toolchain", ...
     std::string positional;  // sketch/hex path, or a subcommand
     std::string positional2; // second operand, e.g. "toolchain fetch <pkg>"
+    std::string positional3; // third, e.g. "wifi flash <name> <sketch>"
     std::string port;
     bool port_is_manual = false;  // named via --manual: never auto-detect
     std::string board;
@@ -33,6 +34,14 @@ struct Args {
     // orders of magnitude in speed, and a user seeing slow emulation should
     // be able to find out which one they got.
     bool explain = false;
+
+    // --- configure wifi / wifi flash ----------------------------------
+    std::string host;        // "user@host", as ssh takes it
+    std::string device;      // the serial device at the far end
+    std::string ssid;        // recorded for reference; ardio never joins a network
+    std::string gpio_chip;
+    int reset_gpio = 0;      // host GPIO wired to the board's RESET
+    int boot_gpio = 0;       // host GPIO wired to GPIO0 on an ESP
 
     bool help = false;
     std::string error;

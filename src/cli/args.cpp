@@ -10,7 +10,8 @@ namespace {
 // Every option is spelled the same way with one dash or two: "-port" and
 // "--port" are the same flag. The leading dashes carry no meaning here.
 enum class Flag { None, Port, Board, Baud, Monitor, Backup, Help, Manual,
-                  For, Wire, Input, Explain };
+                  For, Wire, Input, Explain,
+                  Host, Device, Ssid, GpioChip, ResetGpio, BootGpio };
 
 struct FlagSpec {
     std::string_view name;
@@ -32,6 +33,13 @@ constexpr FlagSpec kFlags[] = {
     {"wire",    Flag::Wire,    true},
     {"input",   Flag::Input,   true},
     {"explain", Flag::Explain, true},
+    // configure wifi / wifi flash options.
+    {"host",       Flag::Host,      true},
+    {"device",     Flag::Device,    true},
+    {"ssid",       Flag::Ssid,      true},
+    {"gpio-chip",  Flag::GpioChip,  true},
+    {"reset-gpio", Flag::ResetGpio, true},
+    {"boot-gpio",  Flag::BootGpio,  true},
     // Single-letter forms. These are exact-only: "-m" is monitor and can
     // never be read as a prefix of "manual".
     {"m",       Flag::Monitor, false},
@@ -108,6 +116,9 @@ Args parse_args(int argc, char** argv) {
         if (!is_flag(arg)) {
             if (a.positional.empty())       { a.positional = arg; }
             else if (a.positional2.empty()) { a.positional2 = arg; }
+            // A third operand exists for "wifi flash <name> <sketch>", where
+            // the subcommand and the board name both come before the file.
+            else if (a.positional3.empty()) { a.positional3 = arg; }
             else { a.error = "unexpected argument '" + arg + "'"; return a; }
             continue;
         }
@@ -157,6 +168,32 @@ Args parse_args(int argc, char** argv) {
         case Flag::Explain:
             a.explain = true;
             break;
+        case Flag::Host:
+            if (!take_value(arg, a.host)) return a;
+            break;
+        case Flag::Device:
+            if (!take_value(arg, a.device)) return a;
+            break;
+        case Flag::Ssid:
+            if (!take_value(arg, a.ssid)) return a;
+            break;
+        case Flag::GpioChip:
+            if (!take_value(arg, a.gpio_chip)) return a;
+            break;
+        case Flag::ResetGpio: {
+            std::string v;
+            if (!take_value(arg, v)) return a;
+            a.reset_gpio = std::atoi(v.c_str());
+            if (a.reset_gpio <= 0) { a.error = arg + " needs a GPIO line number"; return a; }
+            break;
+        }
+        case Flag::BootGpio: {
+            std::string v;
+            if (!take_value(arg, v)) return a;
+            a.boot_gpio = std::atoi(v.c_str());
+            if (a.boot_gpio <= 0) { a.error = arg + " needs a GPIO line number"; return a; }
+            break;
+        }
         case Flag::Help:
             a.help = true;
             break;

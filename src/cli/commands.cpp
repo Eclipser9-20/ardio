@@ -5,12 +5,16 @@
 #include "ardio/monitor.h"
 #include "ardio/platform/ports.h"
 #include "ardio/emu/board.h"
+#include "ardio/wifi_config.h"
+#include "ardio/platform/remote_serial.h"
 #include "ardio/emu/parts.h"
 #include "ardio/protocol/avr109.h"
+#include "ardio/protocol/esp_rom.h"
 #include "ardio/protocol/programmer.h"
 #include "ardio/toolchain.h"
 
 #include <csignal>
+#include <iostream>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -244,6 +248,224 @@ int cmd_emulate(const Args& args, const Config& cfg) {
     case emu::RunOutcome::Fault:
         std::fprintf(stderr, "error: %s\n", result.error.c_str());
         return 1;
+    }
+    return 0;
+}
+
+// `ardio wifi flash <name>` -- builds if needed and uploads over the network
+// to a board on a remote host's UART.
+//
+// Nothing is installed on the far end. ardio speaks the bootloader protocol
+// itself, over an ssh pipe, exactly as it does over a local port -- which is
+// the point: the same STK500 and ESP ROM implementations serve both, so a
+// board being on the other side of the house changes the transport and
+// nothing else.
+int cmd_wifi(const Args& args, const Config& cfg) {
+    if (args.positional != "flash" && args.positional != "list") {
+        std::fprintf(stderr, "usage: ardio wifi flash <name> [sketch]\n"
+                             "       ardio wifi list\n");
+        return 2;
+    }
+
+    WifiConfig wifi;
+    std::string error;
+    if (!load_wifi_config(wifi, error)) {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+    }
+
+    if (args.positional == "list") {
+        if (wifi.boards.empty()) {
+            std::printf("no boards configured. Add one with:\n"
+                        "  ardio configure wifi <name> -host user@host\n");
+            return 0;
+        }
+        for (const WifiBoard& b : wifi.boards)
+            std::printf("%-12s %-10s %s:%s%s\n", b.name.c_str(), b.board_id.c_str(),
+                        b.host.c_str(), b.device.c_str(),
+                        b.reset_gpio ? "" : "  (manual reset)");
+        return 0;
+    }
+
+    if (args.positional2.empty()) {
+        std::fprintf(stderr, "error: wifi flash needs the name of a configured "
+                             "board. Try 'ardio wifi list'.\n");
+        return 2;
+    }
+
+    const WifiBoard* wb = find_wifi_board(wifi, args.positional2);
+    if (!wb) {
+        std::fprintf(stderr, "error: no configured board called '%s'. "
+                             "Try 'ardio wifi list', or configure it with:\n"
+                             "  ardio configure wifi %s -host user@host\n",
+                     args.positional2.c_str(), args.positional2.c_str());
+        return 2;
+    }
+
+    const Board* board = find_board_by_id(wb->board_id);
+    if (!board) {
+        std::fprintf(stderr, "error: '%s' is configured as board '%s', which ardio "
+                             "no longer knows about\n",
+                     wb->name.c_str(), wb->board_id.c_str());
+        return 1;
+    }
+
+    // A sketch may be given, or a .hex, or neither -- in which case there is
+    // nothing to send and saying so beats flashing something stale.
+    if (args.positional3.empty()) {
+        std::fprintf(stderr, "error: wifi flash needs a sketch or a .hex to send\n");
+        return 2;
+    }
+
+    std::string hex_path = args.positional3;
+    if (fs::path(hex_path).extension() != ".hex") {
+        BuildResult built = build_sketch(hex_path, *board, roots_for(cfg),
+                                         ".ardio-build");
+        if (!built.ok) {
+            std::fprintf(stderr, "error: %s\n", built.error.c_str());
+            return 1;
+        }
+        hex_path = built.hex_path;
+    }
+
+    std::ifstream in(hex_path);
+    if (!in) {
+        std::fprintf(stderr, "error: cannot read %s\n", hex_path.c_str());
+        return 1;
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    auto image = parse_intel_hex(ss.str(), error);
+    if (!image) {
+        std::fprintf(stderr, "error: %s: %s\n", hex_path.c_str(), error.c_str());
+        return 1;
+    }
+
+    std::printf("sending %zu bytes to %s on %s:%s\n", image->data.size(),
+                wb->name.c_str(), wb->host.c_str(), wb->device.c_str());
+
+    // Without a GPIO wired to RESET there is no way to start the bootloader
+    // from here, so ask rather than talk to a board that is not listening and
+    // report a timeout the user cannot interpret.
+    if (wb->reset_gpio == 0) {
+        std::printf("\nThis board has no reset GPIO configured, and a header UART "
+                    "has no DTR line,\nso ardio cannot reset it. ");
+        if (board->protocol == Protocol::EspRom)
+            std::printf("Hold GPIO0 to ground, tap RESET, then release GPIO0.\n");
+        else
+            std::printf("Press the board's reset button now.\n");
+        std::printf("Press Enter when the board is in its bootloader: ");
+        std::fflush(stdout);
+        std::string ignored;
+        std::getline(std::cin, ignored);
+    }
+
+    auto serial = make_remote_serial_port(wb->host, wb->gpio_chip, wb->reset_gpio,
+                                          wb->boot_gpio);
+    auto progress = [](const std::string& msg) { std::printf("  %s\n", msg.c_str()); };
+
+    UploadResult result;
+    switch (board->protocol) {
+    case Protocol::Stk500v1:
+        result = upload_stk500v1(*serial, wb->device, *board, *image, progress);
+        break;
+    case Protocol::EspRom:
+        result = esp_rom::upload_esp_rom(*serial, wb->device, *board, *image, progress);
+        break;
+    case Protocol::Avr109:
+    case Protocol::Stk500v2:
+        // Both need something the remote pipe does not give us: avr109 waits
+        // for the port to disappear and reappear under a new name, which is a
+        // USB event that does not happen here, and stk500v2 is only on parts
+        // whose flash the code generator cannot address yet.
+        result.error = board->name + " uses a bootloader ardio cannot yet drive "
+                                     "over a remote UART.";
+        result.stage = "transport";
+        break;
+    }
+
+    if (!result.ok) {
+        std::fprintf(stderr, "error [%s]: %s\n", result.stage.c_str(),
+                     result.error.c_str());
+        return 1;
+    }
+    std::printf("uploaded %zu bytes to %s\n", image->data.size(), wb->name.c_str());
+    return 0;
+}
+
+// `ardio configure wifi <name>` -- records how to reach a board that is wired
+// to a remote host's UART.
+int cmd_configure(const Args& args) {
+    if (args.positional != "wifi") {
+        std::fprintf(stderr,
+                     "usage: ardio configure wifi <name> -host <user@host> "
+                     "[-device /dev/serial0] [-board <id>]\n");
+        return 2;
+    }
+    if (args.positional2.empty()) {
+        std::fprintf(stderr, "error: configure wifi needs a name for the board, "
+                             "which is what 'ardio wifi flash <name>' will take\n");
+        return 2;
+    }
+    if (args.host.empty()) {
+        std::fprintf(stderr,
+                     "error: configure wifi needs -host, as ssh would take it, "
+                     "e.g. -host user@hostname.local\n");
+        return 2;
+    }
+
+    WifiConfig config;
+    std::string error;
+    if (!load_wifi_config(config, error)) {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+    }
+
+    WifiBoard board;
+    board.name = args.positional2;
+    board.board_id = args.board.empty() ? "esp8266" : args.board;
+    board.host = args.host;
+    board.device = args.device.empty() ? "/dev/serial0" : args.device;
+    board.ssid = args.ssid;
+    board.reset_gpio = args.reset_gpio;
+    board.boot_gpio = args.boot_gpio;
+    if (!args.gpio_chip.empty()) board.gpio_chip = args.gpio_chip;
+
+    if (!find_board_by_id(board.board_id)) {
+        std::fprintf(stderr, "error: no board called '%s'. Try 'ardio boards'.\n",
+                     board.board_id.c_str());
+        return 2;
+    }
+
+    // Replacing an existing entry is the expected thing when a host or device
+    // moves, so reconfiguring the same name updates it rather than adding a
+    // second entry that shadows the first.
+    bool replaced = false;
+    for (WifiBoard& existing : config.boards) {
+        if (existing.name == board.name) { existing = board; replaced = true; break; }
+    }
+    if (!replaced) config.boards.push_back(board);
+
+    if (!save_wifi_config(config, error)) {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+    }
+
+    std::printf("%s '%s': %s on %s at %s\n", replaced ? "updated" : "configured",
+                board.name.c_str(), board.board_id.c_str(), board.host.c_str(),
+                board.device.c_str());
+    std::printf("written to %s\n", wifi_config_path().c_str());
+
+    if (board.reset_gpio == 0) {
+        // Worth saying now rather than letting the first flash fail. A header
+        // UART has no modem control lines, so nothing can pulse RESET.
+        std::printf("\nnote: no -reset-gpio was given, so ardio cannot reset the "
+                    "board itself.\n"
+                    "      A UART on a GPIO header has no DTR or RTS line, so "
+                    "flashing will ask\n"
+                    "      you to press reset by hand. Wire RESET to a GPIO and "
+                    "pass -reset-gpio <n>\n"
+                    "      to make it automatic.\n");
     }
     return 0;
 }
@@ -546,6 +768,11 @@ void print_help() {
         "  dump [file.hex]    save the board's current firmware\n"
         "  monitor            open the serial monitor\n"
         "  emulate [sketch]   run a sketch on a virtual board\n"
+        "  configure wifi <name> -host <user@host>\n"
+        "                     record a board reached over the network\n"
+        "  wifi flash <name> <sketch>\n"
+        "                     build and upload to a configured remote board\n"
+        "  wifi list          show configured remote boards\n"
         "  ports              list serial ports\n"
         "  boards             list supported boards\n"
         "  doctor             diagnose toolchains and ports\n"
@@ -566,7 +793,15 @@ void print_help() {
         "  -for <time>        how long to run: 2s, 500ms, 1000c (default 1s)\n"
         "  -wire <kind:pin>   attach a part, e.g. -wire led:13 (repeatable)\n"
         "  -input <text>      feed this to the sketch's serial input\n"
-        "  -explain           report which execution core was selected\n");
+        "  -explain           report which execution core was selected\n"
+        "\n"
+        "configure wifi options:\n"
+        "  -host <user@host>  the machine the board is wired to\n"
+        "  -device <path>     serial device there (default /dev/serial0)\n"
+        "  -board <id>        which board it is (default esp8266)\n"
+        "  -ssid <name>       the network it is on, recorded for reference\n"
+        "  -reset-gpio <n>    host GPIO wired to the board's RESET\n"
+        "  -boot-gpio <n>     host GPIO wired to GPIO0, for an ESP\n");
 }
 
 } // namespace
@@ -589,6 +824,8 @@ int run_command(const Args& args) {
     Config cfg = load_config();
 
     if (args.command == "emulate")   return cmd_emulate(args, cfg);
+    if (args.command == "configure") return cmd_configure(args);
+    if (args.command == "wifi")      return cmd_wifi(args, cfg);
 
     if (args.command == "build" || args.command == "push") {
         if (args.positional.empty()) {

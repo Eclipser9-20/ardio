@@ -100,6 +100,7 @@ struct Running {
     std::string serial;
     double host_seconds = 0.0;       // wall time spent running, never time paused
     double measured_cps = 0.0;       // cycles per host second, for the unthrottled slice
+    double sleep_seconds = 0.0;      // what the last slice owes the requested rate
     bool keeping_up = true;
     bool halted = false;
     std::string fault;

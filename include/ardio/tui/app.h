@@ -1,5 +1,6 @@
 #pragma once
 #include "ardio/board.h"
+#include "ardio/emu/board.h"
 #include "ardio/emu/machine.h"
 #include "ardio/tui/emulate_view.h"
 #include "hike/hike.h"

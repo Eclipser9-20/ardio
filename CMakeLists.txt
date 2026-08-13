@@ -23,6 +23,7 @@ add_compile_options(-Wno-unused-command-line-argument)
 add_library(libardio STATIC
     src/hex.cpp
     src/board.cpp
+    src/wifi_config.cpp
     src/monitor.cpp
     src/protocol/stk500v1.cpp
     src/protocol/programmer.cpp
@@ -30,6 +31,7 @@ add_library(libardio STATIC
     src/protocol/stk500v2.cpp
     src/protocol/avr109.cpp
     src/platform/ports_select.cpp
+    src/platform/remote_serial.cpp
     src/toolchain/config.cpp
     src/toolchain/search.cpp
     src/toolchain/fetch.cpp
@@ -106,6 +108,7 @@ add_executable(ardio_tests
     tests/main.cpp
     tests/test_harness.cpp
     tests/test_hex.cpp
+    tests/test_wifi_config.cpp
     tests/test_board.cpp
     tests/test_stk500v1.cpp
     tests/test_stk500v2.cpp
