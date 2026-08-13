@@ -191,10 +191,10 @@ static int nearest_cube_level(int v) {
  * without asking the terminal, and it keeps relative brightness right, which
  * is what legibility actually depends on. */
 static const uint8_t k_ansi16[16][3] = {
-    {  0,   0,   0}, {170,   0,   0}, {  0, 170,   0}, {170,  85,   0},
-    {  0,   0, 170}, {170,   0, 170}, {  0, 170, 170}, {170, 170, 170},
-    { 85,  85,  85}, {255,  85,  85}, { 85, 255,  85}, {255, 255,  85},
-    { 85,  85, 255}, {255,  85, 255}, { 85, 255, 255}, {255, 255, 255}
+    {  0,   0,   0}, {205,   0,   0}, {  0, 205,   0}, {205, 205,   0},
+    {  0,   0, 238}, {205,   0, 205}, {  0, 205, 205}, {229, 229, 229},
+    {127, 127, 127}, {255,   0,   0}, {  0, 255,   0}, {255, 255,   0},
+    { 92,  92, 255}, {255,   0, 255}, {  0, 255, 255}, {255, 255, 255}
 };
 
 static void index256_to_rgb(uint8_t index, int* r, int* g, int* b) {
@@ -622,7 +622,8 @@ static void install_handlers(hike_context* ctx) {
 
     for (int i = 0; i < k_fatal_count; ++i) {
         struct sigaction old;
-        if (sigaction(k_fatal_signals[i], &old, NULL) != 0) continue;
+        memset(&old, 0, sizeof old);
+        if (sigaction(k_fatal_signals[i], NULL, &old) != 0) continue;
         /* A signal the program has already chosen to ignore stays ignored.
          * Overriding that would change behaviour the program asked for, and a
          * program ignoring SIGPIPE is a common and deliberate choice. */

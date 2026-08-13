@@ -77,6 +77,20 @@ enum {
  * addressed in columns and a multi-byte character occupies one cell (or two,
  * for wide East Asian characters and many emoji). Storing bytes here would
  * make every column calculation wrong for any non-ASCII text. */
+/* The `ch` of the second cell of a wide character.
+ *
+ * A wide character occupies two columns, so the cell to its right holds no
+ * character of its own. It cannot simply be blank: a blank is a thing a caller
+ * could legitimately write, and the pair has to stay recognisable so that
+ * overwriting either half repairs the other rather than leaving half a glyph
+ * on screen.
+ *
+ * The value is not a valid Unicode scalar, so it can never collide with real
+ * content. hike_get_cell returns it for such a cell, and hike_set_cell refuses
+ * it as input -- a continuation only ever exists because a wide character was
+ * written next to it. */
+#define HIKE_CELL_CONTINUATION 0xFFFFFFFFu
+
 typedef struct {
     uint32_t ch;
     hike_color fg;
@@ -137,7 +151,15 @@ typedef enum {
 typedef struct {
     hike_mouse_kind kind;
     int x, y;           /* zero-based cell coordinates, not the wire's 1-based */
-    int button;         /* 0 left, 1 middle, 2 right */
+
+    /* 0 left, 1 middle, 2 right.
+     *
+     * SGR reporting also has a fourth encoding for motion with no button held.
+     * That arrives as HIKE_MOUSE_MOVE with this field 0, rather than as a
+     * fourth button value, because "which button" is not a meaningful question
+     * about a movement and inventing a button number for it would make every
+     * caller filter one out. */
+    int button;
     uint8_t mods;
 } hike_mouse_event;
 
@@ -145,7 +167,12 @@ typedef struct {
     hike_event_kind kind;
     hike_key_event key;
     hike_mouse_event mouse;
-    hike_rect size;        /* on RESIZE, the new terminal size in w/h */
+    /* On RESIZE, the new terminal size in w and h. x and y are always zero:
+     * a terminal has no origin to report. This should be a width/height pair
+     * rather than a rect with two dead fields, and will be once the widget
+     * layer has settled -- reusing the rect type here was convenience, and it
+     * invites a caller to read coordinates that mean nothing. */
+    hike_rect size;
     const char* paste;     /* on PASTE, UTF-8, owned by libhike until the next poll */
     size_t paste_len;
     bool focused;          /* on FOCUS */

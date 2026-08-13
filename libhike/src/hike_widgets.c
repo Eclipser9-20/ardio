@@ -213,7 +213,7 @@ int hike_layout_split(hike_layout layout, hike_rect area,
                       const hike_size* sizes, int n, hike_rect* out) {
     hike_rect inner;
     int extent, cross, gap, gaps, avail, remaining, total_weight, leftover;
-    int distributed, weighted_seen, pos, i;
+    int distributed, pos, i;
 
     if (n < 0 || !out) return 0;
     if (n > 0 && !sizes) return 0;
@@ -263,7 +263,6 @@ int hike_layout_split(hike_layout layout, hike_rect area,
      * one when the division is not exact. */
     leftover = remaining;
     distributed = 0;
-    weighted_seen = 0;
     if (total_weight > 0) {
         for (i = 0; i < n; ++i) {
             int w;
@@ -271,9 +270,7 @@ int hike_layout_split(hike_layout layout, hike_rect area,
             w = int_max(0, sizes[i].value);
             out[i].w = (int)(((long)leftover * (long)w) / (long)total_weight);
             distributed += out[i].w;
-            weighted_seen += 1;
         }
-        (void)weighted_seen;
         for (i = 0; i < n && distributed < leftover; ++i) {
             if (sizes[i].kind != HIKE_SIZE_WEIGHT) continue;
             if (int_max(0, sizes[i].value) == 0) continue;
