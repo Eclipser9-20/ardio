@@ -6,7 +6,16 @@
  * input, the rounding of a layout and the wrapping of the focus ring all
  * happen once, in C, and are observed from here.
  *
- * The one recurring piece of work that is genuinely C++'s own is lifetime. C
+ * The tree is the one thing the C API does not have, and it is worth being
+ * exact about what it does. Drawing a tree is: ask hike_layout_split for the
+ * children's rects, push the C clip for each child, call that child's C draw
+ * function, pop. That is the same sequence of public calls a C program would
+ * make by hand, in the same order, which is why the two produce identical
+ * cells. The tree holds no drawing state of its own between frames -- only the
+ * rects the last split produced, so that a mouse event can find the widget the
+ * user pointed at, which a C program would also have had to remember.
+ *
+ * The other recurring piece of work that is genuinely C++'s own is lifetime. C
  * widgets take arrays of const char* that the caller keeps alive; the C++
  * builders hold std::string, so each draw call builds a vector of pointers
  * into those strings that lives exactly as long as the C call does. It is a
@@ -108,6 +117,35 @@ std::optional<Event> Context::poll(int timeout_ms) {
 Clip::Clip(Context& ctx, Rect r) : ctx_(ctx) { ctx_.push_clip(r); }
 Clip::~Clip() { ctx_.pop_clip(); }
 
+/* ----------------------------------------------------------------- focus */
+
+void Focus::resize(int count) {
+    f_.count = count > 0 ? count : 0;
+    /* Keeping the index where it was, clamped, rather than resetting it: a
+     * frame that adds a widget must not throw the user back to the first
+     * field. hike_focus_set does the clamping, so the rule lives in C. */
+    hike_focus_set(&f_, f_.index);
+}
+
+/* ------------------------------------------------------------------ node */
+
+Node& Node::operator=(const Node& other) {
+    if (this != &other) model_ = other.model_ ? other.model_->clone() : nullptr;
+    return *this;
+}
+
+Child fixed(int cells, Node node) {
+    return Child{hike_fixed(cells), std::move(node), Rect{}};
+}
+
+Child weight(int w, Node node) {
+    return Child{hike_weight(w), std::move(node), Rect{}};
+}
+
+Child content(int cells, Node node) {
+    return Child{hike_content(cells), std::move(node), Rect{}};
+}
+
 /* ---------------------------------------------------------------- layout */
 
 Layout& Layout::pad(int horizontal, int vertical) {
@@ -124,24 +162,109 @@ Layout& Layout::pad(int left, int top, int right, int bottom) {
     return *this;
 }
 
-std::vector<Rect> Layout::split(Rect area) const { return split(area, sizes_); }
+Rect Layout::child_rect(int index) const {
+    if (index < 0 || index >= int(children_.size())) return Rect{};
+    return children_[index].rect;
+}
 
-std::vector<Rect> Layout::split(Rect area, const std::vector<Size>& sizes) const {
+void Layout::draw(Context& ctx, Rect area) {
+    area_ = area;
+    if (children_.empty()) return;
+
+    std::vector<Size> sizes;
+    sizes.reserve(children_.size());
+    for (const auto& c : children_) sizes.push_back(c.size);
+
+    std::vector<Rect> rects(children_.size());
+    hike_layout_split(l_, area, sizes.data(), int(sizes.size()), rects.data());
+
+    for (std::size_t i = 0; i < children_.size(); ++i) {
+        children_[i].rect = rects[i];
+        /* The clip is what makes a container a container: a child handed a
+         * rect narrower than it wants is cut off at its own edge instead of
+         * drawing over its neighbour. The C clip stack intersects rather than
+         * replaces, so nesting composes without anyone tracking depth. */
+        Clip clip(ctx, rects[i]);
+        children_[i].node.draw(ctx, rects[i]);
+    }
+}
+
+void Layout::draw(Context& ctx, Rect area, Focus& focus) {
+    focus.resize(focus_count());
+    int next = 0;
+    apply_focus(next, focus.index());
+    draw(ctx, area);
+}
+
+int Layout::focus_count() const {
+    int total = 0;
+    for (const auto& c : children_) total += c.node.focus_count();
+    return total;
+}
+
+void Layout::apply_focus(int& next, int active) {
+    for (auto& c : children_) c.node.apply_focus(next, active);
+}
+
+bool Layout::dispatch_tree(const Event& ev, Rect area, int& next, int active, int* hit) {
+    (void)area;   /* a container routes by its children's rects, not its own */
+    for (auto& c : children_) {
+        if (c.node.dispatch(ev, c.rect, next, active, hit)) return true;
+    }
+    return false;
+}
+
+bool Layout::dispatch(const Event& ev, Focus& focus) {
+    /* The ring first, and only Tab and Shift+Tab come back true. Everything
+     * else belongs to a widget. */
+    if (focus.key(ev)) return true;
+    /* Marking the focused widget before routing, not only on draw. A widget
+     * decides for itself whether it has the focus -- the C widgets all check
+     * their own flag -- so a Tab followed by a keystroke with no frame drawn
+     * in between would otherwise be offered to a widget that still believes it
+     * is unfocused, and would be dropped. */
+    int counter = 0;
+    apply_focus(counter, focus.index());
+
+    counter = 0;
+    int hit = -1;
+    const bool took = dispatch_tree(ev, area_, counter, focus.index(), &hit);
+    /* A click moves the focus to what was clicked, which is the behaviour
+     * every terminal UI that has a pointer at all has. */
+    if (hit >= 0) focus.set(hit);
+    return took;
+}
+
+std::vector<Rect> split(hike_layout layout, Rect area, const std::vector<Size>& sizes) {
     std::vector<Rect> out(sizes.size());
     if (sizes.empty()) return out;
-    hike_layout_split(l_, area, sizes.data(), int(sizes.size()), out.data());
+    hike_layout_split(layout, area, sizes.data(), int(sizes.size()), out.data());
     return out;
+}
+
+/* ------------------------------------------------------------------- box */
+
+Rect Box::draw(Context& ctx, Rect r) {
+    inner_ = hike_box(ctx.raw(), r, border_,
+                      title_.empty() ? nullptr : title_.c_str(), style_);
+    if (!child_.empty()) {
+        Clip clip(ctx, inner_);
+        child_.draw(ctx, inner_);
+    }
+    return inner_;
+}
+
+bool Box::dispatch_tree(const Event& ev, Rect area, int& next, int active, int* hit) {
+    (void)area;
+    return child_.dispatch(ev, inner_, next, active, hit);
 }
 
 /* --------------------------------------------------------------- widgets */
 
+int Label::measure() const { return hike_text_width(text_.c_str()); }
+
 int Label::draw(Context& ctx, Rect r) const {
     return hike_label(ctx.raw(), r, text_.c_str(), align_, style_);
-}
-
-Rect Box::draw(Context& ctx, Rect r) const {
-    return hike_box(ctx.raw(), r, border_,
-                    title_.empty() ? nullptr : title_.c_str(), style_);
 }
 
 hike_button Button::make() const {
@@ -178,6 +301,10 @@ hike_checkbox Checkbox::make() const {
     c.theme = theme_;
     return c;
 }
+
+/* "[x] " and then the label: four columns of box before the text starts, which
+ * is the same arithmetic the C widget draws with. */
+int Checkbox::measure() const { return hike_text_width(label_.c_str()) + 4; }
 
 void Checkbox::draw(Context& ctx, Rect r) const {
     hike_checkbox c = make();
@@ -256,7 +383,66 @@ Input::Input(std::size_t capacity) : buf_(capacity ? capacity : 1, '\0') {
     in_ = hike_input_make(buf_.data(), buf_.size());
 }
 
+/* The copy and move members exist for one reason: hike_input::buf points into
+ * this object's own vector, and the default members would copy that pointer
+ * verbatim, leaving the new object reading the old one's storage -- and, once
+ * the old one died, freed memory. Everything else about the C struct, the
+ * length and the cursor and the scroll, is a plain value and copies correctly.
+ * This is the only place in the wrapper where a default would be wrong. */
+void Input::repoint() {
+    in_.buf = buf_.data();
+    in_.cap = buf_.size();
+}
+
+Input::Input(const Input& other)
+    : buf_(other.buf_), in_(other.in_), placeholder_(other.placeholder_),
+      masked_(other.masked_), focused_(other.focused_), theme_(other.theme_),
+      on_change_(other.on_change_) {
+    repoint();
+}
+
+Input::Input(Input&& other) noexcept
+    : buf_(std::move(other.buf_)), in_(other.in_),
+      placeholder_(std::move(other.placeholder_)), masked_(other.masked_),
+      focused_(other.focused_), theme_(other.theme_),
+      on_change_(std::move(other.on_change_)) {
+    repoint();
+    other.buf_.assign(1, '\0');
+    other.in_ = hike_input_make(other.buf_.data(), other.buf_.size());
+}
+
+Input& Input::operator=(const Input& other) {
+    if (this != &other) {
+        buf_ = other.buf_;
+        in_ = other.in_;
+        placeholder_ = other.placeholder_;
+        masked_ = other.masked_;
+        focused_ = other.focused_;
+        theme_ = other.theme_;
+        on_change_ = other.on_change_;
+        repoint();
+    }
+    return *this;
+}
+
+Input& Input::operator=(Input&& other) noexcept {
+    if (this != &other) {
+        buf_ = std::move(other.buf_);
+        in_ = other.in_;
+        placeholder_ = std::move(other.placeholder_);
+        masked_ = other.masked_;
+        focused_ = other.focused_;
+        theme_ = other.theme_;
+        on_change_ = std::move(other.on_change_);
+        repoint();
+        other.buf_.assign(1, '\0');
+        other.in_ = hike_input_make(other.buf_.data(), other.buf_.size());
+    }
+    return *this;
+}
+
 Input& Input::text(std::string_view value) {
+    repoint();
     const std::string s = terminated(value);
     hike_input_set_text(&in_, s.c_str());
     return *this;
@@ -267,8 +453,7 @@ std::string_view Input::value() const {
 }
 
 void Input::sync() {
-    in_.buf = buf_.data();
-    in_.cap = buf_.size();
+    repoint();
     in_.masked = masked_;
     in_.focused = focused_;
     in_.theme = theme_;
@@ -327,6 +512,14 @@ hike_tabs Tabs::make(std::vector<const char*>& storage) const {
     t.focused = focused_;
     t.theme = theme_;
     return t;
+}
+
+/* Each tab is its label with a space either side, which is the same width the
+ * C widget draws and hit-tests with. */
+int Tabs::measure() const {
+    int total = 0;
+    for (const auto& l : labels_) total += hike_text_width(l.c_str()) + 2;
+    return total;
 }
 
 void Tabs::draw(Context& ctx, Rect r) const {

@@ -578,42 +578,242 @@ TEST(hike_focus_ring_routes_keys_to_exactly_one_widget) {
 }
 
 // ------------------------------------------------------------------ C++ ---
+//
+// The wrapper is faithful only if it is indistinguishable at the cells, so the
+// tree tests below draw the same screen twice -- once by hand through the C
+// API, once through hike::row -- and compare every cell. Everything else here
+// tests what the tree adds over C: ownership by value, focus numbered by
+// traversal order, and events routed to the widget the layout put under the
+// pointer.
 
-TEST(hike_cpp_builder_draws_the_same_cells_as_the_c_calls) {
-    // The wrapper is faithful only if it is indistinguishable at the cells.
-    Ctx c_ctx(20, 3);
-    Ctx cpp_ctx(20, 3);
+TEST(hike_cpp_tree_draws_the_same_cells_as_the_c_calls) {
+    Ctx c_ctx(24, 3);
+    Ctx cpp_ctx(24, 3);
 
-    hike_button b = hike_button_make("Save");
-    b.focused = true;
-    hike_button_draw(c_ctx, (hike_rect){0, 0, 12, 1}, &b);
-    hike_box(c_ctx, (hike_rect){0, 1, 12, 2}, HIKE_BORDER_ROUNDED, "Log", hike_style_default());
+    // By hand in C: split, then draw each widget into its rect.
+    {
+        const hike_size sizes[] = {hike_fixed(12), hike_weight(1)};
+        hike_rect rects[2];
+        hike_layout l = hike_row();
+        l.gap = 1;
+        hike_layout_split(l, (hike_rect){0, 0, 24, 3}, sizes, 2, rects);
 
-    hike::Context cpp = hike::Context::adopt(cpp_ctx.ctx);
-    hike::button("Save").width(12).focused().draw(cpp, hike::Rect{0, 0, 20, 1});
-    hike::box("Log").rounded().draw(cpp, hike::Rect{0, 1, 12, 2});
-    (void)cpp.raw();   // keep the adopted pointer alive for the comparison below
+        hike_button b = hike_button_make("Save");
+        b.focused = true;
+        hike_button_draw(c_ctx, rects[0], &b);
+        hike_label(c_ctx, rects[1], "status", HIKE_ALIGN_LEFT, hike_style_default());
+    }
 
-    CHECK(grids_equal(c_ctx, cpp_ctx, 20, 3));
-    CHECK(row_text(cpp_ctx, 0, 0, 12) == "  [ Save ]  ");
+    // The same screen as a tree. The layout, the rects and the draws are the
+    // same C calls in the same order; only the way it is written differs.
+    {
+        hike::Context ctx = hike::Context::adopt(cpp_ctx.ctx);
+        cpp_ctx.ctx = nullptr;
 
-    // Adopt took ownership, so release it before Ctx frees the same pointer.
-    // Moving into a temporary that is immediately destroyed would shut it
-    // down; instead the fixture frees it, so the wrapper must not.
-    hike::Context sink = std::move(cpp);
-    cpp_ctx.ctx = nullptr;                 // the wrapper owns it now
-    (void)sink;
+        auto ui = hike::row(
+            hike::fixed(12, hike::button("Save").focused()),
+            hike::weight(1, hike::label("status"))
+        ).gap(1);
+        ui.draw(ctx, hike::Rect{0, 0, 24, 3});
+
+        CHECK(grids_equal(c_ctx, ctx.raw(), 24, 3));
+        CHECK(row_text(ctx.raw(), 0, 0, 24) == "  [ Save ]   status     ");
+    }
 }
 
-TEST(hike_cpp_layout_matches_the_c_split) {
+TEST(hike_cpp_tree_owns_its_children_by_value) {
+    // Every child here is a temporary that is dead by the time draw runs. If
+    // the tree held references this would be reading freed memory, so the test
+    // is that the text still appears.
+    Ctx raw(20, 2);
+    hike::Context ctx = hike::Context::adopt(raw.ctx);
+    raw.ctx = nullptr;
+
+    hike::Layout ui = hike::column(
+        hike::fixed(1, hike::label(std::string("first"))),
+        hike::fixed(1, hike::label(std::string("second")))
+    );
+    ui.draw(ctx, hike::Rect{0, 0, 20, 2});
+    CHECK(row_text(ctx.raw(), 0, 0, 6) == "first ");
+    CHECK(row_text(ctx.raw(), 1, 0, 7) == "second ");
+}
+
+TEST(hike_cpp_tree_nests_and_a_container_clips_its_children) {
+    // A row inside a column, and a label wider than the cell it was given. The
+    // container pushes the C clip, so the label is cut at its own edge instead
+    // of running into its neighbour.
+    Ctx raw(12, 2);
+    hike::Context ctx = hike::Context::adopt(raw.ctx);
+    raw.ctx = nullptr;
+
+    auto ui = hike::column(
+        hike::fixed(1, hike::row(
+            hike::fixed(4, hike::label("abcdefghij")),
+            hike::weight(1, hike::label("XY"))
+        )),
+        hike::weight(1, hike::label("bottom"))
+    );
+    ui.draw(ctx, hike::Rect{0, 0, 12, 2});
+    CHECK(row_text(ctx.raw(), 0, 0, 12) == "abcdXY      ");
+    CHECK(row_text(ctx.raw(), 1, 0, 6) == "bottom");
+}
+
+TEST(hike_cpp_tree_uses_the_c_rounding_unchanged) {
+    // Three equal weights across ten columns is 4, 3, 3 in C, and the tree
+    // must not have opinions of its own about that.
+    Ctx raw(10, 1);
+    hike::Context ctx = hike::Context::adopt(raw.ctx);
+    raw.ctx = nullptr;
+
+    auto ui = hike::row(hike::label("a"), hike::label("b"), hike::label("c"));
+    ui.draw(ctx, hike::Rect{0, 0, 10, 1});
+    CHECK_EQ(ui.child_rect(0).w, 4);
+    CHECK_EQ(ui.child_rect(1).w, 3);
+    CHECK_EQ(ui.child_rect(2).w, 3);
+    CHECK(row_text(ctx.raw(), 0, 0, 10) == "a   b  c  ");
+}
+
+TEST(hike_cpp_content_child_measures_the_widget) {
+    // A content-sized child asks the widget how wide it wants to be, so the
+    // number in the layout cannot drift from the text in the widget.
+    Ctx raw(20, 1);
+    hike::Context ctx = hike::Context::adopt(raw.ctx);
+    raw.ctx = nullptr;
+
+    auto ui = hike::row(
+        hike::content(hike::button("Ok")),      // "[ Ok ]" is six columns
+        hike::weight(1, hike::label("rest"))
+    );
+    ui.draw(ctx, hike::Rect{0, 0, 20, 1});
+    CHECK_EQ(ui.child_rect(0).w, 6);
+    CHECK_EQ(ui.child_rect(1).x, 6);
+    CHECK(row_text(ctx.raw(), 0, 0, 12) == "[ Ok ]rest  ");
+}
+
+TEST(hike_cpp_box_draws_a_child_inside_its_frame) {
+    Ctx raw(10, 4);
+    hike::Context ctx = hike::Context::adopt(raw.ctx);
+    raw.ctx = nullptr;
+
+    auto ui = hike::box("T").ascii().child(hike::label("hi"));
+    ui.draw(ctx, hike::Rect{0, 0, 8, 3});
+    CHECK(row_text(ctx.raw(), 0, 0, 8) == "+ T ---+");
+    CHECK(row_text(ctx.raw(), 1, 0, 8) == "|hi    |");
+}
+
+TEST(hike_cpp_focus_is_numbered_by_traversal_order) {
+    // Three focusable widgets in two nested containers, and one label that is
+    // not focusable and must not take a number. The assertion is on the cells:
+    // the focused button is the bold one, and typing reaches one input only.
+    Ctx raw(30, 3);
+    hike::Context ctx = hike::Context::adopt(raw.ctx);
+    raw.ctx = nullptr;
+
+    hike::Focus focus;
+    auto ui = hike::column(
+        hike::fixed(1, hike::label("title")),
+        hike::fixed(1, hike::row(
+            hike::weight(1, hike::Input(32)),
+            hike::weight(1, hike::Input(32))
+        )),
+        hike::fixed(1, hike::button("Go"))
+    );
+
+    ui.draw(ctx, hike::Rect{0, 0, 30, 3}, focus);
+    CHECK_EQ(focus.count(), 3);      // the label is not in the ring
+    CHECK_EQ(focus.index(), 0);
+
+    // Typing goes to the first input and to nothing else.
+    hike::Event z = char_event('z');
+    CHECK(ui.dispatch(z, focus));
+    ui.draw(ctx, hike::Rect{0, 0, 30, 3}, focus);
+    CHECK(row_text(ctx.raw(), 1, 0, 2) == "z ");
+    CHECK(row_text(ctx.raw(), 1, 15, 2) == "  ");
+
+    // Tab moves to the second input, and the next character lands there.
+    hike::Event tab = key_event(HIKE_KEY_TAB);
+    CHECK(ui.dispatch(tab, focus));
+    CHECK_EQ(focus.index(), 1);
+    hike::Event q = char_event('q');
+    CHECK(ui.dispatch(q, focus));
+    ui.draw(ctx, hike::Rect{0, 0, 30, 3}, focus);
+    CHECK(row_text(ctx.raw(), 1, 0, 2) == "z ");
+    CHECK(row_text(ctx.raw(), 1, 15, 2) == "q ");
+
+    // Tab again reaches the button, which is third in traversal order.
+    CHECK(ui.dispatch(tab, focus));
+    CHECK_EQ(focus.index(), 2);
+    hike::Event enter = key_event(HIKE_KEY_ENTER);
+    CHECK(ui.dispatch(enter, focus));
+
+    // And Shift+Tab wraps back round the other way.
+    hike::Event shift_tab = key_event(HIKE_KEY_TAB, 0, HIKE_MOD_SHIFT);
+    CHECK(ui.dispatch(shift_tab, focus));
+    CHECK_EQ(focus.index(), 1);
+    for (int i = 0; i < 2; ++i) CHECK(ui.dispatch(shift_tab, focus));
+    CHECK_EQ(focus.index(), 2);      // wrapped past the start
+}
+
+TEST(hike_cpp_a_key_reaches_the_focused_widget_and_no_other) {
+    // The same rule as the C test, now with the tree doing the routing: only
+    // one of two buttons may fire, whichever the ring points at.
+    int first = 0, second = 0;
+    hike::Focus focus;
+    auto ui = hike::row(
+        hike::weight(1, hike::button("A").on_click([&] { ++first; })),
+        hike::weight(1, hike::button("B").on_click([&] { ++second; }))
+    );
+
+    Ctx raw(20, 1);
+    hike::Context ctx = hike::Context::adopt(raw.ctx);
+    raw.ctx = nullptr;
+    ui.draw(ctx, hike::Rect{0, 0, 20, 1}, focus);
+
+    hike::Event enter = key_event(HIKE_KEY_ENTER);
+    CHECK(ui.dispatch(enter, focus));
+    CHECK_EQ(first, 1);
+    CHECK_EQ(second, 0);
+
+    hike::Event tab = key_event(HIKE_KEY_TAB);
+    ui.dispatch(tab, focus);
+    ui.draw(ctx, hike::Rect{0, 0, 20, 1}, focus);
+    CHECK(ui.dispatch(enter, focus));
+    CHECK_EQ(first, 1);
+    CHECK_EQ(second, 1);
+}
+
+TEST(hike_cpp_a_click_goes_where_the_pointer_is_and_takes_the_focus) {
+    int clicks = 0;
+    hike::Focus focus;
+    auto ui = hike::row(
+        hike::weight(1, hike::button("A")),
+        hike::weight(1, hike::button("B").on_click([&] { ++clicks; }))
+    );
+
+    Ctx raw(20, 1);
+    hike::Context ctx = hike::Context::adopt(raw.ctx);
+    raw.ctx = nullptr;
+    ui.draw(ctx, hike::Rect{0, 0, 20, 1}, focus);
+    CHECK_EQ(focus.index(), 0);
+
+    hike::Event ev{};
+    ev.kind = HIKE_EVENT_MOUSE;
+    ev.mouse.kind = HIKE_MOUSE_PRESS;
+    ev.mouse.x = 15;     // inside the second child, which spans columns 10..19
+    ev.mouse.y = 0;
+    CHECK(ui.dispatch(ev, focus));
+    CHECK_EQ(clicks, 1);
+    CHECK_EQ(focus.index(), 1);   // the click moved the focus to what it hit
+}
+
+TEST(hike_cpp_split_matches_the_c_split) {
     hike::Rect area{0, 0, 10, 4};
-    std::vector<hike::Rect> got = hike::row().add(hike::weight(1))
-                                             .add(hike::weight(1))
-                                             .add(hike::weight(1))
-                                             .split(area);
-    const hike_size sizes[] = {hike_weight(1), hike_weight(1), hike_weight(1)};
+    const std::vector<hike::Size> sizes = {hike::weight(1), hike::weight(1), hike::weight(1)};
+    std::vector<hike::Rect> got = hike::split(hike_row(), area, sizes);
+
+    const hike_size want_sizes[] = {hike_weight(1), hike_weight(1), hike_weight(1)};
     hike_rect want[3];
-    hike_layout_split(hike_row(), area, sizes, 3, want);
+    hike_layout_split(hike_row(), area, want_sizes, 3, want);
 
     CHECK_EQ(int(got.size()), 3);
     for (int i = 0; i < 3; ++i) {
@@ -656,6 +856,27 @@ TEST(hike_cpp_input_owns_its_buffer_and_scrolls_like_the_c_widget) {
     CHECK(row_text(ctx.raw(), 0, 0, 6) == "abcdef");
 }
 
+TEST(hike_cpp_input_survives_being_copied_into_a_tree) {
+    // An Input's C struct points into the Input's own buffer, so a copy that
+    // kept the original's pointer would read the original's storage and then,
+    // once it died, freed memory. Copying is not exotic here: putting a widget
+    // into a tree does it.
+    hike::Input original(32);
+    original.text("hello");
+    hike::Input copy = original;
+    original.text("gone");
+    CHECK(copy.value() == "hello");
+
+    hike::Input moved = std::move(copy);
+    CHECK(moved.value() == "hello");
+
+    Ctx raw(10, 1);
+    hike::Context ctx = hike::Context::adopt(raw.ctx);
+    raw.ctx = nullptr;
+    moved.draw(ctx, hike::Rect{0, 0, 10, 1});
+    CHECK(row_text(ctx.raw(), 0, 0, 6) == "hello ");
+}
+
 TEST(hike_cpp_list_reports_the_scroll_the_c_widget_chose) {
     Ctx raw(6, 2);
     hike::Context ctx = hike::Context::adopt(raw.ctx);
@@ -683,6 +904,17 @@ TEST(hike_cpp_focus_wraps_like_the_c_ring) {
     CHECK(f.key(shift_tab));
     CHECK_EQ(f.index(), 2);
     CHECK(f.has(2));
+}
+
+TEST(hike_cpp_focus_resize_keeps_the_index_where_it_can) {
+    // A frame that adds a widget must not throw the user back to the first
+    // field, and one that removes the focused widget must land somewhere real.
+    hike::Focus f(3);
+    f.set(2);
+    f.resize(5);
+    CHECK_EQ(f.index(), 2);
+    f.resize(2);
+    CHECK_EQ(f.index(), 1);
 }
 
 TEST(hike_cpp_context_restores_the_terminal_on_an_exception) {
