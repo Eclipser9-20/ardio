@@ -26,6 +26,7 @@ add_library(libardio STATIC
     src/monitor.cpp
     src/protocol/stk500v1.cpp
     src/protocol/programmer.cpp
+    src/protocol/esp_rom.cpp
     src/platform/ports_select.cpp
     src/toolchain/config.cpp
     src/toolchain/search.cpp
@@ -116,6 +117,7 @@ add_executable(ardio_tests
     tests/test_lightweight.cpp
     tests/test_peephole.cpp
     tests/test_flash_data.cpp
+    tests/test_esp_rom.cpp
 )
 target_link_libraries(ardio_tests PRIVATE libardio)
 target_include_directories(ardio_tests PRIVATE tests)

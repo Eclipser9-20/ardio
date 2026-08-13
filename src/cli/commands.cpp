@@ -210,6 +210,27 @@ bool resolve(const Args& args, const Config& cfg, PortInfo& out_port,
     std::string want_port = args.port.empty() ? cfg.default_port : args.port;
     std::string want_board = args.board.empty() ? cfg.default_board : args.board;
 
+    // --manual means "this port or nothing". Say so plainly rather than
+    // letting the generic "no serial ports found" advice stand in for it.
+    if (args.port_is_manual) {
+        bool present = false;
+        for (const PortInfo& p : ports)
+            if (p.device == args.port) { present = true; break; }
+        if (!present) {
+            std::string found;
+            for (const PortInfo& p : ports) {
+                found += "\n  " + p.device;
+                if (!p.description.empty()) found += "  (" + p.description + ")";
+            }
+            if (found.empty()) found = " none";
+            std::fprintf(stderr,
+                         "error: --manual named '%s', but that port does not exist.\n"
+                         "ports found:%s\n",
+                         args.port.c_str(), found.c_str());
+            return false;
+        }
+    }
+
     PortSelection sel = select_port(ports, want_port, want_board);
     if (!sel.port || !sel.board) {
         std::fprintf(stderr, "error: %s\n", sel.error.c_str());
@@ -315,13 +336,14 @@ void print_help() {
         "  toolchain fetch <pkg>\n"
         "                     download a toolchain (asks first)\n"
         "\n"
-        "options:\n"
-        "  --port <device>    serial port (default: auto-detect)\n"
-        "  --board <id>       board id (default: from USB id)\n"
-        "  --baud <n>         monitor baud rate\n"
-        "  -m, --monitor      open the monitor after a successful push\n"
-        "  --backup [file]    save existing firmware before overwriting it\n"
-        "  -h, --help         show this help\n");
+        "options (one dash or two -- '-port' and '--port' are the same):\n"
+        "  -port <device>     serial port (default: auto-detect)\n"
+        "  -manual <device>   use exactly this port, never auto-detect\n"
+        "  -board <id>        board id (default: from USB id)\n"
+        "  -baud <n>          monitor baud rate\n"
+        "  -monitor, -m       open the monitor after a successful push\n"
+        "  -backup [file]     save existing firmware before overwriting it\n"
+        "  -help, -h          show this help\n");
 }
 
 } // namespace

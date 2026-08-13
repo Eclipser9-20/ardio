@@ -8,6 +8,7 @@ struct Args {
     std::string positional;  // sketch/hex path, or a subcommand
     std::string positional2; // second operand, e.g. "toolchain fetch <pkg>"
     std::string port;
+    bool port_is_manual = false;  // named via --manual: never auto-detect
     std::string board;
     int baud = 0;            // 0 = use config/board default
     bool monitor_after = false;

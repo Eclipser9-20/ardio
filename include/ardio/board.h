@@ -7,7 +7,7 @@
 
 namespace ardio {
 
-enum class Protocol { Stk500v1 };
+enum class Protocol { Stk500v1, EspRom };
 
 struct UsbId {
     uint16_t vid = 0;

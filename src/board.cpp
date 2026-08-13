@@ -19,6 +19,34 @@ const std::vector<Board>& board_database() {
             .gcc_mcu = "atmega328p",
             .f_cpu = 16000000,
         },
+        Board{
+            .id = "esp8266",
+            .name = "ESP8266 (NodeMCU / ESP-12E / ESP-12F)",
+            .mcu = "esp8266",
+            .protocol = Protocol::EspRom,
+            // 10C4:EA60 is the CP2102 bridge on NodeMCU v2 boards.
+            //
+            // These boards also ship with a CH340 (1A86:7523) -- but that pair
+            // is the Nano's, and the two are genuinely indistinguishable over
+            // USB: same bridge chip, no serial number, nothing downstream of it
+            // is visible to the host. Claiming it here would make every CH340
+            // port match two boards, and select_port() would (correctly) refuse
+            // to guess -- which would break auto-detection for the Nano, the
+            // common case, to serve the rarer one. So the CH340 stays with the
+            // Nano and a CH340-based ESP8266 needs an explicit --board esp8266.
+            .usb_ids = {{0x10C4, 0xEA60}},
+            // The ROM loader autobauds, so one rate is enough.
+            .baud_rates = {115200},
+            // Flash is an external SPI chip, 4 MB on the usual modules, written
+            // in 4096-byte blocks rather than in on-die pages.
+            .flash_size = 4 * 1024 * 1024,
+            .page_size = 4096,
+            // No AVR-style signature bytes exist. Identity is a 32-bit word
+            // read from a register instead -- see esp_rom::kEsp8266ChipId.
+            .signature = {0x00, 0x00, 0x00},
+            .gcc_mcu = "",     // not an avr-gcc target
+            .f_cpu = 80000000,
+        },
     };
     return db;
 }
