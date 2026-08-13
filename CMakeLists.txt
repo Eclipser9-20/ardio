@@ -47,6 +47,8 @@ add_library(libardio STATIC
     libhike/src/hike_unicode.c
     libhike/src/hike_widgets.c
     libhike/src/hike_cpp.cpp
+    src/tui/emulate_view.cpp
+    src/tui/emulate_app.cpp
     src/emu/peripherals.cpp
     src/avr/lexer.cpp
     src/avr/preprocess.cpp
@@ -116,6 +118,8 @@ add_executable(ardio_tests
     libhike/tests/test_hike_buffer.cpp
     libhike/tests/test_hike_input.cpp
     libhike/tests/test_hike_widgets.cpp
+    tests/test_tui_view.cpp
+    tests/test_tui_app.cpp
     tests/test_emu_peripherals.cpp
     tests/test_serial_fake.cpp
     tests/test_programmer.cpp
