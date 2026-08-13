@@ -19,6 +19,12 @@
 #include <memory>
 
 namespace ardio::emu {
+
+// Defined in core_arm64.cpp. Declared here rather than in a header because the
+// translator is an implementation detail of core selection: nothing should be
+// able to ask for it by name and bypass the fallback.
+std::unique_ptr<Core> make_arm64_core(const avr::AvrDevice& device);
+
 namespace {
 
 // The native translator, when there is one.
@@ -34,8 +40,13 @@ namespace {
 // instead of null, with its declaration above -- and no change anywhere else,
 // because everything downstream already goes through Core.
 std::unique_ptr<Core> make_native_core(const avr::AvrDevice& device) {
-    (void)device;
-    return nullptr;
+    // Returns null on a host that is not ARM64, and also when the executable
+    // memory it needs is refused -- a sandbox or a hardened runtime without
+    // the JIT entitlement will do that. Both cases fall through to the
+    // reference core rather than failing, so emulation always works
+    // somewhere; the difference is speed, and --explain reports which one the
+    // caller actually got.
+    return make_arm64_core(device);
 }
 
 } // namespace

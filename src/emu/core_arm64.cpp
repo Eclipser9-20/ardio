@@ -577,7 +577,32 @@ private:
 
     // Calls one of the trampolines. Arguments must already be in w2 upwards;
     // x0 and x1 are filled in here because they are always the same two.
+    //
+    // The running cycle count is committed to State first, and that store is
+    // not an optimisation that was forgotten -- it is load-bearing. A block
+    // keeps its cycle count in x21 and writes it back once at exit, but a data
+    // access reaches a peripheral, and a peripheral dates that access from
+    // State::cycles because nothing on the interface carries a cycle count with
+    // it. Leaving the count in a register would date every access in a block at
+    // the cycle the BLOCK started rather than the cycle the instruction ran, so
+    // two stores in one block would share a timestamp.
+    //
+    // That is invisible to a differential test on final state -- the totals
+    // still agree -- and it is fatal to anything that measures an interval. A
+    // servo reads its angle from the width between a rising and a falling edge,
+    // and a buzzer its frequency from the gap between rising edges; two edges
+    // sharing a cycle make a pulse zero wide, which comes out as a confident
+    // wrong answer rather than an error.
+    //
+    // x21 is still authoritative afterwards: nothing behind these trampolines
+    // writes State::cycles, so the store at block exit remains correct.
+    //
+    // The value stored is the count BEFORE this instruction, because a block
+    // charges an instruction's cycles after emitting it, which is the same
+    // moment the reference core charges them. An access is therefore dated at
+    // the cycle its instruction started, in both cores.
     void call(void* fn) {
+        a_.str64(kCycles, kState, kOffCycles);
         a_.mov64(0, kCore);
         a_.mov64(1, kState);
         a_.movi64(8, uint64_t(reinterpret_cast<uintptr_t>(fn)));

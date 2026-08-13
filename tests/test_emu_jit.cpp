@@ -964,6 +964,74 @@ private:
     uint16_t base_;
 };
 
+// A peripheral that records every access it is given, and when.
+//
+// Comparing final state cannot see a timing bug: a core that dated every access
+// in a block at the cycle the block started still ends with the right registers
+// and the right cycle total, and only the stamps in between are wrong. Nothing
+// downstream tolerates that -- every part that measures an interval reads it
+// from these stamps -- so the sequence itself is the thing under test.
+//
+// The cycle is taken from `advance`, which is how a real peripheral learns the
+// time: the board advances it to the current cycle immediately before handing
+// it an access, so the value latched here is what any timing part would use.
+class AccessLog : public Peripheral {
+public:
+    struct Access {
+        bool write = false;
+        uint16_t addr = 0;
+        uint8_t value = 0;
+        uint64_t cycles = 0;
+    };
+
+    explicit AccessLog(uint16_t base) : base_(base) {}
+
+    bool claims(uint16_t addr) const override { return addr >= base_ && addr < base_ + 8; }
+
+    uint8_t read(uint16_t addr) override {
+        uint8_t v = regs[addr - base_];
+        log.push_back({false, addr, v, now_});
+        return v;
+    }
+    void write(uint16_t addr, uint8_t value) override {
+        regs[addr - base_] = value;
+        log.push_back({true, addr, value, now_});
+    }
+    void advance(uint64_t cycles) override { now_ = cycles; }
+
+    std::vector<Access> log;
+    uint8_t regs[8] = {};
+
+private:
+    uint16_t base_;
+    uint64_t now_ = 0;
+};
+
+// Stands in for the board's proxy, which is what actually keeps the rule that a
+// peripheral is advanced to the current cycle before every access. The core
+// does not do that itself -- correctly, since the obligation lives in one place
+// rather than once per core -- so a test exercising access timing has to supply
+// it, or it would be testing a peripheral that was never told the time.
+class TimedProxy : public Peripheral {
+public:
+    TimedProxy(Peripheral* inner, const State* state) : inner_(inner), state_(state) {}
+
+    bool claims(uint16_t addr) const override { return inner_->claims(addr); }
+    uint8_t read(uint16_t addr) override {
+        inner_->advance(state_->cycles);
+        return inner_->read(addr);
+    }
+    void write(uint16_t addr, uint8_t value) override {
+        inner_->advance(state_->cycles);
+        inner_->write(addr, value);
+    }
+    void advance(uint64_t cycles) override { inner_->advance(cycles); }
+
+private:
+    Peripheral* inner_;
+    const State* state_;
+};
+
 // Raises one interrupt the first time it is asked, which is the smallest thing
 // that makes a core vector.
 class OneShot : public Peripheral {
@@ -1020,6 +1088,84 @@ TEST(jit_peripheral_accesses_match_the_reference) {
     CHECK_EQ(ref_latch.reads, jit_latch.reads);
     CHECK_EQ(ref_latch.writes, jit_latch.writes);
     for (int k = 0; k < 4; ++k) CHECK_EQ(int(ref_latch.regs[k]), int(jit_latch.regs[k]));
+}
+
+TEST(jit_peripheral_access_timing_matches_access_for_access) {
+    // The whole access sequence, compared entry by entry: what was touched,
+    // whether it was a read or a write, the value, and above all the cycle it
+    // happened on. This is the assertion that final-state comparison cannot
+    // make, and the class of bug it closes is a core that batches its cycle
+    // count across a block and so dates every access in that block alike.
+    //
+    // The stores are deliberately spread across a loop with arithmetic between
+    // them, so a core that dated them all at a block boundary would produce
+    // repeated stamps rather than the strictly increasing ones a part needs to
+    // measure a pulse.
+    if (!have_translator()) return;
+
+    AssembleResult a = assemble(R"(
+        ldi r26, 0x80
+        ldi r27, 0x00       ; X points at the logging peripheral
+        ldi r16, 8
+        ldi r17, 0
+    loop:
+        ldi r18, 0x01
+        st  X, r18          ; a rising edge
+        inc r17
+        add r17, r17
+        ldi r18, 0x00
+        st  X, r18          ; the matching falling edge
+        inc r17
+        lds r19, 0x0081
+        sts 0x0081, r17
+        dec r16
+        brne loop
+    )" + std::string(kHalt));
+    CHECK(a.ok);
+
+    Machine ref = build(a.code, false);
+    Machine jit = build(a.code, true);
+
+    AccessLog ref_log(0x0080), jit_log(0x0080);
+    TimedProxy ref_proxy(&ref_log, &ref.state), jit_proxy(&jit_log, &jit.state);
+    ref.core->attach(&ref_proxy);
+    jit.core->attach(&jit_proxy);
+
+    ref.result = ref.core->run(ref.state);
+    jit.result = jit.core->run(jit.state);
+
+    compare(snapshot(ref), snapshot(jit), "access timing");
+
+    CHECK_EQ(ref_log.log.size(), jit_log.log.size());
+    if (ref_log.log.size() != jit_log.log.size()) return;
+    CHECK(ref_log.log.size() >= 32);   // the loop really did run
+
+    for (size_t k = 0; k < ref_log.log.size(); ++k) {
+        const AccessLog::Access& x = ref_log.log[k];
+        const AccessLog::Access& y = jit_log.log[k];
+        std::string at = "access " + std::to_string(k);
+        if (x.write != y.write)
+            ::ardio_test::fail(__FILE__, __LINE__, at + ": read/write direction differs");
+        if (x.addr != y.addr)
+            ::ardio_test::fail(__FILE__, __LINE__, at + ": address differs");
+        if (x.value != y.value)
+            ::ardio_test::fail(__FILE__, __LINE__, at + ": value differs");
+        if (x.cycles != y.cycles)
+            ::ardio_test::fail(__FILE__, __LINE__,
+                               at + ": cycle stamp -- reference=" +
+                                   std::to_string(x.cycles) + " translator=" +
+                                   std::to_string(y.cycles));
+    }
+
+    // And independently of the comparison: consecutive accesses must fall on
+    // different cycles, because each is separated by at least one instruction.
+    // Two accesses sharing a stamp is what makes a pulse zero wide, so it is
+    // worth asserting outright rather than only against the oracle.
+    for (size_t k = 1; k < jit_log.log.size(); ++k)
+        if (jit_log.log[k].cycles <= jit_log.log[k - 1].cycles)
+            ::ardio_test::fail(__FILE__, __LINE__,
+                               "access " + std::to_string(k) +
+                                   " is not later than the one before it");
 }
 
 TEST(jit_interrupt_vectors_at_the_same_instruction) {
