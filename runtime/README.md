@@ -29,8 +29,79 @@ wrappers over those calls.
 
 ## Target
 
-ATmega328P (Arduino Uno / Nano) at 16 MHz. Pin numbers, the `A0`–`A7` numbering
-space, and the timer assumptions in `Servo.h` are all specific to that part.
+The assembly no longer names a part. Every register address, the top of RAM and
+the whole digital pin numbering reach it as generated symbols, so one runtime
+serves every AVR in ardio's device table. The clock is still assumed to be
+16 MHz by the cycle-counted delays in `ir.S`, `servo.S`, `stepper.S`, `lcd.S`,
+`button.S` and `delayMicroseconds`; `delay()` and the TWI bit rate are computed
+from `AD_F_CPU` and are correct at any clock.
+
+### How the device description reaches the assembly
+
+`src/avr/device.cpp` holds one row per AVR part. Before the runtime is
+assembled, the row for the board's MCU is rendered into a block of assembly and
+emitted alongside it (`device_prelude`, declared in
+`include/ardio/avr/device.h`, which carries the authoritative contract). That
+block defines:
+
+- **Constants.** `AD_RAMEND`, `AD_RAMSTART`, `AD_F_CPU`, `AD_NUM_PINS`,
+  `AD_NUM_ANALOG`, `AD_LED_BUILTIN`, the USART registers `AD_UCSRA`…`AD_UDR`,
+  the ADC registers `AD_ADMUX`…`AD_ADCH`, timer 0's `AD_TCCR0A`…`AD_TIFR0`, the
+  two-wire block `AD_TWBR`…`AD_TWCR`, and `AD_SREG` / `AD_SPL` / `AD_SPH`.
+
+  All of these are **data-space** addresses, reached with `lds`/`sts` — except
+  `AD_SREG`, `AD_SPL` and `AD_SPH`, which are **I/O** addresses, because those
+  three are identical on every AVR8 part and `in`/`out` is the only way the
+  runtime ever touches them.
+
+- **`__ardio_pinmap`.** Two bytes per digital pin in flash: the data-space
+  address of that pin's `PINx` register, then its bit number within the port. A
+  pin the part does not have is stored as address 0, and every caller treats a
+  zero address as "no such pin" and does nothing. Because a label is a word
+  address and `lpm` addresses bytes, pin *n*'s entry is at byte address
+  `__ardio_pinmap * 2 + n * 2`.
+
+- **`__ardio_analogmap`.** One byte per analog input: the ADC channel `An`
+  selects, or `0xFF` for a number the part does not have.
+
+Only `PINx` is stored for a pin because on every AVR the three port registers
+sit together as `PINx`, `DDRx = PINx+1`, `PORTx = PINx+2`. One `Z` pointer at
+`PINx` therefore reaches all three through the displacement forms `Z+0`, `Z+1`
+and `Z+2`, which is how `core.S`, `ir.S`, `button.S`, `servo.S` and `stepper.S`
+drive a pin whose number is only known at run time.
+
+Note that `.equ` and `.org` are resolved as the assembler walks the file, before
+the generated block has been read, so a runtime file may use an `AD_*` name in
+an **instruction operand** but must not define a `.equ` in terms of one.
+
+### Supporting a new part
+
+1. Add a row to the table in `src/avr/device.cpp`: memory sizes, the register
+   addresses from the datasheet's register summary, the board's digital pin
+   numbering and its analog channels.
+2. Point a board at it through `Board::mcu` in `src/board.cpp`.
+
+There is no step three. No assembly file changes, because none of them contain
+a part-specific number — with these exceptions, all of them documented at the
+point they occur:
+
+- `runtime/timer.S` still has the ATmega328P's vector table addresses in its
+  `.org` directives. `.org` has to be resolved while the assembler is still
+  measuring where code lands, which is before the generated block at the end of
+  the image has been read, so the vector number cannot be a symbol as things
+  stand. Timer 0's overflow vector is elsewhere on every other part in the
+  table, and this is why `timer.S` is excluded from the runtime the build
+  assembles.
+- `analogRead` in `runtime/adc.S` folds a digital pin number down to an analog
+  input number by subtracting 14, the digital pin number of `A0`. The device
+  description does not carry that number and it cannot be derived from the ones
+  it does carry: `AD_NUM_PINS - AD_NUM_ANALOG` is 14 on most parts but 12 on the
+  ATmega328P, whose table lists two ADC-only inputs that have no digital pin.
+  Guessing there would read a different pin and say nothing about it.
+- The delays listed above are calibrated for 16 MHz.
+- Each file's SRAM state is at a fixed address chosen by hand, since there is no
+  linker and no `.bss`. Those addresses fit inside the SRAM of every part in the
+  table, but a part with very little RAM would need them revisited.
 
 ## Which sketches these support
 
@@ -77,8 +148,9 @@ silent no-op stub on a microcontroller is worse than a build failure.
   constructor forms.
 - **`tone()` on more than one pin at a time**, and `pulseIn` with a timeout
   longer than the 16-bit microsecond counter.
-- **Anything not an ATmega328P.** Boards on the roadmap (RP2040, ESP32, SAMD)
-  have no runtime here.
+- **Anything that is not an AVR.** Boards on the roadmap (RP2040, ESP32, SAMD)
+  have no runtime here: the device description abstracts over AVR parts, not
+  over instruction sets.
 
 ## Conventions
 

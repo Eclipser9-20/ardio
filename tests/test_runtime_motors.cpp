@@ -7,6 +7,7 @@
 // checkout where the runtime has not been added yet.
 
 #include "harness.h"
+#include "runtime_source.h"
 
 #include "ardio/avr/assembler.h"
 
@@ -28,6 +29,9 @@ bool read_runtime(const std::string& name, std::string& out) {
         size_t n;
         while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
         std::fclose(f);
+        // The runtime is written against the device prelude's AD_* names, so
+        // on its own it is not assemblable source.
+        out += "\n" + ardio::test::default_prelude();
         return true;
     }
     return false;

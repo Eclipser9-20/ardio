@@ -1,6 +1,6 @@
-; ardio USART0 runtime for the ATmega328P at 16 MHz.
+; ardio USART runtime.
 ;
-; ardio's own serial support, written straight from the ATmega328P datasheet
+; ardio's own serial support, written straight from the megaAVR datasheets'
 ; USART chapter and assembled by ardio's own assembler (src/avr/assembler.cpp)
 ; -- no external toolchain, no third-party sources.
 ;
@@ -13,12 +13,14 @@
 ; Every routine below sticks to call-clobbered registers only, so nothing
 ; needs to be pushed.
 ;
-; USART0 lives above the 0x00-0x3F I/O space, so in/out cannot reach it and
-; every access here is lds/sts against the data-space address (datasheet
-; register summary):
-;
-;       UCSR0A 0xC0   UCSR0B 0xC1   UCSR0C 0xC2
-;       UBRR0L 0xC4   UBRR0H 0xC5   UDR0   0xC6
+; The registers are named rather than numbered: AD_UCSRA and the rest come from
+; the device description, because parts disagree about where the USART lives.
+; The ATmega328P and everything after it put it at 0xC0 and up, the ATmega32U4
+; has no USART0 at all and uses USART1 one block higher, and the ATmega8 keeps
+; the whole thing down in low I/O space. Every access is lds/sts, which reaches
+; any data-space address; in/out would be a word shorter on the ATmega8, but
+; the assembler cannot tell from a symbolic address whether that form is legal
+; and a wrong guess would land on a different register entirely.
 ;
 ; Bits used, by position:
 ;
@@ -51,15 +53,15 @@
 ; on the wire.
 serial_begin:
         ldi     r18, 0
-        sts     0xC1, r18               ; UCSR0B = 0: RX and TX off
-        sts     0xC5, r25               ; UBRR0H  -- high byte first
-        sts     0xC4, r24               ; UBRR0L  -- writing low latches both
+        sts     AD_UCSRB, r18           ; RX and TX off while the divisor moves
+        sts     AD_UBRRH, r25           ; high byte first
+        sts     AD_UBRRL, r24           ; writing the low byte latches both
         ldi     r18, 0x40
-        sts     0xC0, r18               ; UCSR0A: clear TXC0, U2X0 = 0
+        sts     AD_UCSRA, r18           ; clear TXC0, U2X0 = 0
         ldi     r18, 0x06
-        sts     0xC2, r18               ; UCSR0C: 8N1, asynchronous
+        sts     AD_UCSRC, r18           ; 8N1, asynchronous
         ldi     r18, 0x18
-        sts     0xC1, r18               ; UCSR0B: RXEN0 | TXEN0
+        sts     AD_UCSRB, r18           ; RXEN0 | TXEN0
         ret
 
 
@@ -69,10 +71,10 @@ serial_begin:
 ;   the transmitter. Clobbers only r18, which the printing helpers below rely
 ;   on -- they keep their state in r19-r27 across these calls.
 serial_write:
-        lds     r18, 0xC0               ; UCSR0A
+        lds     r18, AD_UCSRA
         sbrs    r18, 5                  ; UDRE0 set means UDR0 is free
         rjmp    serial_write
-        sts     0xC6, r24               ; UDR0
+        sts     AD_UDR, r24
         ret
 
 
@@ -169,7 +171,7 @@ __serial_digit_done:
 serial_available:
         ldi     r24, 0
         ldi     r25, 0
-        lds     r18, 0xC0               ; UCSR0A
+        lds     r18, AD_UCSRA
         sbrc    r18, 7                  ; RXC0
         ldi     r24, 1
         ret
@@ -182,10 +184,10 @@ serial_available:
 serial_read:
         ldi     r24, 0xFF               ; -1
         ldi     r25, 0xFF
-        lds     r18, 0xC0               ; UCSR0A
+        lds     r18, AD_UCSRA
         sbrs    r18, 7                  ; RXC0
         ret
-        lds     r24, 0xC6               ; UDR0
+        lds     r24, AD_UDR
         ldi     r25, 0
         ret
 
@@ -198,13 +200,13 @@ serial_read:
 ;   cleared by writing a one to it, which is done here so the next flush waits
 ;   on the next transmission rather than on this one.
 serial_flush:
-        lds     r18, 0xC0               ; UCSR0A
+        lds     r18, AD_UCSRA
         sbrs    r18, 5                  ; UDRE0
         rjmp    serial_flush
         sbrs    r18, 6                  ; TXC0
         rjmp    serial_flush
         ldi     r18, 0x40
-        sts     0xC0, r18               ; write 1 to TXC0 to clear it
+        sts     AD_UCSRA, r18           ; write 1 to TXC0 to clear it
         ret
 
 

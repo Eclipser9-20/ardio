@@ -1,4 +1,4 @@
-; ardio string runtime for the ATmega328P.
+; ardio string runtime.
 ;
 ; The character primitives behind runtime/include/WString.h, written straight
 ; against the AVR instruction set and assembled by ardio's own assembler

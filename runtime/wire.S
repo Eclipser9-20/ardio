@@ -1,14 +1,13 @@
-; ardio runtime -- I2C (TWI) master, ATmega328P at 16 MHz.
+; ardio runtime -- I2C (TWI) master.
 ;
-; Written from the ATmega328P datasheet's two-wire serial interface chapter.
-; The TWI control registers live above the 0x00-0x3F I/O window, so every
-; access here is lds/sts against the data-space address rather than in/out:
+; Written from the megaAVR datasheets' two-wire serial interface chapter. The
+; four registers it needs are named rather than numbered -- AD_TWBR is the
+; bit-rate divider, AD_TWSR the status byte whose top five bits carry the state
+; and whose low two select the prescaler, AD_TWDR the data register and AD_TWCR
+; the control register -- because the block sits at 0xB8 on the ATmega328P and
+; at 0x20 on the ATmega8. Every access is lds/sts, which reaches either.
 ;
-;     TWBR 0xB8   bit-rate divider
-;     TWSR 0xB9   status (top 5 bits) + prescaler select (low 2 bits)
-;     TWAR 0xBA   slave address (unused in master mode)
-;     TWDR 0xBB   data
-;     TWCR 0xBC   control
+; (TWAR, the slave address, is not used: this is a master-only driver.)
 ;
 ; TWCR bits: TWINT 7, TWEA 6, TWSTA 5, TWSTO 4, TWWC 3, TWEN 2, TWIE 0.
 ; Every operation is started by writing TWINT back as a 1 (which clears it)
@@ -19,21 +18,21 @@
 ; register, so no prologue is needed.
 ;
 ; SRAM: this file keeps no state at all. (lcd.S owns 0x0300-0x0301,
-; button.S owns 0x0302-0x0304.)
+; button.S owns 0x0308-0x0317.)
 
 ; ---------------------------------------------------------------------------
 ; i2c_init(void)
 ;
-; SCL = F_CPU / (16 + 2*TWBR*prescaler). With F_CPU 16 MHz, prescaler 1 and
-; TWBR 72 that is 16000000 / (16 + 144) = 100 kHz exactly.
+; SCL = F_CPU / (16 + 2*TWBR*prescaler), so with the prescaler at 1 a 100 kHz
+; bus wants TWBR = (F_CPU / 100000 - 16) / 2 -- 72 at 16 MHz, 32 at 8 MHz.
 ; ---------------------------------------------------------------------------
 i2c_init:
-        ldi     r18, 72
-        sts     0xB8, r18               ; TWBR
+        ldi     r18, (AD_F_CPU / 100000 - 16) / 2
+        sts     AD_TWBR, r18
         ldi     r18, 0
-        sts     0xB9, r18               ; TWSR: TWPS1:0 = 00 -> prescaler 1
+        sts     AD_TWSR, r18            ; TWPS1:0 = 00 -> prescaler 1
         ldi     r18, 0x04
-        sts     0xBC, r18               ; TWCR = TWEN, bus enabled and idle
+        sts     AD_TWCR, r18            ; TWEN: bus enabled and idle
         ret
 
 ; ---------------------------------------------------------------------------
@@ -44,9 +43,9 @@ i2c_init:
 ; ---------------------------------------------------------------------------
 i2c_start:
         ldi     r18, 0xA4               ; TWINT | TWSTA | TWEN
-        sts     0xBC, r18
+        sts     AD_TWCR, r18
 i2c_start_wait:
-        lds     r18, 0xBC
+        lds     r18, AD_TWCR
         sbrs    r18, 7                  ; TWINT set means START is on the wire
         rjmp    i2c_start_wait
         ret
@@ -59,9 +58,9 @@ i2c_start_wait:
 ; ---------------------------------------------------------------------------
 i2c_stop:
         ldi     r18, 0x94               ; TWINT | TWSTO | TWEN
-        sts     0xBC, r18
+        sts     AD_TWCR, r18
 i2c_stop_wait:
-        lds     r18, 0xBC
+        lds     r18, AD_TWCR
         sbrc    r18, 4                  ; TWSTO still set -> STOP in progress
         rjmp    i2c_stop_wait
         ret
@@ -74,14 +73,14 @@ i2c_stop_wait:
 ; Argument in r24, result in r24:r25.
 ; ---------------------------------------------------------------------------
 i2c_write:
-        sts     0xBB, r24               ; TWDR
+        sts     AD_TWDR, r24
         ldi     r18, 0x84               ; TWINT | TWEN -> start shifting
-        sts     0xBC, r18
+        sts     AD_TWCR, r18
 i2c_write_wait:
-        lds     r18, 0xBC
+        lds     r18, AD_TWCR
         sbrs    r18, 7
         rjmp    i2c_write_wait
-        lds     r24, 0xB9               ; TWSR
+        lds     r24, AD_TWSR            ; TWSR
         andi    r24, 0xF8               ; drop the prescaler bits
         ldi     r25, 0
         ret

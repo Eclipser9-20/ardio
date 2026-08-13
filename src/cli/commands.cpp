@@ -4,6 +4,7 @@
 #include "ardio/hex.h"
 #include "ardio/monitor.h"
 #include "ardio/platform/ports.h"
+#include "ardio/protocol/avr109.h"
 #include "ardio/protocol/programmer.h"
 #include "ardio/toolchain.h"
 
@@ -258,10 +259,40 @@ int do_flash(const std::string& hex_path, const PortInfo& port, const Board& boa
     }
 
     auto serial = make_serial_port();
-    auto result = upload_stk500v1(*serial, port.device, board, *image,
-                                  [](const std::string& msg) {
-                                      std::printf("  %s\n", msg.c_str());
-                                  });
+    auto progress = [](const std::string& msg) { std::printf("  %s\n", msg.c_str()); };
+
+    // Which conversation to have depends entirely on the board's bootloader.
+    // The protocols have nothing in common beyond the serial line they run
+    // over, so this is a real fork rather than a parameter.
+    UploadResult result;
+    switch (board.protocol) {
+    case Protocol::Stk500v1:
+        result = upload_stk500v1(*serial, port.device, board, *image, progress);
+        break;
+    case Protocol::Avr109: {
+        // These boards run USB CDC from the sketch, so the bootloader shows up
+        // as a different device at a different path once the touch reset takes
+        // effect. The uploader needs to watch the port list to find it, which
+        // is what the enumerator is for.
+        SystemPortEnumerator ports;
+        result = upload_avr109(*serial, port.device, board, *image, ports, progress);
+        break;
+    }
+    case Protocol::Stk500v2:
+        result.error = board.name +
+                       " uses the stk500v2 bootloader. ardio implements the "
+                       "protocol, but its code generator cannot yet address "
+                       "the flash above 64 KB that this part has, so there is "
+                       "nothing safe to send.";
+        result.stage = "board";
+        break;
+    case Protocol::EspRom:
+        result.error = board.name +
+                       " uses the ESP ROM loader, which expects a raw binary "
+                       "at a flash offset rather than an Intel HEX image.";
+        result.stage = "board";
+        break;
+    }
     if (!result.ok) {
         std::fprintf(stderr, "error [%s]: %s\n", result.stage.c_str(), result.error.c_str());
         return 1;

@@ -23,7 +23,7 @@
 ; SRAM state (documented so other runtime files do not collide):
 ;     0x0300  7-bit I2C address of the expander
 ;     0x0301  backlight/control shadow, OR'd into every expander write
-; (button.S owns 0x0302-0x0304. wire.S owns nothing.)
+; (button.S owns 0x0308-0x0317. wire.S owns nothing.)
 ;
 ; Registers: avr-gcc convention, args r24:r25 then r22:r23. r16 is used as the
 ; expander-byte accumulator and is call-saved, so it is pushed by the public
@@ -39,31 +39,31 @@ lcd_pcf_send:
         lds     r18, 0x0301             ; backlight shadow
         or      r16, r18                ; every write carries it
         ldi     r18, 0xA4               ; TWINT | TWSTA | TWEN
-        sts     0xBC, r18
+        sts     AD_TWCR, r18
 lcd_tw_start:
-        lds     r18, 0xBC
+        lds     r18, AD_TWCR
         sbrs    r18, 7
         rjmp    lcd_tw_start
         lds     r18, 0x0300             ; 7-bit address
         lsl     r18                     ; shift up, bit 0 = 0 -> write
-        sts     0xBB, r18               ; TWDR
+        sts     AD_TWDR, r18
         ldi     r18, 0x84               ; TWINT | TWEN
-        sts     0xBC, r18
+        sts     AD_TWCR, r18
 lcd_tw_addr:
-        lds     r18, 0xBC
+        lds     r18, AD_TWCR
         sbrs    r18, 7
         rjmp    lcd_tw_addr
-        sts     0xBB, r16               ; the payload byte
+        sts     AD_TWDR, r16            ; the payload byte
         ldi     r18, 0x84
-        sts     0xBC, r18
+        sts     AD_TWCR, r18
 lcd_tw_data:
-        lds     r18, 0xBC
+        lds     r18, AD_TWCR
         sbrs    r18, 7
         rjmp    lcd_tw_data
         ldi     r18, 0x94               ; TWINT | TWSTO | TWEN
-        sts     0xBC, r18
+        sts     AD_TWCR, r18
 lcd_tw_stop:
-        lds     r18, 0xBC
+        lds     r18, AD_TWCR
         sbrc    r18, 4
         rjmp    lcd_tw_stop
         ret
@@ -146,12 +146,12 @@ lcd_init:
         ldi     r24, 0x08
         sts     0x0301, r24             ; backlight on by default
 
-        ldi     r18, 72                 ; TWI at 100 kHz, prescaler 1
-        sts     0xB8, r18
+        ldi     r18, (AD_F_CPU / 100000 - 16) / 2   ; TWI at 100 kHz, prescaler 1
+        sts     AD_TWBR, r18
         ldi     r18, 0
-        sts     0xB9, r18
+        sts     AD_TWSR, r18
         ldi     r18, 0x04
-        sts     0xBC, r18
+        sts     AD_TWCR, r18
 
         ldi     r21, 50                 ; >40 ms after power-on
         rcall   lcd_delay_ms

@@ -4,6 +4,7 @@
 // from disk rather than a copy pasted into the test.
 
 #include "harness.h"
+#include "runtime_source.h"
 
 #include "ardio/avr/assembler.h"
 
@@ -25,6 +26,9 @@ bool read_serial_source(std::string& out) {
         std::ostringstream buf;
         buf << in.rdbuf();
         out = buf.str();
+        // The runtime is written against the device prelude's AD_* names, so
+        // on its own it is not assemblable source.
+        out += "\n" + ardio::test::default_prelude();
         return true;
     }
     return false;
@@ -78,7 +82,12 @@ TEST(runtime_serial_assembles_without_its_fallback_section) {
     // sketch, so the file has to assemble in that form too.
     std::string::size_type marker = source.find("ARDIO_FALLBACK_BEGIN");
     if (marker != std::string::npos) {
+        // The prelude was appended by the reader, so it sits below the marker
+        // and the trim takes it with it. Put it back afterwards: the point of
+        // this test is that the fallback section is droppable, not that the
+        // device definitions are.
         std::string trimmed = source.substr(0, source.rfind('\n', marker));
+        trimmed += "\n" + ardio::test::default_prelude();
         ardio::AssembleResult result = ardio::assemble(trimmed);
         if (!result.ok) std::printf("    assembler said: %s\n", result.error.c_str());
         CHECK(result.ok);

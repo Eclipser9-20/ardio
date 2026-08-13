@@ -8,6 +8,7 @@
 // fails) when the runtime tree is not next to it.
 
 #include "harness.h"
+#include "runtime_source.h"
 #include "ardio/avr/assembler.h"
 
 #include <cstdio>
@@ -33,7 +34,12 @@ bool find_runtime_file(const char* name, std::string& out) {
                            "../../../runtime/"};
     for (const char* root : roots) {
         std::string path = std::string(root) + name;
-        if (read_file(path, out)) return true;
+        if (read_file(path, out)) {
+            // The runtime is written against the device prelude's AD_* names,
+            // so on its own it is not assemblable source.
+            out += "\n" + ardio::test::default_prelude();
+            return true;
+        }
     }
     return false;
 }

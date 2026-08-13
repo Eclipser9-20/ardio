@@ -27,12 +27,19 @@ add_library(libardio STATIC
     src/protocol/stk500v1.cpp
     src/protocol/programmer.cpp
     src/protocol/esp_rom.cpp
+    src/protocol/stk500v2.cpp
+    src/protocol/avr109.cpp
     src/platform/ports_select.cpp
     src/toolchain/config.cpp
     src/toolchain/search.cpp
     src/toolchain/fetch.cpp
     src/toolchain/build_toolchain.cpp
     src/avr/assembler.cpp
+    src/avr/device.cpp
+    src/emu/core_reference.cpp
+    src/emu/core_arm64.cpp
+    src/emu/core_select.cpp
+    src/emu/peripherals.cpp
     src/avr/lexer.cpp
     src/avr/preprocess.cpp
     src/avr/parser.cpp
@@ -83,6 +90,12 @@ add_executable(ardio_tests
     tests/test_hex.cpp
     tests/test_board.cpp
     tests/test_stk500v1.cpp
+    tests/test_stk500v2.cpp
+    tests/test_avr109.cpp
+    tests/test_device.cpp
+    tests/test_emu_core.cpp
+    tests/test_emu_jit.cpp
+    tests/test_emu_peripherals.cpp
     tests/test_serial_fake.cpp
     tests/test_programmer.cpp
     tests/test_ports.cpp

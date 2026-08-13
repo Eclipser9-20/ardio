@@ -4,6 +4,7 @@
 // disk rather than a copy pasted into the test.
 
 #include "harness.h"
+#include "runtime_source.h"
 
 #include "ardio/avr/assembler.h"
 
@@ -16,16 +17,7 @@ namespace {
 // The test binary may be started from the build directory or from the source
 // root, so try the handful of places the file can be relative to the cwd.
 bool read_source(const char* relative, std::string& out) {
-    static const char* const prefixes[] = {"", "../", "../../", "../../../"};
-    for (const char* prefix : prefixes) {
-        std::ifstream in(std::string(prefix) + relative, std::ios::binary);
-        if (!in) continue;
-        std::ostringstream buf;
-        buf << in.rdbuf();
-        out = buf.str();
-        return true;
-    }
-    return false;
+    return ardio::test::read_runtime(relative, out);
 }
 
 } // namespace

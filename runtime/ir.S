@@ -1,4 +1,4 @@
-; ardio infrared receive runtime -- ATmega328P at 16 MHz.
+; ardio infrared receive runtime, at 16 MHz.
 ;
 ; Written from the published NEC remote-control protocol timings rather than
 ; from any existing library. Assembled by ardio's own assembler
@@ -26,9 +26,9 @@
 ; Polling with cycle-counted timing loops, not interrupts. ir_decode blocks
 ; until a frame arrives or its timeout expires, which suits a sketch that
 ; checks the remote once per pass of loop(). It costs nothing when idle beyond
-; the call itself, needs no interrupt vector, and works on any of the 20 I/O
-; pins -- an external-interrupt or pin-change scheme would either be tied to
-; particular pins or have to demultiplex the whole port.
+; the call itself, needs no interrupt vector, and works on any I/O pin the
+; board has -- an external-interrupt or pin-change scheme would either be tied
+; to particular pins or have to demultiplex the whole port.
 ;
 ; Every pulse is measured by counting ticks of one sampling loop. That loop is
 ; exactly 801 cycles = 50.06 us at 16 MHz (see ir_measure_mark for the count),
@@ -58,8 +58,8 @@
 ;
 ; Fixed addresses, since this assembler has absolute lds/sts only. Placed at
 ; 0x0380, clear of every other runtime file (servo.S at 0x0300, stepper.S at
-; 0x0340, lcd.S and button.S at 0x0300-0x0304) and well above the 0x0100 start
-; of SRAM:
+; 0x0340, lcd.S at 0x0300-0x0301 and button.S at 0x0308-0x0317) and inside the
+; SRAM of every part in the device table:
 ;
 ;       0x0380  available flag (1 once a frame has been decoded)
 ;       0x0381  receive pin number
@@ -70,9 +70,9 @@
 ; -------------------------------------------------------------------- ABI ---
 ;
 ; avr-gcc's: first int argument in r24:r25, return value in r24:r25, r1 is
-; permanently zero, r18-r27 and r30:r31 are call-clobbered, r2-r17 and r28:r29
-; are preserved. Nothing here touches a call-saved register, so no routine
-; needs to push anything.
+; permanently zero, r0 is scratch, r18-r27 and r30:r31 are call-clobbered, and
+; r2-r17 and r28:r29 are preserved. Nothing here touches a call-saved register,
+; so no routine needs to push anything.
 ;
 ; Register roles inside a decode:
 ;
@@ -355,42 +355,53 @@ ir_wm_found:
 ; ---------------------------------------------------------------------------
 ; ir_pin_setup: turn the stored pin number into a port pointer and a mask.
 ;
-;   out: Z (r31:r30) = address of PINx, r18 = bit mask, or 0 if the pin
-;        number is not a real pin
-;   clobbers r18, r19, r24, r30, r31
+;   out: Z (r31:r30) = address of PINx, r18 = bit mask, or both 0 if the
+;        stored number is not a pin on this part
+;   clobbers r0, r18, r19, r24, r30, r31
 ;
-; Data-space addresses, as in core.S: PIND 0x29, PINB 0x23, PINC 0x26, with
-; DDRx at PINx+1 and PORTx at PINx+2, which is why callers can reach the other
-; two registers as displacements Z+1 and Z+2.
+; The numbering is not compiled in. __ardio_pinmap, which the device
+; description renders alongside the runtime, holds two bytes per digital pin --
+; the data-space address of its PINx register, then the bit number -- so pin n
+; is at byte address __ardio_pinmap * 2 + n * 2, doubled because a label names
+; a word and lpm addresses bytes. A pin the part does not have is stored as
+; address 0, and every caller here already treats a zero mask as "give up",
+; which is what the old out-of-range branch did.
 ;
-;       pins  0-7  -> PORTD bits 0-7
-;       pins  8-13 -> PORTB bits 0-5
-;       pins 14-19 -> PORTC bits 0-5   (A0-A5)
-; ---------------------------------------------------------------------------
+; DDRx is at PINx+1 and PORTx at PINx+2 on every AVR, which is why ir_begin can
+; reach both through the displacements Z+1 and Z+2 off this one pointer.
+;
+; The offset is built as a full 16-bit value rather than by shifting the pin
+; number where it sits, so a board numbering past 127 pins cannot lose the top
+; bit and read a different pin's entry.
 ir_pin_setup:
         lds     r24, 0x0381
-        cpi     r24, 20
-        brsh    ir_ps_bad
-        mov     r19, r24                ; r19 becomes the bit index
+        ldi     r18, 0                  ; assume there is no such pin
+        ldi     r30, 0
+        ldi     r31, 0
+        cpi     r24, AD_NUM_PINS
+        brsh    ir_ps_done
+        mov     r19, r24
+        lsl     r19                     ; r18:r19 = pin * 2
+        rol     r18
+        ldi     r30, lo8(__ardio_pinmap * 2)
+        ldi     r31, hi8(__ardio_pinmap * 2)
+        add     r30, r19
+        adc     r31, r18
+        lpm                             ; r0 = address of PINx
+        mov     r19, r0
+        adiw    r30, 1
+        lpm                             ; r0 = bit number within the port
+        ldi     r18, 0
         ldi     r31, 0                  ; every port register is below 0x100
-        ldi     r30, 0x29               ; PIND
-        cpi     r24, 8
-        brlo    ir_ps_mask
-        ldi     r30, 0x23               ; PINB
-        subi    r19, 8
-        cpi     r24, 14
-        brlo    ir_ps_mask
-        ldi     r30, 0x26               ; PINC
-        subi    r19, 6                  ; 8 already taken off above -> 14
-ir_ps_mask:
-        ldi     r18, 1
-ir_ps_shift:
+        mov     r30, r19
         tst     r19
+        breq    ir_ps_done              ; address 0: not a pin on this part
+        ldi     r18, 1                  ; mask = 1 << bit number
+ir_ps_shift:
+        tst     r0
         breq    ir_ps_done
         lsl     r18
-        dec     r19
+        dec     r0
         rjmp    ir_ps_shift
-ir_ps_bad:
-        ldi     r18, 0
 ir_ps_done:
         ret

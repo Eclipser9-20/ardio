@@ -1,4 +1,4 @@
-; ardio servo runtime -- ATmega328P at 16 MHz.
+; ardio servo runtime, at 16 MHz.
 ;
 ; Written from the hobby-servo signal spec rather than from any existing
 ; library: a servo expects a positive pulse repeated at about 50 Hz, where the
@@ -10,8 +10,8 @@
 ; Approach: the pulse is bit-banged in a timed loop rather than driven from
 ; Timer1. Timer1 would hold the output on its own and free the CPU, but it can
 ; only serve OC1A/OC1B, and the Label Maker's servo is on an arbitrary pin. A
-; timed loop works on any of the 20 I/O pins and needs no interrupt vector, at
-; the cost of blocking for the length of the pulse -- at most 2 ms, which is
+; timed loop works on any I/O pin the board has and needs no interrupt vector,
+; at the cost of blocking for the length of the pulse -- at most 2 ms, which is
 ; well under the 20 ms frame, so a caller that calls servo_write in its main
 ; loop naturally produces a valid 50 Hz signal. servo_write emits exactly one
 ; pulse per call; call it about every 20 ms to hold a position.
@@ -29,8 +29,8 @@
 ;     0x0301  attached pin number
 ;     0x0302  last commanded angle
 ;
-; ABI: avr-gcc's. First int arg r24:r25, second r22:r23; r1 is always zero;
-; r18-r27, r30, r31 are call-clobbered.
+; ABI: avr-gcc's. First int arg r24:r25, second r22:r23; r1 is always zero, r0
+; is scratch; r18-r27, r30, r31 are call-clobbered.
 
 ; ---------------------------------------------------------------------------
 ; servo_attach(uint8_t pin)  -- pin in r24
@@ -176,101 +176,89 @@ du_done:
         ret
 
 ; ---------------------------------------------------------------------------
-; pin_decode: r24 = Arduino pin number -> r20 = port id, r21 = bit mask.
+; pin_decode: r24 = Arduino pin number -> Z (r31:r30) = data address of that
+; pin's PINx register, r21 = its bit mask within the port. Both come back 0
+; when the part has no such pin, and the three helpers below then do nothing.
 ;
-; Port ids: 0 = PORTD (pins 0-7), 1 = PORTB (8-13), 2 = PORTC (14-19).
-; Clobbers r22, r23.
+; Clobbers r0, r21, r22, r23, r30, r31.
+;
+; The numbering lives in __ardio_pinmap, the flash table the device description
+; renders alongside the runtime: two bytes per pin, the address of PINx then
+; the bit number, so pin n sits at byte address __ardio_pinmap * 2 + n * 2 --
+; doubled because a label names a word while lpm addresses bytes. The offset is
+; built as a full 16-bit value rather than by shifting the pin number in place,
+; so a high pin number cannot lose its top bit and select the wrong entry.
 ; ---------------------------------------------------------------------------
 pin_decode:
+        ldi     r21, 0                  ; assume there is no such pin
+        ldi     r30, 0
+        ldi     r31, 0
+        cpi     r24, AD_NUM_PINS
+        brsh    pd_done
         mov     r22, r24
-        cpi     r24, 8
-        brlo    pd_portd
-        cpi     r24, 14
-        brlo    pd_portb
-        ldi     r20, 2
-        subi    r22, 14
-        rjmp    pd_mask
-pd_portb:
-        ldi     r20, 1
-        subi    r22, 8
-        rjmp    pd_mask
-pd_portd:
-        ldi     r20, 0
-pd_mask:
-        ldi     r21, 1
-pd_shift:
+        ldi     r23, 0
+        lsl     r22                     ; r23:r22 = pin * 2
+        rol     r23
+        ldi     r30, lo8(__ardio_pinmap * 2)
+        ldi     r31, hi8(__ardio_pinmap * 2)
+        add     r30, r22
+        adc     r31, r23
+        lpm                             ; r0 = address of PINx
+        mov     r22, r0
+        adiw    r30, 1
+        lpm                             ; r0 = bit number within the port
+        ldi     r31, 0                  ; every port register is below 0x100
+        mov     r30, r22
         tst     r22
+        breq    pd_done                 ; address 0: not a pin on this part
+        ldi     r21, 1                  ; mask = 1 << bit number
+pd_shift:
+        tst     r0
         breq    pd_done
         lsl     r21
-        dec     r22
+        dec     r0
         rjmp    pd_shift
 pd_done:
         ret
 
 ; ---------------------------------------------------------------------------
-; pin_ddr_out / pin_high / pin_low: act on port id r20, mask r21.
+; pin_ddr_out / pin_high / pin_low: act on the port pin_decode selected, which
+; is Z pointing at PINx with the mask in r21.
 ;
-; sbi/cbi need a compile-time address, so the port is selected by branch
-; rather than computed. Clobbers r19, r23.
+; DDRx is at PINx+1 and PORTx at PINx+2 on every AVR, so both are reached as
+; displacements off the one pointer. That is also why these are read-modify-
+; write sequences rather than sbi/cbi: sbi and cbi need a compile-time bit
+; number and an address in the low 32 bytes of I/O space, and neither is known
+; once the port comes out of a table.
+;
+; A zero mask means pin_decode found no such pin, and each routine returns
+; having touched nothing. Clobbers r19, r23.
 ; ---------------------------------------------------------------------------
 pin_ddr_out:
-        cpi     r20, 1
-        breq    pdo_b
-        cpi     r20, 2
-        breq    pdo_c
-        in      r23, 0x0A               ; DDRD
+        tst     r21
+        breq    pdo_done
+        ldd     r23, Z+1                ; DDRx |= mask
         or      r23, r21
-        out     0x0A, r23
-        ret
-pdo_b:
-        in      r23, 0x04               ; DDRB
-        or      r23, r21
-        out     0x04, r23
-        ret
-pdo_c:
-        in      r23, 0x07               ; DDRC
-        or      r23, r21
-        out     0x07, r23
+        std     Z+1, r23
+pdo_done:
         ret
 
 pin_high:
-        cpi     r20, 1
-        breq    ph_b
-        cpi     r20, 2
-        breq    ph_c
-        in      r23, 0x0B               ; PORTD
+        tst     r21
+        breq    ph_done
+        ldd     r23, Z+2                ; PORTx |= mask
         or      r23, r21
-        out     0x0B, r23
-        ret
-ph_b:
-        in      r23, 0x05               ; PORTB
-        or      r23, r21
-        out     0x05, r23
-        ret
-ph_c:
-        in      r23, 0x08               ; PORTC
-        or      r23, r21
-        out     0x08, r23
+        std     Z+2, r23
+ph_done:
         ret
 
 pin_low:
+        tst     r21
+        breq    pl_done
         mov     r19, r21
         com     r19
-        cpi     r20, 1
-        breq    pl_b
-        cpi     r20, 2
-        breq    pl_c
-        in      r23, 0x0B               ; PORTD
+        ldd     r23, Z+2                ; PORTx &= ~mask
         and     r23, r19
-        out     0x0B, r23
-        ret
-pl_b:
-        in      r23, 0x05               ; PORTB
-        and     r23, r19
-        out     0x05, r23
-        ret
-pl_c:
-        in      r23, 0x08               ; PORTC
-        and     r23, r19
-        out     0x08, r23
+        std     Z+2, r23
+pl_done:
         ret
