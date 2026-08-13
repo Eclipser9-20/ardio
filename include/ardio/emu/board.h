@@ -17,11 +17,15 @@
 namespace ardio::emu {
 
 // How a run ended, in terms a caller cares about rather than core internals.
+// There is deliberately no "a part asked to stop" outcome. One was specified
+// and then removed, because Part has no way to ask: nothing could ever produce
+// it, and an outcome a caller must handle but can never observe is worse than
+// no outcome at all -- it reads as a supported case and is untestable. Add it
+// back together with the mechanism on Part, not before.
 enum class RunOutcome {
     ReachedTime,   // ran out the requested span, still running happily
     Halted,        // the sketch stopped: a self-loop with interrupts off
     Fault,         // illegal instruction or a core error
-    PartRequest,   // a part asked to stop, e.g. a scripted input ran out
 };
 
 struct StepResult {

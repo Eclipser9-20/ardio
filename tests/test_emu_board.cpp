@@ -29,6 +29,7 @@
 #include "ardio/build.h"
 #include "ardio/emu/board.h"
 #include "ardio/emu/machine.h"
+#include "ardio/emu/parts.h"
 #include "ardio/hex.h"
 
 #include <cstdint>
@@ -59,15 +60,10 @@ const Board& pro_mini() {
     return b ? *b : fallback;
 }
 
-// ---------------------------------------------------- ATmega328P registers --
-//
-// Written out rather than derived, so that a test says which register it means.
-// These are data-space addresses.
-constexpr uint16_t kPinB = 0x23, kDdrB = 0x24, kPortB = 0x25;
-constexpr uint16_t kPinD = 0x29, kDdrD = 0x2A, kPortD = 0x2B;
-constexpr uint16_t kTccr0b = 0x45;
-constexpr uint16_t kTimsk0 = 0x6E;
-constexpr uint16_t kAdcl = 0x78, kAdch = 0x79, kAdcsra = 0x7A, kAdmux = 0x7C;
+// The bottom of SRAM on the ATmega328P, which is where the assembly programs
+// below leave what they observed. Every other register address they use is
+// written out at the instruction that touches it, with the name beside it, so
+// that a program reads as the sequence a datasheet describes.
 constexpr uint16_t kRamStart = 0x0100;
 
 // -------------------------------------------------------------- parts ----
@@ -139,6 +135,15 @@ std::unique_ptr<Machine> machine_running(const Board& board, const std::string& 
         return nullptr;
     }
     return m;
+}
+
+// Compares serial text, reporting what actually came out. CHECK_EQ cannot do
+// this: it renders both sides with std::to_string, which has no overload for a
+// string.
+void check_text(const std::string& actual, const std::string& expected, int line) {
+    if (actual != expected)
+        ::ardio_test::fail(__FILE__, line,
+                           "text was \"" + actual + "\", expected \"" + expected + "\"");
 }
 
 // A byte of the guest's own SRAM, which is how the assembly programs below
@@ -403,6 +408,72 @@ halt:   rjmp    halt
     CHECK_EQ(nowhere.changes.size(), size_t(0));
 }
 
+TEST(a_scripted_button_press_reaches_a_sketch_that_is_only_polling) {
+    // Nothing about this press is an edge the machine can see coming from the
+    // guest's side: the button decides on its own, at a cycle chosen from
+    // outside. It only ever reaches the sketch because the run loop advances
+    // the parts as well as the peripherals, and does so before reading what a
+    // part is driving.
+    std::unique_ptr<Machine> m = machine_running(uno(), R"(
+        ldi     r16, 0x00
+        sts     0x2A, r16       ; DDRD: PD2 an input
+        ldi     r16, 0x04
+        sts     0x2B, r16       ; PORTD: its pull-up on, so it idles high
+wait:   lds     r17, 0x29       ; PIND
+        sbrc    r17, 2          ; low means the button pulled it down
+        rjmp    wait
+        ldi     r18, 0x01
+        sts     0x0100, r18
+halt:   rjmp    halt
+    )");
+    if (!m) return;
+
+    Button button(0);
+    button.set_pin(2);
+    CHECK(button.press(50000));
+    m->wire(2, &button);
+
+    StepResult before = m->run_for(20000);
+    CHECK(before.outcome == RunOutcome::ReachedTime);
+    CHECK_EQ(int(guest_byte(*m, kRamStart)), 0x00);
+    CHECK(!button.pressed());
+
+    StepResult after = m->run_for(60000);
+    CHECK(after.outcome == RunOutcome::Halted);
+    CHECK_EQ(int(guest_byte(*m, kRamStart)), 0x01);
+    CHECK(button.pressed());
+    // It cannot have noticed before the press was scheduled.
+    CHECK(after.cycles >= 50000);
+}
+
+TEST(wiring_a_part_gives_it_the_boards_clock_rate) {
+    // A part converts cycles to microseconds and reports zero rather than
+    // guessing when it has no rate. This LED is built without one, so a
+    // non-zero lit time can only come from the machine having supplied it.
+    std::unique_ptr<Machine> m = machine_running(uno(), R"(
+        ldi     r16, 0x20
+        sts     0x24, r16       ; DDRB: PB5 an output
+        ldi     r17, 0x20
+        sts     0x25, r17       ; on
+        ldi     r17, 0x00
+        sts     0x25, r17       ; off
+        ldi     r17, 0x20
+        sts     0x25, r17       ; on again
+halt:   rjmp    halt
+    )");
+    if (!m) return;
+
+    Led led(0);
+    CHECK_EQ(led.clock_hz(), uint32_t(0));
+    m->wire(13, &led);
+    CHECK_EQ(led.clock_hz(), uint32_t(16000000));
+
+    CHECK(m->run_for(1000).outcome == RunOutcome::Halted);
+    CHECK_EQ(led.blinks(), uint32_t(2));
+    CHECK(led.on());
+    CHECK(led.lit_us(m->cycles()) > 0.0);
+}
+
 // ============================================================== serial =====
 
 TEST(serial_output_from_a_sketch_comes_out_of_take_serial_output) {
@@ -436,7 +507,7 @@ void loop() {
     CHECK(m->take_serial_output().empty());
 
     m->run_ms(10);
-    CHECK_EQ(m->take_serial_output(), std::string("hi"));
+    check_text(m->take_serial_output(), "hi", __LINE__);
     // Taking the output consumes it.
     CHECK(m->take_serial_output().empty());
 }
@@ -473,11 +544,11 @@ void loop() {
     m->run_ms(10);
     // The sketch echoes the next character along, so this is the guest having
     // read the byte rather than the byte being handed back.
-    CHECK_EQ(m->take_serial_output(), std::string("B"));
+    check_text(m->take_serial_output(), "B", __LINE__);
 
     m->feed_serial("m");
     m->run_ms(10);
-    CHECK_EQ(m->take_serial_output(), std::string("n"));
+    check_text(m->take_serial_output(), "n", __LINE__);
 }
 
 // ================================================================= ADC =====
@@ -775,17 +846,27 @@ TEST(a_compiled_blink_sketch_blinks_the_pin_it_says_it_does) {
     CHECK(led.count(PinState::High) >= 1);
     CHECK(led.count(PinState::Low) >= 2);
 
-    // And the half-second is a real half-second in sketch time: consecutive
-    // level changes are about 8 million cycles apart at 16 MHz. Allow a wide
-    // band, since the delay loop is calibrated in whole milliseconds and the
-    // sketch spends real instructions either side of it.
-    size_t edges = 0;
-    for (size_t i = 1; i < led.changes.size(); ++i) {
-        if (led.changes[i - 1].state == PinState::Floating) continue;
+    // And the half-second is a real half-second in sketch time: 500 ms at
+    // 16 MHz is 8 million cycles. The band is wide because the delay loop is
+    // calibrated to whole milliseconds and the sketch runs its own
+    // instructions either side of the wait -- but it is nowhere near wide
+    // enough to accept a delay that was not emulated at all.
+    //
+    // Measuring starts at the first High. The changes before it are the pin
+    // arriving at a level rather than the sketch waiting: an unwired pin is
+    // Floating, pinMode makes it an output already holding low, and the first
+    // digitalWrite follows immediately.
+    size_t first_high = led.changes.size();
+    for (size_t i = 0; i < led.changes.size(); ++i)
+        if (led.changes[i].state == PinState::High) { first_high = i; break; }
+    CHECK(first_high < led.changes.size());
+
+    size_t waits = 0;
+    for (size_t i = first_high + 1; i < led.changes.size(); ++i) {
         uint64_t gap = led.changes[i].cycles - led.changes[i - 1].cycles;
         CHECK(gap > 7000000);
         CHECK(gap < 9000000);
-        ++edges;
+        ++waits;
     }
-    CHECK(edges >= 1);
+    CHECK(waits >= 1);
 }

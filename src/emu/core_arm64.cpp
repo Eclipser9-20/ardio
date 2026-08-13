@@ -1413,6 +1413,11 @@ bool JitCore::translate(State& s, uint16_t word_addr, Block& out) {
             break;
         }
 
+        // A terminator charges its own cycles, because its cost can depend on
+        // whether a branch was taken. Everything else has a fixed cost that is
+        // known here, so it is added to the running total in one instruction.
+        if (e.kind == Emit::Straight && e.max_cycles) a.addi64(kCycles, kCycles, e.max_cycles);
+
         max_cycles += e.max_cycles;
         ++count;
         pc = uint16_t(pc + e.words);

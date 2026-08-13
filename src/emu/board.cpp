@@ -73,6 +73,7 @@
 #include "ardio/emu/board.h"
 
 #include "ardio/avr/device.h"
+#include "ardio/emu/parts.h"
 
 #include <algorithm>
 #include <memory>
@@ -413,6 +414,25 @@ PinState BoardMachine::resolve(const PinLocation& loc) const {
 void BoardMachine::settle() {
     if (wires_.empty()) return;
 
+    // Parts are dated exactly the way peripherals are: drive() carries no cycle
+    // count either, so a part reports what it is driving as of its last
+    // advance. Advancing here rather than only at a deadline is what makes a
+    // scripted button press land on the cycle it was scripted for instead of
+    // whenever the sketch next happened to poll something -- and settle() is
+    // called both from the run loop, after the peripherals are advanced, and
+    // from every port access, which is where drive() is about to be read.
+    for (size_t i = 0; i < wires_.size(); ++i) {
+        Part* part = wires_[i].part;
+        if (!part) continue;
+        // A part wired to several pins appears in `wires_` once per pin.
+        // Advancing it once per pin would be harmless for a part that tracks a
+        // cycle count and wrong for one that accumulates, so it is advanced
+        // once.
+        bool seen = false;
+        for (size_t j = 0; j < i && !seen; ++j) seen = wires_[j].part == part;
+        if (!seen) part->advance(state_.cycles);
+    }
+
     // First publish what every part is driving, so that the ports resolve
     // against the current outside world. This has to be a separate pass:
     // deciding a pin's level before all the parts on it have been asked would
@@ -450,6 +470,14 @@ void BoardMachine::wire(int pin, Part* part) {
     PinState before = PinState::Floating;
     bool have_pin = pin >= 0 && size_t(pin) < pin_level_.size();
     if (have_pin) before = pin_level_[size_t(pin)];
+
+    // A part converts cycles to microseconds to do anything with time, and it
+    // cannot know the rate from a pin number. Setting it here means a part that
+    // has been wired to a machine can never be left without one: this is the
+    // only moment at which a part and a board are both in hand. A part from
+    // outside this library says so by returning false, and there is nothing to
+    // do about that -- it has its own arrangements.
+    set_part_clock(part, uint32_t(board_.f_cpu));
 
     wires_.push_back(Wire{pin, part});
     if (std::find(wired_pins_.begin(), wired_pins_.end(), pin) == wired_pins_.end())

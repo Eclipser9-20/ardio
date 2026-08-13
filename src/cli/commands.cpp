@@ -241,9 +241,6 @@ int cmd_emulate(const Args& args, const Config& cfg) {
         // way that hides it.
         std::printf("sketch halted\n");
         return 0;
-    case emu::RunOutcome::PartRequest:
-        std::printf("stopped at a part's request\n");
-        return 0;
     case emu::RunOutcome::Fault:
         std::fprintf(stderr, "error: %s\n", result.error.c_str());
         return 1;

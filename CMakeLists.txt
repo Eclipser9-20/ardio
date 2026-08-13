@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ardio VERSION 0.1.0 LANGUAGES CXX)
+project(ardio VERSION 0.1.0 LANGUAGES C CXX)
 
 # Lets editors and clangd resolve includes without guessing.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -41,6 +41,12 @@ add_library(libardio STATIC
     src/emu/core_select.cpp
     src/emu/board.cpp
     src/emu/parts.cpp
+    libhike/src/hike_buffer.c
+    libhike/src/hike_term.c
+    libhike/src/hike_input.c
+    libhike/src/hike_unicode.c
+    libhike/src/hike_widgets.c
+    libhike/src/hike_cpp.cpp
     src/emu/peripherals.cpp
     src/avr/lexer.cpp
     src/avr/preprocess.cpp
@@ -60,8 +66,16 @@ add_library(libardio STATIC
 set_target_properties(libardio PROPERTIES OUTPUT_NAME ardio)
 target_include_directories(libardio PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libhike/include>
     $<INSTALL_INTERFACE:include>
 )
+
+# libhike's core is C, deliberately: the C API is the whole library and the C++
+# layer wraps exactly it, so a C caller is never a second-class one.
+set_source_files_properties(
+    libhike/src/hike_buffer.c libhike/src/hike_term.c libhike/src/hike_input.c
+    libhike/src/hike_unicode.c libhike/src/hike_widgets.c
+    PROPERTIES LANGUAGE C)
 
 # Platform layer. macOS is implemented; other platforms build against a stub
 # that reports the limitation rather than failing to link.
@@ -99,6 +113,9 @@ add_executable(ardio_tests
     tests/test_emu_jit.cpp
     tests/test_emu_board.cpp
     tests/test_emu_parts.cpp
+    libhike/tests/test_hike_buffer.cpp
+    libhike/tests/test_hike_input.cpp
+    libhike/tests/test_hike_widgets.cpp
     tests/test_emu_peripherals.cpp
     tests/test_serial_fake.cpp
     tests/test_programmer.cpp
