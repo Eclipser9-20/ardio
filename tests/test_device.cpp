@@ -455,7 +455,6 @@ TEST(the_prelude_defines_every_name_the_contract_promises) {
     const char* names[] = {
         "AD_RAMEND", "AD_RAMSTART", "AD_F_CPU",  "AD_NUM_PINS", "AD_NUM_ANALOG",
         "AD_ANALOG_PIN_BASE",
-        "AD_ANALOG_PIN_BASE",
         "AD_SREG",   "AD_SPL",      "AD_SPH",
         "AD_UCSRA",  "AD_UCSRB",    "AD_UCSRC",  "AD_UBRRL",    "AD_UBRRH", "AD_UDR",
         "AD_ADMUX",  "AD_ADCSRA",   "AD_ADCSRB", "AD_ADCL",     "AD_ADCH",
@@ -485,9 +484,6 @@ TEST(the_prelude_constants_carry_the_devices_values) {
     CHECK_EQ(v, 20L);
     CHECK(symbol_value(prelude, "AD_NUM_ANALOG", v));
     CHECK_EQ(v, 8L);
-    // The constant adc.S needs in place of a hardcoded 14.
-    CHECK(symbol_value(prelude, "AD_ANALOG_PIN_BASE", v));
-    CHECK_EQ(v, 14L);
     // The constant adc.S needs in place of the hardcoded 14 it used to carry.
     CHECK(symbol_value(prelude, "AD_ANALOG_PIN_BASE", v));
     CHECK_EQ(v, 14L);

@@ -33,6 +33,16 @@ constexpr uint16_t PIN_E = 0x2C;
 constexpr uint16_t PIN_F = 0x2F;
 constexpr uint16_t PIN_G = 0x32;
 
+// The ATmega8 does not share the 328P's port addresses. Its low I/O space is
+// laid out differently and packed tighter -- 0x23 to 0x2C, where the 328P has
+// PORTB and PORTC, is TWDR, the ADC block and the USART on this part, so a
+// port table copied across from the 328P writes digitalWrite's bit mask into
+// ADCH. The ports themselves sit above all of that, and in the opposite order:
+// PORTD lowest, PORTB highest.
+constexpr uint16_t PIN_D8 = 0x30;
+constexpr uint16_t PIN_C8 = 0x33;
+constexpr uint16_t PIN_B8 = 0x36;
+
 // The 2560 and 1280 run out of low I/O space after PORTG and put the rest of
 // their ports in extended I/O, above 0xFF.
 constexpr uint16_t PIN_H = 0x100;
@@ -352,13 +362,13 @@ AvrDevice make_atmega8() {
     // other part in the table, and tccr0a is left at zero to say plainly that
     // the waveform-mode register does not exist.
     d.tccr0a = 0x0000;
-    d.tccr0b = 0x33;
-    d.tcnt0  = 0x32;
+    d.tccr0b = 0x53;
+    d.tcnt0  = 0x52;
     // The interrupt mask and flag registers are shared by all three timers
     // rather than split per timer, hence TIMSK and TIFR under the 0-suffixed
     // names.
-    d.timsk0 = 0x39;
-    d.tifr0  = 0x38;
+    d.timsk0 = 0x59;
+    d.tifr0  = 0x58;
     d.timer0_ovf_vector = 9;
 
     d.twbr = 0x20;
@@ -366,23 +376,24 @@ AvrDevice make_atmega8() {
     d.twdr = 0x23;
     d.twcr = 0x56;
 
-    // The ports are where the ATmega8 does agree with the 328P, which is why
-    // the old boards and the new ones share a silkscreen.
+    // The silkscreen is the one the 328P boards inherited -- PORTD, then
+    // PORTB, then PORTC -- but the addresses behind it are this part's own.
     d.pins = {
-        pin(PIN_D, 0), pin(PIN_D, 1), pin(PIN_D, 2), pin(PIN_D, 3),
-        pin(PIN_D, 4), pin(PIN_D, 5), pin(PIN_D, 6), pin(PIN_D, 7),
-        pin(PIN_B, 0), pin(PIN_B, 1), pin(PIN_B, 2), pin(PIN_B, 3),
-        pin(PIN_B, 4), pin(PIN_B, 5),
-        pin(PIN_C, 0), pin(PIN_C, 1), pin(PIN_C, 2), pin(PIN_C, 3),
-        pin(PIN_C, 4), pin(PIN_C, 5),
+        pin(PIN_D8, 0), pin(PIN_D8, 1), pin(PIN_D8, 2), pin(PIN_D8, 3),
+        pin(PIN_D8, 4), pin(PIN_D8, 5), pin(PIN_D8, 6), pin(PIN_D8, 7),
+        pin(PIN_B8, 0), pin(PIN_B8, 1), pin(PIN_B8, 2), pin(PIN_B8, 3),
+        pin(PIN_B8, 4), pin(PIN_B8, 5),
+        pin(PIN_C8, 0), pin(PIN_C8, 1), pin(PIN_C8, 2), pin(PIN_C8, 3),
+        pin(PIN_C8, 4), pin(PIN_C8, 5),
     };
     // The 28-pin package brings out six ADC inputs; the two extra channels of
     // the surface-mount package have no header on any board that used this
     // part, so they are not offered.
     d.analog = {ana(0), ana(1), ana(2), ana(3), ana(4), ana(5)};
-    // The same silkscreen as the 328P boards, so A0 is digital 14 here too --
-    // and here it happens to equal pins.size() - analog.size(), which is a
-    // coincidence of this part having no ADC-only pads rather than a rule.
+    // The same silkscreen as the 328P boards, so A0 is digital 14 here too.
+    // Here that does happen to equal the pin count less the analog count,
+    // because this part offers no ADC-only pads -- a coincidence of the row
+    // rather than a rule worth generalising.
     d.analog_pin_base = 14;
     d.led_builtin = 13;
     return d;

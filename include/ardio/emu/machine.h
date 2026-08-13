@@ -67,6 +67,14 @@ public:
     // Data-space addresses this peripheral answers for, inclusive.
     virtual bool claims(uint16_t addr) const = 0;
 
+    // These carry no cycle count, so a peripheral has to date an access from
+    // the last cycle it was advanced to. That puts an obligation on the core:
+    // ADVANCE THIS PERIPHERAL BEFORE EVERY read() OR write() TO IT. Skipping
+    // it mistimes whatever the access starts -- a USART frame finishes at the
+    // wrong cycle, an ADC conversion completes early -- and nothing here can
+    // detect the omission, because a stale peripheral cannot tell that it is
+    // stale. The symptom is a sketch whose timing is subtly wrong rather than
+    // an error, which is the worst way to find out.
     virtual uint8_t read(uint16_t addr) = 0;
     virtual void write(uint16_t addr, uint8_t value) = 0;
 
