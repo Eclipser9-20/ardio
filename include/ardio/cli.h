@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 
 namespace ardio {
 
@@ -14,6 +15,25 @@ struct Args {
     bool monitor_after = false;
     bool backup_first = false;   // save existing firmware before writing
     std::string backup_path;
+    // --- emulate ------------------------------------------------------
+    // How long to run, as the user wrote it ("2s", "500ms", "1000000c").
+    // Kept as text so the command can report the unit back in its own error
+    // rather than silently defaulting a value it failed to understand.
+    std::string run_for;
+
+    // Parts to wire up, each "kind:pin" ("led:13", "button:2"). Repeatable,
+    // because a breadboard with one component on it is not very interesting.
+    std::vector<std::string> wires;
+
+    // Text fed to the sketch's serial input before running.
+    std::string serial_input;
+
+    // Report which execution core was selected and stop. Worth having as a
+    // flag because the native translator and the portable core differ by
+    // orders of magnitude in speed, and a user seeing slow emulation should
+    // be able to find out which one they got.
+    bool explain = false;
+
     bool help = false;
     std::string error;
 };

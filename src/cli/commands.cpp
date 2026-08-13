@@ -4,6 +4,8 @@
 #include "ardio/hex.h"
 #include "ardio/monitor.h"
 #include "ardio/platform/ports.h"
+#include "ardio/emu/board.h"
+#include "ardio/emu/parts.h"
 #include "ardio/protocol/avr109.h"
 #include "ardio/protocol/programmer.h"
 #include "ardio/toolchain.h"
@@ -59,6 +61,192 @@ int cmd_ports() {
         auto boards = p.has_usb_id ? find_boards_by_usb(p.usb) : std::vector<const Board*>{};
         std::printf("%-28s %-12s %s\n", p.device.c_str(), usb_id_string(p).c_str(),
                     boards.empty() ? "(unrecognised)" : boards[0]->name.c_str());
+    }
+    return 0;
+}
+
+// Parses "2s", "500ms" or "1000000c" into cycles for a board at `f_cpu`.
+//
+// Cycles are offered alongside time because they are the only unit that means
+// the same thing on every board, which matters when comparing a run against
+// the reference core. Time is the default because it is what a user thinks in.
+bool parse_duration(const std::string& text, int f_cpu, uint64_t& cycles,
+                    std::string& error) {
+    if (text.empty()) { error = "empty duration"; return false; }
+
+    size_t digits = 0;
+    while (digits < text.size() && std::isdigit(static_cast<unsigned char>(text[digits])))
+        ++digits;
+    if (digits == 0) {
+        error = "'" + text + "' does not start with a number";
+        return false;
+    }
+
+    uint64_t value = std::strtoull(text.substr(0, digits).c_str(), nullptr, 10);
+    std::string unit = text.substr(digits);
+
+    if (unit == "c")             cycles = value;
+    else if (unit == "us")       cycles = value * uint64_t(f_cpu) / 1000000u;
+    else if (unit == "ms")       cycles = value * uint64_t(f_cpu) / 1000u;
+    else if (unit == "s" || unit.empty()) cycles = value * uint64_t(f_cpu);
+    else {
+        error = "'" + unit + "' is not a unit ardio knows. Use s, ms, us, or c "
+                "for cycles.";
+        return false;
+    }
+    return true;
+}
+
+int cmd_emulate(const Args& args, const Config& cfg) {
+    std::string want = args.board.empty() ? cfg.default_board : args.board;
+    if (want.empty()) want = "nano";
+    const Board* board = find_board_by_id(want);
+    if (!board) {
+        std::fprintf(stderr, "error: no board called '%s'. Try 'ardio boards'.\n",
+                     want.c_str());
+        return 2;
+    }
+
+    std::string error;
+    auto machine = emu::Machine::create(*board, error);
+    if (!machine) {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+    }
+
+    // --explain answers "which core did I get", which is worth asking before
+    // waiting on a long run: the translator and the portable core differ by
+    // orders of magnitude.
+    if (args.explain) {
+        std::printf("%s\n%s\n", board->name.c_str(), machine->description().c_str());
+        return 0;
+    }
+
+    if (args.positional.empty()) {
+        std::fprintf(stderr, "error: emulate needs a sketch or a .hex file\n");
+        return 2;
+    }
+
+    // A .hex runs as-is; anything else is a sketch and gets built first, so
+    // `ardio emulate blink.ino` does the obvious thing.
+    std::string hex_path = args.positional;
+    if (fs::path(args.positional).extension() != ".hex") {
+        BuildResult built = build_sketch(args.positional, *board, roots_for(cfg),
+                                         ".ardio-build");
+        if (!built.ok) {
+            std::fprintf(stderr, "error: %s\n", built.error.c_str());
+            return 1;
+        }
+        hex_path = built.hex_path;
+    }
+
+    std::ifstream in(hex_path);
+    if (!in) {
+        std::fprintf(stderr, "error: cannot read %s\n", hex_path.c_str());
+        return 1;
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    auto image = parse_intel_hex(ss.str(), error);
+    if (!image) {
+        std::fprintf(stderr, "error: %s: %s\n", hex_path.c_str(), error.c_str());
+        return 1;
+    }
+    if (!machine->load(image->data, error)) {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+    }
+
+    // Parts stay owned here rather than by the machine, so they can be
+    // queried for what they observed once the run is over.
+    std::vector<std::unique_ptr<emu::Part>> parts;
+    std::vector<int> part_pins;
+    for (const std::string& spec : args.wires) {
+        size_t colon = spec.rfind(':');
+        if (colon == std::string::npos) {
+            std::fprintf(stderr,
+                         "error: -wire wants kind:pin, like 'led:13'. Got '%s'.\n",
+                         spec.c_str());
+            return 2;
+        }
+        std::string kind = spec.substr(0, colon);
+        std::string pin_text = spec.substr(colon + 1);
+        if (pin_text.empty() ||
+            pin_text.find_first_not_of("0123456789") != std::string::npos) {
+            std::fprintf(stderr, "error: '%s' is not a pin number in '%s'\n",
+                         pin_text.c_str(), spec.c_str());
+            return 2;
+        }
+
+        auto part = emu::create_part(kind, error);
+        if (!part) {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            return 2;
+        }
+        // A part cannot convert cycles to microseconds without knowing the
+        // clock, and -wire is parsed before the board is resolved, so the rate
+        // has to be supplied here. Without it a servo or a buzzer reports
+        // zeroes rather than guessing at 16 MHz -- which is the right choice by
+        // the part, but only if this call is not forgotten.
+        if (!emu::set_part_clock(part.get(), uint32_t(board->f_cpu))) {
+            std::fprintf(stderr, "error: cannot set the clock rate on part '%s'\n",
+                         kind.c_str());
+            return 1;
+        }
+
+        int pin = std::atoi(pin_text.c_str());
+        machine->wire(pin, part.get());
+        part_pins.push_back(pin);
+        parts.push_back(std::move(part));
+    }
+
+    if (!args.serial_input.empty()) machine->feed_serial(args.serial_input);
+
+    uint64_t cycles = 0;
+    std::string duration = args.run_for.empty() ? "1s" : args.run_for;
+    if (!parse_duration(duration, board->f_cpu, cycles, error)) {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 2;
+    }
+
+    std::printf("emulating %s on %s\n", args.positional.c_str(), board->name.c_str());
+    emu::StepResult result = machine->run_for(cycles);
+
+    std::string output = machine->take_serial_output();
+    if (!output.empty()) {
+        std::printf("\nserial output:\n%s", output.c_str());
+        if (output.back() != '\n') std::printf("\n");
+    }
+
+    if (!parts.empty()) {
+        std::printf("\nparts:\n");
+        for (size_t i = 0; i < parts.size(); ++i)
+            std::printf("  pin %-3d %s\n", part_pins[i], parts[i]->describe().c_str());
+    }
+
+    // Report simulated time rather than raw cycles: "ran 1.00s of sketch time"
+    // is what the user asked for, and the cycle count is only meaningful once
+    // you know the clock.
+    double seconds = board->f_cpu > 0
+                         ? double(result.cycles) / double(board->f_cpu) : 0.0;
+    std::printf("\nran %.3fs of sketch time (%llu cycles)\n", seconds,
+                static_cast<unsigned long long>(result.cycles));
+
+    switch (result.outcome) {
+    case emu::RunOutcome::ReachedTime:
+        return 0;
+    case emu::RunOutcome::Halted:
+        // Not an error. A sketch whose loop() returns and whose setup() is
+        // done legitimately stops, and saying so beats reporting success in a
+        // way that hides it.
+        std::printf("sketch halted\n");
+        return 0;
+    case emu::RunOutcome::PartRequest:
+        std::printf("stopped at a part's request\n");
+        return 0;
+    case emu::RunOutcome::Fault:
+        std::fprintf(stderr, "error: %s\n", result.error.c_str());
+        return 1;
     }
     return 0;
 }
@@ -360,6 +548,7 @@ void print_help() {
         "  flash <file.hex>   upload a prebuilt image\n"
         "  dump [file.hex]    save the board's current firmware\n"
         "  monitor            open the serial monitor\n"
+        "  emulate [sketch]   run a sketch on a virtual board\n"
         "  ports              list serial ports\n"
         "  boards             list supported boards\n"
         "  doctor             diagnose toolchains and ports\n"
@@ -374,7 +563,13 @@ void print_help() {
         "  -baud <n>          monitor baud rate\n"
         "  -monitor, -m       open the monitor after a successful push\n"
         "  -backup [file]     save existing firmware before overwriting it\n"
-        "  -help, -h          show this help\n");
+        "  -help, -h          show this help\n"
+        "\n"
+        "emulate options:\n"
+        "  -for <time>        how long to run: 2s, 500ms, 1000c (default 1s)\n"
+        "  -wire <kind:pin>   attach a part, e.g. -wire led:13 (repeatable)\n"
+        "  -input <text>      feed this to the sketch's serial input\n"
+        "  -explain           report which execution core was selected\n");
 }
 
 } // namespace
@@ -395,6 +590,8 @@ int run_command(const Args& args) {
     if (args.command == "toolchain") return cmd_toolchain(args);
 
     Config cfg = load_config();
+
+    if (args.command == "emulate")   return cmd_emulate(args, cfg);
 
     if (args.command == "build" || args.command == "push") {
         if (args.positional.empty()) {

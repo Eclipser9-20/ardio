@@ -129,6 +129,15 @@ public:
     // part is not driving that pin at all.
     virtual PinState drive(int pin) const { (void)pin; return PinState::Floating; }
 
+    // Time passed without any pin this part watches moving.
+    //
+    // Parts need this because not everything a part does is driven by an edge.
+    // A scripted button press has no incoming edge to ride in on; an LED that
+    // is still lit has to keep accumulating time; a buzzer has to notice that
+    // the tone stopped rather than waiting forever for a rising edge that will
+    // not come. The run loop calls this whenever it advances peripherals.
+    virtual void advance(uint64_t cycles) { (void)cycles; }
+
     // A short human-readable line for the CLI, e.g. "led d13: on (blinked 4x)".
     virtual std::string describe() const = 0;
 };

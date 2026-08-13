@@ -39,6 +39,8 @@ add_library(libardio STATIC
     src/emu/core_reference.cpp
     src/emu/core_arm64.cpp
     src/emu/core_select.cpp
+    src/emu/board.cpp
+    src/emu/parts.cpp
     src/emu/peripherals.cpp
     src/avr/lexer.cpp
     src/avr/preprocess.cpp
@@ -95,6 +97,8 @@ add_executable(ardio_tests
     tests/test_device.cpp
     tests/test_emu_core.cpp
     tests/test_emu_jit.cpp
+    tests/test_emu_board.cpp
+    tests/test_emu_parts.cpp
     tests/test_emu_peripherals.cpp
     tests/test_serial_fake.cpp
     tests/test_programmer.cpp

@@ -9,7 +9,8 @@ namespace {
 
 // Every option is spelled the same way with one dash or two: "-port" and
 // "--port" are the same flag. The leading dashes carry no meaning here.
-enum class Flag { None, Port, Board, Baud, Monitor, Backup, Help, Manual };
+enum class Flag { None, Port, Board, Baud, Monitor, Backup, Help, Manual,
+                  For, Wire, Input, Explain };
 
 struct FlagSpec {
     std::string_view name;
@@ -26,6 +27,11 @@ constexpr FlagSpec kFlags[] = {
     {"monitor", Flag::Monitor, true},
     {"manual",  Flag::Manual,  true},
     {"help",    Flag::Help,    true},
+    // emulate options.
+    {"for",     Flag::For,     true},
+    {"wire",    Flag::Wire,    true},
+    {"input",   Flag::Input,   true},
+    {"explain", Flag::Explain, true},
     // Single-letter forms. These are exact-only: "-m" is monitor and can
     // never be read as a prefix of "manual".
     {"m",       Flag::Monitor, false},
@@ -133,6 +139,23 @@ Args parse_args(int argc, char** argv) {
             a.backup_first = true;
             // An optional filename may follow, but not another flag.
             if (i + 1 < argc && !is_flag(argv[i + 1])) a.backup_path = argv[++i];
+            break;
+        case Flag::For:
+            if (!take_value(arg, a.run_for)) return a;
+            break;
+        case Flag::Wire: {
+            // Repeatable rather than last-one-wins: wiring two parts to a
+            // board is the normal case, not a mistake to be resolved.
+            std::string v;
+            if (!take_value(arg, v)) return a;
+            a.wires.push_back(v);
+            break;
+        }
+        case Flag::Input:
+            if (!take_value(arg, a.serial_input)) return a;
+            break;
+        case Flag::Explain:
+            a.explain = true;
             break;
         case Flag::Help:
             a.help = true;
