@@ -694,3 +694,130 @@ TEST(builtin_led_pin_resolves_to_a_port_bit) {
     port->write(m.pin_reg, uint8_t(1u << m.bit));                 // toggle
     CHECK(port->drive(m.bit) == PinState::Low);
 }
+
+// ============================================ a part that is not the 328P ===
+//
+// The ATmega8 is in the device table precisely because it disagrees with every
+// later part about where its peripherals live and what they contain. These
+// check that the peripherals take the disagreement from the description rather
+// than carrying 328P assumptions, which is the whole reason the table exists.
+
+namespace {
+
+const ardio::avr::AvrDevice& mega8() {
+    const ardio::avr::AvrDevice* d = ardio::avr::find_device("atmega8");
+    static ardio::avr::AvrDevice fallback;
+    return d ? *d : fallback;
+}
+
+} // namespace
+
+TEST(atmega8_timer_has_no_output_compare_and_claims_no_zero_address) {
+    // Timer 0 on this part is a plain counter: one TCCR0 with the clock
+    // select bits, no waveform register, no OCR0. The table says so by leaving
+    // tccr0a at zero, and a peripheral that answered for address zero would be
+    // shadowing r0 -- silently, and for every access the sketch makes to it.
+    Timer0 t(mega8());
+    CHECK(!t.claims(0));
+    CHECK_EQ(int(t.ocr0a_addr()), 0);
+    CHECK_EQ(int(t.ocr0b_addr()), 0);
+
+    // And nothing derived lands on a register that does exist: TCCR0 is at the
+    // address a 328P-shaped derivation would have called OCR0A.
+    CHECK_EQ(int(mega8().tccr0b), 0x33);
+    CHECK_EQ(int(mega8().tcnt0), 0x32);
+}
+
+TEST(atmega8_timer_still_overflows_on_the_right_cycle) {
+    Timer0 t(mega8());
+    t.write(mega8().tccr0b, 0x03);       // clk/64, the only mode there is
+    CHECK(t.next_event() == 16384u);
+
+    t.advance(16383);
+    CHECK_EQ(int(t.tifr() & 0x01), 0);
+    t.advance(16384);
+    CHECK_EQ(int(t.tifr() & 0x01), 0x01);
+
+    // Bits 1 and 2 of this part's TIFR belong to timer 1, so timer 0 must
+    // leave them alone rather than reporting compare matches it cannot have.
+    CHECK_EQ(int(t.tifr() & 0x06), 0);
+
+    t.write(mega8().timsk0, 0x01);
+    CHECK_EQ(int(t.pending_interrupt()), 9);
+    t.acknowledge_interrupt();
+    CHECK_EQ(int(t.pending_interrupt()), 0);
+}
+
+TEST(atmega8_adc_does_not_answer_for_sfior) {
+    // There is no ADCSRB on this part; the auto-trigger bits live in SFIOR,
+    // which also carries the pull-up disable and the timer prescaler resets.
+    // Claiming it would let the ADC swallow writes meant for those.
+    Adc a(mega8());
+    CHECK(!a.claims(0x50));
+    CHECK(a.claims(mega8().admux));
+    CHECK(a.claims(mega8().adcsra));
+
+    // On a part that really has one, it is claimed.
+    Adc modern(mega328p());
+    CHECK(modern.claims(mega328p().adcsrb));
+}
+
+TEST(atmega8_usart_tells_ucsrc_from_ubrrh_by_the_ursel_bit) {
+    // Both registers are one location here. URSEL, bit 7 of the value written,
+    // is what says which of the two the write is for -- so a divisor high byte
+    // and a frame-format byte go to the same address and must not be told
+    // apart by the order the fields happen to be checked in.
+    const ardio::avr::AvrDevice& d = mega8();
+    CHECK_EQ(int(d.ucsrc), int(d.ubrrh));
+
+    Usart0 u(mega8());
+    u.write(d.ubrrh, 0x01);              // URSEL clear: the divisor high byte
+    u.write(d.ubrrl, 0x00);
+    CHECK_EQ(int(u.read(d.ubrrh)), 0x01);
+    CHECK(u.frame_cycles() == 257u * 16u * 10u);
+
+    u.write(d.ucsrc, 0x86);              // URSEL set: 8N1 into UCSRC
+    CHECK_EQ(int(u.read(d.ubrrh)), 0x01);      // the divisor is untouched
+    CHECK(u.frame_cycles() == 257u * 16u * 10u);
+
+    u.write(d.ucsrc, 0x8E);              // URSEL set: 8N2
+    CHECK(u.frame_cycles() == 257u * 16u * 11u);
+}
+
+TEST(atmega8_usart_transmits_at_its_own_addresses) {
+    const ardio::avr::AvrDevice& d = mega8();
+    Usart0 u(mega8());
+    CHECK(u.claims(0x2B));               // UCSRA, down in low I/O space
+    CHECK(u.claims(0x2C));               // UDR
+
+    u.write(d.ubrrl, 51);                // 9600 baud at 8 MHz
+    u.write(d.ucsrb, 0x18);
+    u.write(d.udr, 'y');
+    CHECK(u.next_event() == 52u * 16u * 10u);
+    u.advance(52 * 16 * 10);
+    CHECK(u.output() == std::string("y"));
+}
+
+TEST(atmega8_peripherals_claim_disjoint_addresses) {
+    ardio::emu::PeripheralSet set = ardio::emu::make_standard_peripherals(mega8());
+    CHECK(set.timer0 != nullptr);
+    CHECK(set.usart0 != nullptr);
+    CHECK(set.adc != nullptr);
+
+    // Only the three register-block peripherals are checked here, not the
+    // ports. The ATmega8's ports are at 0x30, 0x33 and 0x36 in data space, but
+    // the pin map in the device table carries the 328P's 0x23, 0x26 and 0x29
+    // -- which on this part are the ADC and the USART. That overlap is real
+    // and it lives in the description, not in these peripherals: an emulated
+    // digitalWrite on this part would land on ADCH. Asserting the ports are
+    // disjoint would be asserting the table is right about something it is
+    // not, so what is checked is what this file is answerable for.
+    const ardio::emu::Peripheral* blocks[] = {set.timer0, set.usart0, set.adc};
+    for (uint32_t addr = 0; addr <= 0xFFFF; ++addr) {
+        int claims = 0;
+        for (const ardio::emu::Peripheral* p : blocks)
+            if (p->claims(uint16_t(addr))) ++claims;
+        CHECK(claims <= 1);
+        if (claims > 1) break;
+    }
+}

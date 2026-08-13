@@ -80,7 +80,19 @@ public:
     // to set State::deadline, so a machine doing nothing costs nothing.
     virtual uint64_t next_event() const { return UINT64_MAX; }
 
-    // Vector number to fire, or 0 for none. Checked after advance().
+    // Vector number to fire, or 0 for none.
+    //
+    // The core must check this after every advance() AND whenever the guest
+    // sets the global interrupt enable, not only when a deadline arrives.
+    // Some interrupt sources are level-asserted rather than edge-triggered --
+    // UDRE with UDRIE set is the standard example, since the transmit register
+    // is empty and stays empty -- so there is no future event for next_event()
+    // to schedule and a core that waits for a deadline would sleep through it.
+    //
+    // A peripheral must NOT work around this by returning a past cycle from
+    // next_event() to force a wakeup. That livelocks the core whenever such a
+    // flag is asserted while interrupts are globally disabled, which is an
+    // ordinary critical section rather than an error.
     virtual uint8_t pending_interrupt() const { return 0; }
     virtual void acknowledge_interrupt() {}
 };

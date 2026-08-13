@@ -113,18 +113,19 @@ __ardio_adc_none:
 ; The Arduino spelling, which accepts either an analog input number or the
 ; digital pin number the same physical pin carries.
 ;
-; The 14 below is the one part-specific number left in the runtime, and it is
-; here because the device description does not carry the fact it stands for:
-; the digital pin number of A0. AD_NUM_PINS - AD_NUM_ANALOG comes to 14 on most
-; parts and would be the obvious substitute, but it is 12 on the ATmega328P,
-; whose table lists eight analog inputs while only six of them have a digital
-; pin at all (A6 and A7 are ADC-only pads). Folding pin 14 by 12 would select
-; channel 2 and return a reading from the wrong pin -- a wrong answer with
-; nothing to show for itself. Until the description carries A0's digital pin
-; number this stays a literal, and stays wrong only on parts whose A0 is not
-; pin 14, where today it is wrong anyway.
+; Anything below AD_ANALOG_PIN_BASE, the digital pin number A0 also answers to,
+; is already an analog input number; anything at or above it is a digital pin
+; number, and subtracting the base turns it back into one.
+;
+; That base is carried by the device description rather than worked out here,
+; because it cannot be derived from the other constants. AD_NUM_PINS -
+; AD_NUM_ANALOG is the tempting shortcut and it agrees on most parts, but on the
+; ATmega328P it gives 12 instead of 14: that table lists eight analog inputs
+; while only six of them have a digital pin behind them, A6 and A7 being
+; ADC-only pads with no port bit. Folding pin 14 by 12 would select channel 2
+; and hand back an entirely plausible reading from the wrong pin.
 analogRead:
-        cpi     r24, 14
+        cpi     r24, AD_ANALOG_PIN_BASE
         brlo    analog_read
-        subi    r24, 14
+        subi    r24, AD_ANALOG_PIN_BASE
         rjmp    analog_read

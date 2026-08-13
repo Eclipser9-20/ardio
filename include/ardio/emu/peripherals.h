@@ -128,6 +128,9 @@ private:
     uint16_t timsk0_ = 0, tifr0_ = 0;
     uint8_t vec_ovf_ = 0, vec_compa_ = 0, vec_compb_ = 0;
 
+    // False on a part whose timer 0 is a plain counter with no output compare.
+    bool has_compare_ = true;
+
     uint8_t tccr0a_v_ = 0, tccr0b_v_ = 0, ocr0a_v_ = 0, ocr0b_v_ = 0;
     uint8_t timsk0_v_ = 0, tifr_ = 0;
 
@@ -187,6 +190,9 @@ private:
     uint16_t ucsra_ = 0, ucsrb_ = 0, ucsrc_ = 0;
     uint16_t ubrrl_ = 0, ubrrh_ = 0, udr_ = 0;
     uint8_t vec_rx_ = 0, vec_udre_ = 0, vec_tx_ = 0;
+
+    // True where UCSRC and UBRRH are one location behind the URSEL bit.
+    bool shared_ucsrc_ubrrh_ = false;
 
     uint8_t ucsra_v_ = 0x20;   // UDRE is set out of reset: the buffer is empty
     uint8_t ucsrb_v_ = 0;
@@ -249,6 +255,10 @@ private:
 
     uint16_t admux_ = 0, adcsra_ = 0, adcsrb_ = 0, adcl_ = 0, adch_ = 0;
     uint8_t vec_adc_ = 0;
+
+    // False where the device's adcsrb field points at a register that is not
+    // an ADCSRB, which this peripheral must not answer for.
+    bool owns_adcsrb_ = false;
 
     uint8_t admux_v_ = 0, adcsra_v_ = 0, adcsrb_v_ = 0;
     uint16_t result_ = 0;

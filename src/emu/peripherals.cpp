@@ -28,6 +28,15 @@
 // waking up too often. Concretely: timer 0 schedules a wakeup for every flag
 // it could set, including flags whose interrupt is not enabled, because a
 // sketch polling TIFR0 must see the flag at the cycle the hardware would.
+//
+// One thing these rely on that the Peripheral interface does not state:
+// read() and write() carry no cycle count, so each peripheral dates a write
+// from the last cycle it was advanced to. A USART frame started by a write to
+// UDR is timed from there, and so is an ADC conversion. The core must
+// therefore advance a peripheral to the current cycle before handing it an
+// access, or a byte will finish as much too early as the access ran ahead of
+// the last advance. Nothing here can detect the omission, which is why it is
+// written down.
 
 #include "ardio/emu/peripherals.h"
 
@@ -54,6 +63,9 @@ uint32_t ticks_until(uint32_t from, uint32_t to, uint32_t period) {
 GpioPort::GpioPort(uint16_t pin_reg, char label) : pin_reg_(pin_reg), label_(label) {}
 
 bool GpioPort::claims(uint16_t addr) const {
+    // A port at address 0 is a port the part does not have, and answering for
+    // address 0 would shadow r0 rather than model anything.
+    if (pin_reg_ == 0) return false;
     return addr >= pin_reg_ && addr <= uint16_t(pin_reg_ + 2);
 }
 
@@ -134,11 +146,18 @@ Timer0::Timer0(const avr::AvrDevice& device) {
 
     // OCR0A and OCR0B are not in the device table, but on every part that has
     // the TCCR0A/TCCR0B pair they sit immediately above TCNT0, in that order.
-    // The exception is the ATmega8, whose timer 0 has no output compare at
-    // all and no TCCR0A -- so the same condition that makes those registers
-    // exist is the one that makes this derivation hold.
-    ocr0a_ = uint16_t(tcnt0_ + 1);
-    ocr0b_ = uint16_t(tcnt0_ + 2);
+    // Both facts hang off the same condition: TCCR0A exists only on the parts
+    // whose timer 0 has an output compare unit. The ATmega8's timer 0 is a
+    // plain counter -- one TCCR0 with the clock select bits, no waveform
+    // register and no OCR0 at all -- and the device table says so by leaving
+    // tccr0a at zero. Deriving OCR0A anyway would put it on top of that part's
+    // TCCR0, and claiming a tccr0a of 0 would make this peripheral answer for
+    // data-space address 0, which is r0.
+    has_compare_ = tccr0a_ != 0;
+    if (has_compare_) {
+        ocr0a_ = uint16_t(tcnt0_ + 1);
+        ocr0b_ = uint16_t(tcnt0_ + 2);
+    }
 
     vec_ovf_ = device.timer0_ovf_vector;
     // The three timer 0 vectors are always adjacent and always in the order
@@ -149,6 +168,10 @@ Timer0::Timer0(const avr::AvrDevice& device) {
 }
 
 bool Timer0::claims(uint16_t addr) const {
+    // Address 0 is r0, never a register: a zero in the device table means the
+    // part does not have that register, and answering for it would shadow the
+    // register file.
+    if (addr == 0) return false;
     return addr == tccr0a_ || addr == tccr0b_ || addr == tcnt0_ ||
            addr == ocr0a_ || addr == ocr0b_ || addr == timsk0_ || addr == tifr0_;
 }
@@ -169,12 +192,15 @@ uint32_t Timer0::prescaler() const {
 
 bool Timer0::phase_correct() const {
     // WGM01:0 are TCCR0A bits 1:0, WGM02 is TCCR0B bit 3. Modes 1 and 5 are
-    // the phase-correct ones.
+    // the phase-correct ones. A part with no waveform register has no modes:
+    // its timer 0 only ever counts up through the full eight bits.
+    if (!has_compare_) return false;
     uint8_t wgm = uint8_t((tccr0a_v_ & 0x03) | ((tccr0b_v_ & 0x08) >> 1));
     return wgm == 1 || wgm == 5;
 }
 
 uint32_t Timer0::top() const {
+    if (!has_compare_) return 0xFF;
     uint8_t wgm = uint8_t((tccr0a_v_ & 0x03) | ((tccr0b_v_ & 0x08) >> 1));
     // Modes 2 (CTC), 5 (phase-correct with OCR0A as TOP) and 7 (fast PWM with
     // OCR0A as TOP) take TOP from OCR0A; the rest count the full 8 bits.
@@ -240,11 +266,15 @@ void Timer0::catch_up(uint64_t cycles) {
     };
 
     if (crossed(0)) tifr_ |= 0x01;
-    if (ocr0a_v_ <= t) {
+    // Bits 1 and 2 of TIFR are the timer 0 compare flags only on a part that
+    // has a timer 0 compare unit. On the ATmega8 that register is shared with
+    // timers 1 and 2 and those two bits belong to timer 1, so setting them
+    // here would raise another timer's interrupt.
+    if (has_compare_ && ocr0a_v_ <= t) {
         if (crossed(ocr0a_v_)) tifr_ |= 0x02;
         if (pc && crossed((2 * t - ocr0a_v_) % per)) tifr_ |= 0x02;
     }
-    if (ocr0b_v_ <= t) {
+    if (has_compare_ && ocr0b_v_ <= t) {
         if (crossed(ocr0b_v_)) tifr_ |= 0x04;
         if (pc && crossed((2 * t - ocr0b_v_) % per)) tifr_ |= 0x04;
     }
@@ -255,6 +285,7 @@ void Timer0::catch_up(uint64_t cycles) {
 void Timer0::advance(uint64_t cycles) { catch_up(cycles); }
 
 uint8_t Timer0::read(uint16_t addr) {
+    if (addr == 0) return 0;
     if (addr == tccr0a_) return tccr0a_v_;
     if (addr == tccr0b_) return tccr0b_v_;
     if (addr == tcnt0_) return uint8_t(count_from_position());
@@ -266,6 +297,7 @@ uint8_t Timer0::read(uint16_t addr) {
 }
 
 void Timer0::write(uint16_t addr, uint8_t value) {
+    if (addr == 0) return;
     if (addr == tccr0a_) { tccr0a_v_ = value; return; }
     if (addr == tccr0b_) {
         // A prescaler change restarts the divider chain from a known point.
@@ -310,11 +342,11 @@ uint64_t Timer0::next_event() const {
         // Compare matches are scheduled whether or not their interrupt is
         // enabled, because TIFR0 is polled as often as it is used as an
         // interrupt source, and a poll must see the flag on the right cycle.
-        if (ocr0a_v_ <= t) {
+        if (has_compare_ && ocr0a_v_ <= t) {
             consider(ocr0a_v_);
             if (pc) consider((2 * t - ocr0a_v_) % per);
         }
-        if (ocr0b_v_ <= t) {
+        if (has_compare_ && ocr0b_v_ <= t) {
             consider(ocr0b_v_);
             if (pc) consider((2 * t - ocr0b_v_) % per);
         }
@@ -328,6 +360,8 @@ uint64_t Timer0::next_event() const {
 
 uint8_t Timer0::pending_interrupt() const {
     // Lowest vector number first: that is the hardware's own priority order.
+    if (!has_compare_)
+        return ((tifr_ & 0x01) && (timsk0_v_ & 0x01)) ? vec_ovf_ : 0;
     if ((tifr_ & 0x02) && (timsk0_v_ & 0x02)) return vec_compa_;
     if ((tifr_ & 0x04) && (timsk0_v_ & 0x04)) return vec_compb_;
     if ((tifr_ & 0x01) && (timsk0_v_ & 0x01)) return vec_ovf_;
@@ -336,6 +370,10 @@ uint8_t Timer0::pending_interrupt() const {
 
 void Timer0::acknowledge_interrupt() {
     // Entering the vector clears the flag that caused it, and only that one.
+    if (!has_compare_) {
+        if ((tifr_ & 0x01) && (timsk0_v_ & 0x01)) tifr_ &= uint8_t(~0x01);
+        return;
+    }
     if ((tifr_ & 0x02) && (timsk0_v_ & 0x02)) { tifr_ &= uint8_t(~0x02); return; }
     if ((tifr_ & 0x04) && (timsk0_v_ & 0x04)) { tifr_ &= uint8_t(~0x04); return; }
     if ((tifr_ & 0x01) && (timsk0_v_ & 0x01)) { tifr_ &= uint8_t(~0x01); return; }
@@ -366,6 +404,14 @@ Usart0::Usart0(const avr::AvrDevice& device) {
     ubrrl_ = device.ubrrl;
     ubrrh_ = device.ubrrh;
     udr_   = device.udr;
+
+    // On the ATmega8 UCSRC and UBRRH are one location, told apart by the URSEL
+    // bit in the value written: URSEL set means the write is meant for UCSRC.
+    // The two fields in the device table then carry the same address, which is
+    // the only way to notice from here -- and a model that checked them in
+    // declaration order would send every baud-rate high byte to UCSRC and get
+    // the divisor wrong on that part alone.
+    shared_ucsrc_ubrrh_ = (ucsrc_ != 0 && ucsrc_ == ubrrh_);
 
     // The USART vectors are not in the device table. On every part in it they
     // follow the timer 0 overflow vector at a fixed distance, in the order RX,
@@ -420,9 +466,16 @@ void Usart0::start_next_rx() {
 uint8_t Usart0::read(uint16_t addr) {
     if (addr == ucsra_) return ucsra_v_;
     if (addr == ucsrb_) return ucsrb_v_;
-    if (addr == ucsrc_) return ucsrc_v_;
+    if (addr == ucsrc_ && !shared_ucsrc_ubrrh_) return ucsrc_v_;
     if (addr == ubrrl_) return uint8_t(ubrr_v_ & 0xFF);
-    if (addr == ubrrh_) return uint8_t(ubrr_v_ >> 8);
+    if (addr == ubrrh_) {
+        // A plain read of the shared location returns UBRRH. Real silicon
+        // gives UCSRC only to the second of two back-to-back reads, which
+        // nothing in ardio's runtime does; modelling that would mean tracking
+        // the previous instruction here, and getting UBRRH is what a single
+        // read is defined to produce.
+        return uint8_t(ubrr_v_ >> 8);
+    }
     if (addr == udr_) {
         uint8_t v = rx_data_;
         // Reading the data register is what acknowledges a received byte, so
@@ -454,7 +507,11 @@ void Usart0::write(uint16_t addr, uint8_t value) {
         }
         return;
     }
-    if (addr == ucsrc_) { ucsrc_v_ = value; return; }
+    if (addr == ucsrc_ && (!shared_ucsrc_ubrrh_ || (value & 0x80))) {
+        // URSEL is bit 7 and is not part of UCSRC's own contents.
+        ucsrc_v_ = shared_ucsrc_ubrrh_ ? uint8_t(value & 0x7F) : value;
+        return;
+    }
     if (addr == ubrrl_) { ubrr_v_ = uint16_t((ubrr_v_ & 0xFF00) | value); return; }
     if (addr == ubrrh_) { ubrr_v_ = uint16_t((ubrr_v_ & 0x00FF) | (uint16_t(value & 0x0F) << 8)); return; }
     if (addr == udr_) {
@@ -565,6 +622,18 @@ Adc::Adc(const avr::AvrDevice& device) {
     admux_  = device.admux;
     adcsra_ = device.adcsra;
     adcsrb_ = device.adcsrb;
+
+    // ADCSRB is only this peripheral's to answer for when it sits inside the
+    // ADC's own register block. On the ATmega8 there is no ADCSRB: the
+    // auto-trigger source bits live in SFIOR, and the device table points the
+    // field there because that is the register holding the same bits. SFIOR
+    // also carries the pull-up disable and the timer prescaler resets, so
+    // claiming it would let the ADC swallow writes that have nothing to do
+    // with it. The test is positional rather than by part name: on a part that
+    // really has an ADCSRB it is one of the five contiguous ADC registers.
+    uint16_t lo = std::min(std::min(adcl_, adch_), std::min(adcsra_, admux_));
+    uint16_t hi = std::max(std::max(adcl_, adch_), std::max(adcsra_, admux_));
+    owns_adcsrb_ = adcsrb_ != 0 && adcsrb_ >= lo && adcsrb_ <= hi;
     adcl_   = device.adcl;
     adch_   = device.adch;
 
@@ -576,8 +645,9 @@ Adc::Adc(const avr::AvrDevice& device) {
 }
 
 bool Adc::claims(uint16_t addr) const {
-    return addr == admux_ || addr == adcsra_ || addr == adcsrb_ ||
-           addr == adcl_ || addr == adch_;
+    if (addr == 0) return false;   // address 0 is r0, not a missing register
+    if (owns_adcsrb_ && addr == adcsrb_) return true;
+    return addr == admux_ || addr == adcsra_ || addr == adcl_ || addr == adch_;
 }
 
 uint32_t Adc::prescaler() const {
@@ -624,7 +694,7 @@ double Adc::channel_voltage(uint8_t channel) const {
 uint8_t Adc::read(uint16_t addr) {
     if (addr == admux_) return admux_v_;
     if (addr == adcsra_) return adcsra_v_;
-    if (addr == adcsrb_) return adcsrb_v_;
+    if (owns_adcsrb_ && addr == adcsrb_) return adcsrb_v_;
     if (addr == adcl_ || addr == adch_) {
         // ADLAR shifts the ten bits to the top of the pair, so a sketch that
         // only wants eight bits can read ADCH alone.
@@ -636,7 +706,7 @@ uint8_t Adc::read(uint16_t addr) {
 
 void Adc::write(uint16_t addr, uint8_t value) {
     if (addr == admux_) { admux_v_ = value; return; }
-    if (addr == adcsrb_) { adcsrb_v_ = value; return; }
+    if (owns_adcsrb_ && addr == adcsrb_) { adcsrb_v_ = value; return; }
     if (addr == adcsra_) {
         if (value & kAdif) adcsra_v_ &= uint8_t(~kAdif);   // written as a one to clear
         adcsra_v_ = uint8_t((adcsra_v_ & kAdif) | (value & ~kAdif));

@@ -120,6 +120,10 @@ AvrDevice make_atmega328p() {
         pin(PIN_C, 4), pin(PIN_C, 5),
     };
     d.analog = {ana(0), ana(1), ana(2), ana(3), ana(4), ana(5), ana(6), ana(7)};
+    // A0 is the pin numbered 14 above. It cannot be derived by subtracting the
+    // analog count from the pin count, because A6 and A7 are counted as analog
+    // inputs and have no digital pin to be subtracted.
+    d.analog_pin_base = 14;
     d.led_builtin = 13;
     return d;
 }
@@ -193,6 +197,11 @@ AvrDevice make_atmega32u4() {
         ana(7), ana(6), ana(5), ana(4), ana(1), ana(0),
         ana(8), ana(10), ana(11), ana(12), ana(13), ana(9),
     };
+    // A0 is digital 18 on the Leonardo, the first of the six PORTF entries in
+    // the table above. The six aliases A6-A11 sit at 24 and up and are not
+    // contiguous with it, so folding a digital pin to an analog number is only
+    // meaningful for the first six.
+    d.analog_pin_base = 18;
     d.led_builtin = 13;
     return d;
 }
@@ -244,6 +253,8 @@ AvrDevice make_atmega2560() {
         ana(0), ana(1), ana(2),  ana(3),  ana(4),  ana(5),  ana(6),  ana(7),
         ana(8), ana(9), ana(10), ana(11), ana(12), ana(13), ana(14), ana(15),
     };
+    // A0 is digital 54, where the PORTF block starts in the table above.
+    d.analog_pin_base = 54;
     d.led_builtin = 13;
     return d;
 }
@@ -288,6 +299,12 @@ AvrDevice make_atmega1284p() {
         pin(PIN_A, 4), pin(PIN_A, 5), pin(PIN_A, 6), pin(PIN_A, 7),
     };
     d.analog = {ana(0), ana(1), ana(2), ana(3), ana(4), ana(5), ana(6), ana(7)};
+    // PORTA carries the ADC inputs and is the last block in the numbering
+    // above, so A0 is digital 24. This follows from the pin table rather than
+    // from any official pinout -- there is no official one for this part, and
+    // third-party cores that number the ports in a different order arrive at a
+    // different answer. The two must be changed together.
+    d.analog_pin_base = 24;
     d.led_builtin = 13;
     return d;
 }
@@ -363,6 +380,10 @@ AvrDevice make_atmega8() {
     // the surface-mount package have no header on any board that used this
     // part, so they are not offered.
     d.analog = {ana(0), ana(1), ana(2), ana(3), ana(4), ana(5)};
+    // The same silkscreen as the 328P boards, so A0 is digital 14 here too --
+    // and here it happens to equal pins.size() - analog.size(), which is a
+    // coincidence of this part having no ADC-only pads rather than a rule.
+    d.analog_pin_base = 14;
     d.led_builtin = 13;
     return d;
 }
@@ -424,6 +445,7 @@ std::string device_prelude(const AvrDevice& device, int f_cpu) {
     equ(out, "AD_F_CPU", std::to_string(f_cpu));
     equ(out, "AD_NUM_PINS", std::to_string(device.pins.size()));
     equ(out, "AD_NUM_ANALOG", std::to_string(device.analog.size()));
+    equ(out, "AD_ANALOG_PIN_BASE", std::to_string(device.analog_pin_base));
     out += "\n";
 
     // These three are the exception to the data-space rule above, and it is a

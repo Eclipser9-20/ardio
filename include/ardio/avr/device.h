@@ -93,6 +93,18 @@ struct AvrDevice {
     std::vector<AnalogMapping> analog;  // indexed by the number in "A<n>"
 
     uint8_t led_builtin = 0;  // digital pin number of the on-board LED
+
+    // The digital pin number that A0 also answers to, so analogRead(14) and
+    // analogRead(0) mean the same input on a board numbered like the Uno.
+    //
+    // This cannot be derived as pins.size() - analog.size(), which is the
+    // tempting shortcut. On the ATmega328P that subtraction gives 12 rather
+    // than 14, because the table lists eight analog inputs while only six of
+    // them have a digital pin behind them: A6 and A7 are ADC-only pads with no
+    // port bit at all. Using the subtraction would make analogRead(14) sample
+    // channel 2 and return an entirely plausible reading from the wrong pin,
+    // which is the kind of wrong that gets debugged with an oscilloscope.
+    uint8_t analog_pin_base = 0;
 };
 
 // Looks a part up by the name used in Board::mcu. Returns nullptr if ardio has
@@ -108,6 +120,7 @@ const std::vector<AvrDevice>& device_database();
 //
 //   .equ constants
 //     AD_RAMEND, AD_RAMSTART, AD_F_CPU, AD_NUM_PINS, AD_NUM_ANALOG
+//     AD_ANALOG_PIN_BASE
 //     AD_SREG, AD_SPL, AD_SPH                 (identical on all AVR8 parts)
 //       These three are I/O-space addresses (0x3F, 0x3D, 0x3E), not data-space
 //       ones like everything else here. The reset sequence reaches them with

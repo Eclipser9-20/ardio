@@ -12,6 +12,7 @@
 #include "ardio/avr/assembler.h"
 #include "ardio/avr/device.h"
 
+#include <algorithm>
 #include <string>
 
 using ardio::avr::AvrDevice;
@@ -348,6 +349,72 @@ TEST(atmega1284p_has_sixteen_kilobytes_of_ram_and_four_full_ports) {
     CHECK_EQ(d.analog.size(), size_t(8));
 }
 
+TEST(a0_is_digital_pin_14_and_not_the_difference_of_the_two_counts) {
+    const AvrDevice& d = device("atmega328p");
+    CHECK_EQ(int(d.analog_pin_base), 14);
+    // The arithmetic shortcut gives 12 here, because A6 and A7 are counted as
+    // analog inputs and have no digital pin to subtract. Twelve would make
+    // analogRead(14) sample channel 2 and hand back an entirely plausible
+    // number from the wrong pad. Pinning the inequality is what stops the
+    // shortcut being reintroduced later as a tidy-up.
+    CHECK_EQ(d.pins.size() - d.analog.size(), size_t(12));
+    CHECK(size_t(d.analog_pin_base) != d.pins.size() - d.analog.size());
+}
+
+TEST(every_parts_analog_pin_base_agrees_with_its_own_pin_table) {
+    // A0's digital pin and the first analog entry name the same pad, so the
+    // base has to land on a real pin, and the analog inputs that do have
+    // digital pins have to continue consecutively from it -- that consecutive
+    // run is the whole premise of folding a pin number by subtraction.
+    for (const AvrDevice& d : ardio::avr::device_database()) {
+        size_t base = d.analog_pin_base;
+        if (base >= d.pins.size()) {
+            ::ardio_test::fail(__FILE__, __LINE__,
+                               d.name + ": analog_pin_base is not a digital pin");
+            continue;
+        }
+        CHECK(d.pins[base].pin_reg != 0);
+
+        // The run is shorter than the analog count wherever the part has
+        // ADC-only pads: the 328P's A6 and A7 sit past the end of the pin
+        // table altogether. The Leonardo leaves the run after A5, where
+        // A6-A11 become aliases numbered 24 and up, and the Mega's A8-A15 are
+        // on PORTK in extended I/O, which a byte-wide address cannot reach.
+        size_t run = std::min(d.analog.size(), d.pins.size() - base);
+        if (d.name == "atmega32u4") run = std::min(run, size_t(6));
+        CHECK(run >= 6);
+        bool extended_io = d.name == "atmega2560" || d.name == "atmega1280";
+        for (size_t a = 0; a < run; ++a) {
+            if (d.pins[base + a].pin_reg == 0 && !extended_io)
+                ::ardio_test::fail(__FILE__, __LINE__,
+                                   d.name + ": A" + std::to_string(a) +
+                                       " has no digital pin behind it");
+        }
+    }
+
+    CHECK_EQ(int(device("atmega168").analog_pin_base), 14);
+    CHECK_EQ(int(device("atmega8").analog_pin_base), 14);
+    CHECK_EQ(int(device("atmega32u4").analog_pin_base), 18);
+    CHECK_EQ(int(device("atmega2560").analog_pin_base), 54);
+    CHECK_EQ(int(device("atmega1280").analog_pin_base), 54);
+    // Derived from this table's own numbering, which puts PORTA last.
+    CHECK_EQ(int(device("atmega1284p").analog_pin_base), 24);
+}
+
+TEST(the_pin_at_the_analog_base_is_the_port_bit_a0_lives_on) {
+    // Spot checks that each base lands on the pad A0 actually is, read out of
+    // the pin table rather than restated as a second number.
+    CHECK_EQ(int(device("atmega328p").pins[14].pin_reg), 0x26);   // PC0
+    CHECK_EQ(int(device("atmega328p").pins[14].bit), 0);
+    CHECK_EQ(int(device("atmega8").pins[14].pin_reg), 0x26);      // PC0
+    CHECK_EQ(int(device("atmega32u4").pins[18].pin_reg), 0x2F);   // PF7
+    CHECK_EQ(int(device("atmega32u4").pins[18].bit), 7);
+    CHECK_EQ(int(device("atmega2560").pins[54].pin_reg), 0x2F);   // PF0
+    CHECK_EQ(int(device("atmega2560").pins[54].bit), 0);
+    CHECK_EQ(int(device("atmega1284p").pins[24].pin_reg), 0x20);  // PA0
+    CHECK_EQ(int(device("atmega1284p").pins[24].bit), 0);
+}
+
 TEST(the_table_holds_every_part_ardio_claims_to_support) {
     const auto& table = ardio::avr::device_database();
     CHECK_EQ(table.size(), size_t(7));
@@ -387,6 +454,8 @@ TEST(the_prelude_defines_every_name_the_contract_promises) {
     // source that mentions all of them proves each one exists.
     const char* names[] = {
         "AD_RAMEND", "AD_RAMSTART", "AD_F_CPU",  "AD_NUM_PINS", "AD_NUM_ANALOG",
+        "AD_ANALOG_PIN_BASE",
+        "AD_ANALOG_PIN_BASE",
         "AD_SREG",   "AD_SPL",      "AD_SPH",
         "AD_UCSRA",  "AD_UCSRB",    "AD_UCSRC",  "AD_UBRRL",    "AD_UBRRH", "AD_UDR",
         "AD_ADMUX",  "AD_ADCSRA",   "AD_ADCSRB", "AD_ADCL",     "AD_ADCH",
@@ -416,6 +485,12 @@ TEST(the_prelude_constants_carry_the_devices_values) {
     CHECK_EQ(v, 20L);
     CHECK(symbol_value(prelude, "AD_NUM_ANALOG", v));
     CHECK_EQ(v, 8L);
+    // The constant adc.S needs in place of a hardcoded 14.
+    CHECK(symbol_value(prelude, "AD_ANALOG_PIN_BASE", v));
+    CHECK_EQ(v, 14L);
+    // The constant adc.S needs in place of the hardcoded 14 it used to carry.
+    CHECK(symbol_value(prelude, "AD_ANALOG_PIN_BASE", v));
+    CHECK_EQ(v, 14L);
     CHECK(symbol_value(prelude, "AD_UDR", v));
     CHECK_EQ(v, 0xC6L);
     CHECK(symbol_value(prelude, "AD_LED_BUILTIN", v));
@@ -446,6 +521,21 @@ TEST(the_prelude_constants_carry_the_devices_values) {
     long other = 0;
     CHECK(symbol_value(faster, "AD_F_CPU", other));
     CHECK(other != v);
+}
+
+TEST(every_preludes_analog_pin_base_matches_its_device) {
+    // The prelude is the only form of the table adc.S ever sees, so the
+    // constant it hands over has to be the one the device row carries.
+    for (const AvrDevice& d : ardio::avr::device_database()) {
+        std::string prelude = device_prelude(d, 16000000);
+        long v = -1;
+        if (!symbol_value(prelude, "AD_ANALOG_PIN_BASE", v)) {
+            ::ardio_test::fail(__FILE__, __LINE__,
+                               d.name + ": AD_ANALOG_PIN_BASE is not usable");
+            continue;
+        }
+        CHECK_EQ(v, long(d.analog_pin_base));
+    }
 }
 
 TEST(the_generated_pinmap_decodes_back_to_the_same_mappings) {
