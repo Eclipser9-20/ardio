@@ -44,6 +44,19 @@ enum class Command : uint8_t {
     FlashEnd   = 0x04,
     Sync       = 0x08,
     ReadReg    = 0x0A,
+    WriteReg   = 0x09,
+
+    // RAM upload. The ESP8266 ROM loader can WRITE flash but cannot READ it,
+    // so anything that reads has to put a small stub into RAM and run it. The
+    // stub then answers ReadFlash. That is why these exist here rather than in
+    // some later feature: they are the only route to reading the part at all.
+    MemBegin   = 0x05,
+    MemEnd     = 0x06,
+    MemData    = 0x07,
+
+    // Answered by a stub, never by the ROM. Sending it to a bare ROM loader
+    // gets an invalid-command reply rather than data.
+    ReadFlash  = 0xD2,
 };
 
 inline constexpr uint8_t kDirRequest = 0x00;
@@ -94,6 +107,20 @@ std::vector<uint8_t> cmd_flash_data(const uint8_t* data, size_t len, uint32_t se
 std::vector<uint8_t> cmd_flash_end(bool reboot);
 
 std::vector<uint8_t> cmd_read_reg(uint32_t address);
+std::vector<uint8_t> cmd_write_reg(uint32_t address, uint32_t value,
+                                   uint32_t mask = 0xFFFFFFFFu, uint32_t delay = 0);
+
+// RAM upload, for placing a stub the part can run.
+std::vector<uint8_t> cmd_mem_begin(uint32_t total_size, uint32_t blocks,
+                                   uint32_t block_size, uint32_t offset);
+std::vector<uint8_t> cmd_mem_data(const uint8_t* data, size_t len, uint32_t sequence);
+// `entry` of zero means "do not jump", which is how a caller loads data into
+// RAM without transferring control to it.
+std::vector<uint8_t> cmd_mem_end(uint32_t entry);
+
+// Reads `size` bytes from flash at `offset`. Only a running stub answers this.
+std::vector<uint8_t> cmd_read_flash(uint32_t offset, uint32_t size,
+                                    uint32_t block_size, uint32_t max_in_flight);
 
 // -------------------------------------------------------------- replies ----
 

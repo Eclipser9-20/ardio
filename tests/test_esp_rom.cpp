@@ -490,3 +490,70 @@ TEST(esp_upload_rejects_an_empty_image) {
     CHECK(!result.ok);
     CHECK(result.stage == "size");
 }
+
+namespace {
+// slip_decode yields an optional; these tests build their own packets, so a
+// decode failure is a bug in the test rather than a case to handle.
+std::vector<uint8_t> decoded(const std::vector<uint8_t>& packet) {
+    auto body = esp_rom::slip_decode(packet);
+    return body ? *body : std::vector<uint8_t>{};
+}
+uint32_t le32(const std::vector<uint8_t>& b, size_t at) {
+    if (at + 3 >= b.size()) return 0;
+    return uint32_t(b[at]) | (uint32_t(b[at+1]) << 8) |
+           (uint32_t(b[at+2]) << 16) | (uint32_t(b[at+3]) << 24);
+}
+} // namespace
+
+// --- RAM upload and flash reading ---------------------------------------
+
+TEST(esp_mem_begin_lays_out_a_ram_upload) {
+    auto p = esp_rom::cmd_mem_begin(0x100, 1, 0x100, 0x40100000);
+    auto body = decoded(p);
+    CHECK_EQ(int(body[1]), 0x05);
+    CHECK_EQ(int(le32(body, 8)), 0x100);
+    CHECK_EQ(int(le32(body, 12)), 1);
+    CHECK_EQ(int(le32(body, 16)), 0x100);
+    CHECK_EQ(le32(body, 20), 0x40100000u);
+}
+
+TEST(esp_mem_data_carries_the_same_checksum_as_flash_data) {
+    const uint8_t payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
+    auto p = esp_rom::cmd_mem_data(payload, sizeof payload, 0);
+    auto body = decoded(p);
+    CHECK_EQ(int(body[1]), 0x07);
+    // The ROM verifies this, so a block corrupted in transit is refused rather
+    // than run as code.
+    CHECK_EQ(le32(body, 4), esp_rom::checksum(payload, sizeof payload));
+}
+
+TEST(esp_mem_end_without_an_entry_point_tells_the_rom_not_to_jump) {
+    auto stay = decoded(esp_rom::cmd_mem_end(0));
+    // The flag is the inverse of "the entry point is meaningful": 1 means do
+    // not jump, which reads backwards but is what the ROM expects.
+    CHECK_EQ(int(le32(stay, 8)), 1);
+    CHECK_EQ(int(le32(stay, 12)), 0);
+
+    auto run = decoded(esp_rom::cmd_mem_end(0x4010E004));
+    CHECK_EQ(int(le32(run, 8)), 0);
+    CHECK_EQ(le32(run, 12), 0x4010E004u);
+}
+
+TEST(esp_read_flash_encodes_its_four_parameters) {
+    auto p = esp_rom::cmd_read_flash(0x1000, 0x4000, 0x400, 4);
+    auto body = decoded(p);
+    // 0xD2 is answered by a stub, never by the bare ROM loader.
+    CHECK_EQ(int(body[1]), 0xD2);
+    CHECK_EQ(int(le32(body, 8)), 0x1000);
+    CHECK_EQ(int(le32(body, 12)), 0x4000);
+    CHECK_EQ(int(le32(body, 16)), 0x400);
+    CHECK_EQ(int(le32(body, 20)), 4);
+}
+
+TEST(esp_write_reg_defaults_to_a_full_mask) {
+    auto body = decoded(esp_rom::cmd_write_reg(0x60000200, 0x1234));
+    CHECK_EQ(int(body[1]), 0x09);
+    CHECK_EQ(le32(body, 8), 0x60000200u);
+    CHECK_EQ(le32(body, 12), 0x1234u);
+    CHECK_EQ(le32(body, 16), 0xFFFFFFFFu);
+}

@@ -140,6 +140,62 @@ std::vector<uint8_t> cmd_read_reg(uint32_t address) {
     return packet(Command::ReadReg, payload);
 }
 
+std::vector<uint8_t> cmd_write_reg(uint32_t address, uint32_t value, uint32_t mask,
+                                   uint32_t delay) {
+    std::vector<uint8_t> payload;
+    put_u32_le(payload, address);
+    put_u32_le(payload, value);
+    put_u32_le(payload, mask);
+    put_u32_le(payload, delay);
+    return packet(Command::WriteReg, payload);
+}
+
+// MEM_BEGIN takes the same shape as FLASH_BEGIN: how much is coming, in how
+// many blocks of what size, and where it goes -- except the destination is a
+// RAM address rather than a flash offset.
+std::vector<uint8_t> cmd_mem_begin(uint32_t total_size, uint32_t blocks,
+                                   uint32_t block_size, uint32_t offset) {
+    std::vector<uint8_t> payload;
+    put_u32_le(payload, total_size);
+    put_u32_le(payload, blocks);
+    put_u32_le(payload, block_size);
+    put_u32_le(payload, offset);
+    return packet(Command::MemBegin, payload);
+}
+
+// Carries the same checksum as FLASH_DATA. The ROM verifies it, so a block
+// corrupted in transit is refused rather than executed, which matters rather
+// more for something about to be run as code.
+std::vector<uint8_t> cmd_mem_data(const uint8_t* data, size_t len, uint32_t sequence) {
+    std::vector<uint8_t> payload;
+    put_u32_le(payload, uint32_t(len));
+    put_u32_le(payload, sequence);
+    put_u32_le(payload, 0);
+    put_u32_le(payload, 0);
+    payload.insert(payload.end(), data, data + len);
+    return packet(Command::MemData, payload, checksum(data, len));
+}
+
+std::vector<uint8_t> cmd_mem_end(uint32_t entry) {
+    std::vector<uint8_t> payload;
+    // A zero entry point means "stay in the loader". The flag is the inverse
+    // of the entry being meaningful, which reads backwards but is what the ROM
+    // expects: 1 tells it NOT to jump.
+    put_u32_le(payload, entry == 0 ? 1u : 0u);
+    put_u32_le(payload, entry);
+    return packet(Command::MemEnd, payload);
+}
+
+std::vector<uint8_t> cmd_read_flash(uint32_t offset, uint32_t size,
+                                    uint32_t block_size, uint32_t max_in_flight) {
+    std::vector<uint8_t> payload;
+    put_u32_le(payload, offset);
+    put_u32_le(payload, size);
+    put_u32_le(payload, block_size);
+    put_u32_le(payload, max_in_flight);
+    return packet(Command::ReadFlash, payload);
+}
+
 // -------------------------------------------------------------- replies ----
 
 std::optional<Reply> parse_reply(const std::vector<uint8_t>& body) {
