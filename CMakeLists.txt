@@ -87,6 +87,7 @@ if(APPLE)
     target_sources(libardio PRIVATE
         src/platform/macos/serial_macos.cpp
         src/platform/macos/ports_macos.cpp
+        src/platform/macos/usb_serial_macos.cpp
     )
     target_link_libraries(libardio PUBLIC "-framework IOKit" "-framework CoreFoundation")
 else()

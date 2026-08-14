@@ -7,6 +7,7 @@
 #include "ardio/emu/board.h"
 #include "ardio/wifi_config.h"
 #include "ardio/platform/remote_serial.h"
+#include "ardio/platform/usb_serial.h"
 #include "ardio/emu/parts.h"
 #include "ardio/protocol/avr109.h"
 #include "ardio/protocol/esp_rom.h"
@@ -470,6 +471,38 @@ int cmd_configure(const Args& args) {
     return 0;
 }
 
+// `ardio usb` -- what is actually on the USB bus.
+//
+// This asks the USB stack directly rather than looking for /dev entries, so a
+// device with no kernel driver still appears. That makes it the honest answer
+// to "is the board there at all", which is a different question from "can the
+// system already talk to it".
+int cmd_usb() {
+    std::string error;
+    auto devices = enumerate_usb_devices(error);
+    if (!error.empty()) {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+    }
+
+    if (devices.empty()) {
+        std::printf("no USB devices found on the bus at all.\n");
+        return 1;
+    }
+
+    for (const UsbDeviceInfo& d : devices) {
+        std::printf("%04x:%04x  %-28s %s\n", d.vid, d.pid,
+                    d.product.empty() ? "(no product name)" : d.product.c_str(),
+                    d.supported ? ("ardio can drive this: " + d.chip).c_str()
+                                : "not a bridge ardio knows");
+    }
+
+    std::printf("\nbridges ardio can drive without a system driver:\n");
+    for (const KnownBridge& b : known_bridges())
+        std::printf("  %04x:%04x  %-8s %s\n", b.vid, b.pid, b.chip, b.name);
+    return 0;
+}
+
 int cmd_boards() {
     for (const Board& b : board_database())
         std::printf("%-10s %-32s flash %uKB  page %u\n", b.id.c_str(), b.name.c_str(),
@@ -774,6 +807,7 @@ void print_help() {
         "                     build and upload to a configured remote board\n"
         "  wifi list          show configured remote boards\n"
         "  ports              list serial ports\n"
+        "  usb                list raw USB devices, driver or not\n"
         "  boards             list supported boards\n"
         "  doctor             diagnose toolchains and ports\n"
         "  toolchain list     show installed and fetchable toolchains\n"
@@ -826,6 +860,7 @@ int run_command(const Args& args) {
     if (args.command == "emulate")   return cmd_emulate(args, cfg);
     if (args.command == "configure") return cmd_configure(args);
     if (args.command == "wifi")      return cmd_wifi(args, cfg);
+    if (args.command == "usb")       return cmd_usb();
 
     if (args.command == "build" || args.command == "push") {
         if (args.positional.empty()) {
