@@ -56,16 +56,54 @@ std::vector<std::string> roots_for(const Config& cfg) {
     return cfg.search_roots.empty() ? default_search_roots() : cfg.search_roots;
 }
 
-int cmd_ports() {
+int cmd_ports(const Args& args) {
     auto ports = enumerate_ports();
-    if (ports.empty()) {
-        std::printf("no serial ports found\n");
-        return 1;
-    }
     for (const PortInfo& p : ports) {
         auto boards = p.has_usb_id ? find_boards_by_usb(p.usb) : std::vector<const Board*>{};
         std::printf("%-28s %-12s %s\n", p.device.c_str(), usb_id_string(p).c_str(),
                     boards.empty() ? "(unrecognised)" : boards[0]->name.c_str());
+    }
+
+    // A bridge with no system driver has no /dev entry, so it cannot appear
+    // above however healthy it is. ardio can drive those itself, so they are
+    // listed here too -- by their USB id, since an id is the only name they
+    // have. Anything ardio cannot drive is left out: a flash drive is not a
+    // port, and listing it would be noise dressed up as diagnostics.
+    std::string error;
+    auto devices = enumerate_usb_devices(error);
+    int drivable = 0;
+    for (const UsbDeviceInfo& d : devices) {
+        if (!d.supported) {
+            // -all is for working out why a board is not showing up, so it
+            // shows everything on the bus rather than only what ardio drives.
+            if (args.show_all) {
+                char other[16];
+                std::snprintf(other, sizeof other, "%04x:%04x", d.vid, d.pid);
+                std::printf("%-28s %-12s %s (not a serial bridge)\n", other, other,
+                            d.product.empty() ? "unnamed device" : d.product.c_str());
+            }
+            continue;
+        }
+        char id[16];
+        std::snprintf(id, sizeof id, "%04x:%04x", d.vid, d.pid);
+        std::printf("%-28s %-12s %s (no system driver, ardio drives it)\n", id, id,
+                    d.product.empty() ? d.chip.c_str() : d.product.c_str());
+        ++drivable;
+    }
+
+    if (ports.empty() && drivable == 0) {
+        std::printf("no boards found.\n");
+        // Worth distinguishing "nothing is plugged in" from "something is
+        // plugged in that ardio does not recognise", because the two need
+        // completely different next steps.
+        if (devices.empty())
+            std::printf("Nothing is on the USB bus at all -- check the cable and "
+                        "that it carries data, not just power.\n");
+        else
+            std::printf("%zu USB device(s) are attached, but none is a serial "
+                        "bridge ardio knows. Run 'ardio ports -all' to see them.\n",
+                        devices.size());
+        return 1;
     }
     return 0;
 }
@@ -471,38 +509,6 @@ int cmd_configure(const Args& args) {
     return 0;
 }
 
-// `ardio usb` -- what is actually on the USB bus.
-//
-// This asks the USB stack directly rather than looking for /dev entries, so a
-// device with no kernel driver still appears. That makes it the honest answer
-// to "is the board there at all", which is a different question from "can the
-// system already talk to it".
-int cmd_usb() {
-    std::string error;
-    auto devices = enumerate_usb_devices(error);
-    if (!error.empty()) {
-        std::fprintf(stderr, "error: %s\n", error.c_str());
-        return 1;
-    }
-
-    if (devices.empty()) {
-        std::printf("no USB devices found on the bus at all.\n");
-        return 1;
-    }
-
-    for (const UsbDeviceInfo& d : devices) {
-        std::printf("%04x:%04x  %-28s %s\n", d.vid, d.pid,
-                    d.product.empty() ? "(no product name)" : d.product.c_str(),
-                    d.supported ? ("ardio can drive this: " + d.chip).c_str()
-                                : "not a bridge ardio knows");
-    }
-
-    std::printf("\nbridges ardio can drive without a system driver:\n");
-    for (const KnownBridge& b : known_bridges())
-        std::printf("  %04x:%04x  %-8s %s\n", b.vid, b.pid, b.chip, b.name);
-    return 0;
-}
-
 int cmd_boards() {
     for (const Board& b : board_database())
         std::printf("%-10s %-32s flash %uKB  page %u\n", b.id.c_str(), b.name.c_str(),
@@ -807,7 +813,6 @@ void print_help() {
         "                     build and upload to a configured remote board\n"
         "  wifi list          show configured remote boards\n"
         "  ports              list serial ports\n"
-        "  usb                list raw USB devices, driver or not\n"
         "  boards             list supported boards\n"
         "  doctor             diagnose toolchains and ports\n"
         "  toolchain list     show installed and fetchable toolchains\n"
@@ -828,6 +833,7 @@ void print_help() {
         "  -wire <kind:pin>   attach a part, e.g. -wire led:13 (repeatable)\n"
         "  -input <text>      feed this to the sketch's serial input\n"
         "  -explain           report which execution core was selected\n"
+        "  -all               with ports: show every USB device, for diagnosis\n"
         "\n"
         "configure wifi options:\n"
         "  -host <user@host>  the machine the board is wired to\n"
@@ -850,7 +856,7 @@ int run_command(const Args& args) {
         return 0;
     }
 
-    if (args.command == "ports")     return cmd_ports();
+    if (args.command == "ports")     return cmd_ports(args);
     if (args.command == "boards")    return cmd_boards();
     if (args.command == "doctor")    return cmd_doctor();
     if (args.command == "toolchain") return cmd_toolchain(args);
@@ -860,7 +866,6 @@ int run_command(const Args& args) {
     if (args.command == "emulate")   return cmd_emulate(args, cfg);
     if (args.command == "configure") return cmd_configure(args);
     if (args.command == "wifi")      return cmd_wifi(args, cfg);
-    if (args.command == "usb")       return cmd_usb();
 
     if (args.command == "build" || args.command == "push") {
         if (args.positional.empty()) {

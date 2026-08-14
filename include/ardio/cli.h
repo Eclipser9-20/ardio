@@ -35,6 +35,9 @@ struct Args {
     // be able to find out which one they got.
     bool explain = false;
 
+    // ports -all: include USB devices ardio cannot drive, for diagnosis.
+    bool show_all = false;
+
     // --- configure wifi / wifi flash ----------------------------------
     std::string host;        // "user@host", as ssh takes it
     std::string device;      // the serial device at the far end

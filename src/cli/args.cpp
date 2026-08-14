@@ -11,7 +11,7 @@ namespace {
 // "--port" are the same flag. The leading dashes carry no meaning here.
 enum class Flag { None, Port, Board, Baud, Monitor, Backup, Help, Manual,
                   For, Wire, Input, Explain,
-                  Host, Device, Ssid, GpioChip, ResetGpio, BootGpio };
+                  Host, Device, Ssid, GpioChip, ResetGpio, BootGpio, All };
 
 struct FlagSpec {
     std::string_view name;
@@ -33,6 +33,7 @@ constexpr FlagSpec kFlags[] = {
     {"wire",    Flag::Wire,    true},
     {"input",   Flag::Input,   true},
     {"explain", Flag::Explain, true},
+    {"all",     Flag::All,     true},
     // configure wifi / wifi flash options.
     {"host",       Flag::Host,      true},
     {"device",     Flag::Device,    true},
@@ -167,6 +168,9 @@ Args parse_args(int argc, char** argv) {
             break;
         case Flag::Explain:
             a.explain = true;
+            break;
+        case Flag::All:
+            a.show_all = true;
             break;
         case Flag::Host:
             if (!take_value(arg, a.host)) return a;
