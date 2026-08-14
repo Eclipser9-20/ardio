@@ -99,6 +99,11 @@ int cmd_ports(const Args& args) {
         if (devices.empty())
             std::printf("Nothing is on the USB bus at all -- check the cable and "
                         "that it carries data, not just power.\n");
+        else if (args.show_all)
+            // The devices are already listed above, so pointing at -all again
+            // would be telling the user to run what they just ran.
+            std::printf("%zu USB device(s) are attached, listed above, but none "
+                        "is a serial bridge ardio knows.\n", devices.size());
         else
             std::printf("%zu USB device(s) are attached, but none is a serial "
                         "bridge ardio knows. Run 'ardio ports -all' to see them.\n",

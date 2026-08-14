@@ -199,7 +199,117 @@ install(TARGETS ardio RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # cannot build a sketch -- it would report every runtime symbol as undefined.
 install(DIRECTORY runtime/
         DESTINATION ${CMAKE_INSTALL_DATADIR}/ardio/runtime)
-install(TARGETS libardio ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-install(TARGETS hike ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(TARGETS libardio EXPORT ardioTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(TARGETS hike EXPORT ardioTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/ardio DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY libhike/include/hike DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# --- package discovery --------------------------------------------------
+#
+# Without these, a project that installs ardio still cannot use it:
+# find_package(ardio) finds nothing, and an editor's language server has no
+# idea where <ardio/...> or <hike/...> live, so every include is underlined in
+# red even though the compiler would resolve it. Exporting targets fixes both,
+# because the same files tell CMake and any tool reading its output.
+
+include(CMakePackageConfigHelpers)
+
+install(EXPORT ardioTargets
+        FILE ardioTargets.cmake
+        NAMESPACE ardio::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ardio)
+
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/ardioConfig.cmake
+"include(\"\${CMAKE_CURRENT_LIST_DIR}/ardioTargets.cmake\")\n")
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/ardioConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+
+install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/ardioConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/ardioConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ardio)
+
+# libhike is usable on its own, so it gets its own package name too. A project
+# that only wants a terminal UI should not have to find_package(ardio).
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/hikeConfig.cmake
+"include(\"\${CMAKE_CURRENT_LIST_DIR}/../ardio/ardioTargets.cmake\")\n")
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/hikeConfig.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hike)
+
+# pkg-config, for build systems that are not CMake.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/ardio.pc
+"prefix=${CMAKE_INSTALL_PREFIX}\n"
+"includedir=\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}\n"
+"libdir=\${prefix}/${CMAKE_INSTALL_LIBDIR}\n"
+"\n"
+"Name: ardio\n"
+"Description: Build, flash, monitor and emulate Arduino boards\n"
+"Version: ${PROJECT_VERSION}\n"
+"Cflags: -I\${includedir}\n"
+"Libs: -L\${libdir} -lardio -lhike\n")
+
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/hike.pc
+"prefix=${CMAKE_INSTALL_PREFIX}\n"
+"includedir=\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}\n"
+"libdir=\${prefix}/${CMAKE_INSTALL_LIBDIR}\n"
+"\n"
+"Name: hike\n"
+"Description: Cross-platform terminal user interface library\n"
+"Version: ${PROJECT_VERSION}\n"
+"Cflags: -I\${includedir}\n"
+"Libs: -L\${libdir} -lhike\n")
+
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ardio.pc
+              ${CMAKE_CURRENT_BINARY_DIR}/hike.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# --- editor discovery ---------------------------------------------------
+#
+# clangd resolves includes from the compiler's flags, so a file that is not
+# part of a project with a compile_commands.json gets no include path at all
+# and every <ardio/...> or <hike/...> line is underlined even though the
+# compiler would find it. Adding the install prefix to the global config fixes
+# that everywhere at once.
+#
+# This edits a file outside the install prefix, which an install should
+# normally never do, so it is written to be safe about it: it only ever
+# appends, it does nothing if the path is already present, and it leaves any
+# existing configuration untouched.
+install(CODE "
+    set(clangd_dir \"\$ENV{HOME}/.config/clangd\")
+    set(clangd_config \"\${clangd_dir}/config.yaml\")
+    set(include_flag \"-I${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_INCLUDEDIR}\")
+
+    set(existing \"\")
+    if(EXISTS \"\${clangd_config}\")
+        file(READ \"\${clangd_config}\" existing)
+    endif()
+
+    if(existing MATCHES \"\${include_flag}\")
+        message(STATUS \"clangd already knows \${include_flag}\")
+    elseif(existing STREQUAL \"\")
+        file(MAKE_DIRECTORY \"\${clangd_dir}\")
+        file(WRITE \"\${clangd_config}\"
+\"CompileFlags:
+  Add:
+    # ardio and libhike install their headers here.
+    - \${include_flag}
+\")
+        message(STATUS \"Wrote \${clangd_config}\")
+    elseif(existing MATCHES \"CompileFlags:\" AND existing MATCHES \"Add:\")
+        string(REGEX REPLACE \"(Add:[ \\t]*\\n)\"
+               \"\\\\1    # ardio and libhike install their headers here.\\n    - \${include_flag}\\n\"
+               patched \"\${existing}\")
+        file(WRITE \"\${clangd_config}\" \"\${patched}\")
+        message(STATUS \"Added \${include_flag} to \${clangd_config}\")
+    else()
+        # A config exists but is not in a shape we can safely edit, so say what
+        # to add rather than rewriting someone's file badly.
+        message(WARNING
+            \"Could not update \${clangd_config} automatically. \"
+            \"Add this under CompileFlags/Add:  \${include_flag}\")
+    endif()
+")
