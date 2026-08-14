@@ -249,7 +249,7 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/ardio.pc
 "Description: Build, flash, monitor and emulate Arduino boards\n"
 "Version: ${PROJECT_VERSION}\n"
 "Cflags: -I\${includedir}\n"
-"Libs: -L\${libdir} -lardio -lhike\n")
+"Libs: -L\${libdir} -lardio -lhike -framework IOKit -framework CoreFoundation\n")
 
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/hike.pc
 "prefix=${CMAKE_INSTALL_PREFIX}\n"
