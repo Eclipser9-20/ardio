@@ -18,6 +18,33 @@ add_compile_options(-Wall -Wextra -Werror)
 # but -Werror would make it fatal.
 add_compile_options(-Wno-unused-command-line-argument)
 
+# ------------------------------------------------------------------ libhike ---
+#
+# A library in its own right, not an internal detail of ardio. It is useful to
+# anything that wants a terminal UI, so it is built and installed separately
+# and ardio simply links it -- which also keeps the dependency one-way and
+# stops ardio's types leaking into it.
+
+add_library(hike STATIC
+    libhike/src/hike_buffer.c
+    libhike/src/hike_term.c
+    libhike/src/hike_input.c
+    libhike/src/hike_unicode.c
+    libhike/src/hike_widgets.c
+    libhike/src/hike_cpp.cpp
+)
+
+set_source_files_properties(
+    libhike/src/hike_buffer.c libhike/src/hike_term.c libhike/src/hike_input.c
+    libhike/src/hike_unicode.c libhike/src/hike_widgets.c
+    PROPERTIES LANGUAGE C)
+
+target_include_directories(hike PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libhike/include>
+    $<INSTALL_INTERFACE:include>
+)
+set_target_properties(hike PROPERTIES OUTPUT_NAME hike)
+
 # ---------------------------------------------------------------- libardio ---
 
 add_library(libardio STATIC
@@ -43,12 +70,6 @@ add_library(libardio STATIC
     src/emu/core_select.cpp
     src/emu/board.cpp
     src/emu/parts.cpp
-    libhike/src/hike_buffer.c
-    libhike/src/hike_term.c
-    libhike/src/hike_input.c
-    libhike/src/hike_unicode.c
-    libhike/src/hike_widgets.c
-    libhike/src/hike_cpp.cpp
     src/tui/emulate_view.cpp
     src/tui/emulate_app.cpp
     src/emu/peripherals.cpp
@@ -74,12 +95,7 @@ target_include_directories(libardio PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-# libhike's core is C, deliberately: the C API is the whole library and the C++
-# layer wraps exactly it, so a C caller is never a second-class one.
-set_source_files_properties(
-    libhike/src/hike_buffer.c libhike/src/hike_term.c libhike/src/hike_input.c
-    libhike/src/hike_unicode.c libhike/src/hike_widgets.c
-    PROPERTIES LANGUAGE C)
+
 
 # Platform layer. macOS is implemented; other platforms build against a stub
 # that reports the limitation rather than failing to link.
@@ -90,6 +106,11 @@ if(APPLE)
         src/platform/macos/usb_serial_macos.cpp
     )
     target_link_libraries(libardio PUBLIC "-framework IOKit" "-framework CoreFoundation")
+endif()
+
+target_link_libraries(libardio PUBLIC hike)
+
+if(APPLE)
 else()
     message(WARNING
         "ardio's platform layer is implemented for macOS only so far. "
@@ -172,5 +193,13 @@ add_test(NAME unit COMMAND ardio_tests)
 
 include(GNUInstallDirs)
 install(TARGETS ardio RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# The AVR runtime has to ship too. find_runtime_dir looks here once ardio is
+# installed, and without it an installed ardio can flash and emulate but
+# cannot build a sketch -- it would report every runtime symbol as undefined.
+install(DIRECTORY runtime/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/ardio/runtime)
 install(TARGETS libardio ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(TARGETS hike ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/ardio DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(DIRECTORY libhike/include/hike DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
