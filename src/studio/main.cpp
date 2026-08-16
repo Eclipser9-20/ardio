@@ -236,6 +236,7 @@ int main(int, char**) {
             if (trans > 1.0f) trans = 1.0f;
         }
         bool transitioning = trans < 1.0f;
+        win.layout().exempt_count = 0;  // toolbars re-register their titlebar rects
 
         Input live{mouse_x, mouse_y, clicked, mouse_down};
         Input dead{-1e4f, -1e4f, false, false};  // offscreen, no clicks
