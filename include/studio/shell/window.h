@@ -23,11 +23,17 @@ namespace studio {
 // or resize instead of passing the click to the app. Recomputed each frame from
 // the theme and the current size and shared with the hit-test callback.
 struct ChromeLayout {
-    float titlebar_height = 30.0f;
+    float titlebar_height = 34.0f;
     float resize_margin = 6.0f;
-    // Control-dot rects (close, minimize, maximize), in window points. A point
-    // inside one of these is a normal click, not a drag, so the button works.
-    Rect close_btn, min_btn, max_btn;
+    // Window-control hit boxes, in window points. A point inside one is a normal
+    // click, not a titlebar drag, so the control works.
+    Rect close_btn, min_btn;
+    // Extra interactive regions the app places inside the titlebar (an editor
+    // toolbar's buttons, a command bar). These are exempt from dragging too, so
+    // toolbar controls can live in the same bar as the window controls. Refilled
+    // each frame by whatever draws in the titlebar.
+    Rect exempt[8];
+    int exempt_count = 0;
 };
 
 class Window {
@@ -39,10 +45,6 @@ public:
     void close();
     ~Window();
 
-    // Applies vsync and the backend hints from the theme. Safe to call again
-    // when the user changes them in settings; only vsync can change live.
-    void apply_render_settings(const Theme& theme);
-
     SDL_Renderer* renderer() const { return renderer_; }
     SDL_Window* handle() const { return window_; }
 
@@ -52,6 +54,11 @@ public:
 
     bool focused() const { return focused_; }
     void set_focused(bool f) { focused_ = f; }
+
+    // Device pixels per point (2.0 on a Retina display). The UI is laid out and
+    // drawn in points -- the renderer scales to pixels -- but text is rasterized
+    // at point*dpr so glyphs land on the physical pixel grid and stay crisp.
+    float dpr() const { return dpr_; }
 
     // The layout the hit-test reads. The chrome updates it each frame; the
     // window installed a callback pointing here at open().
@@ -64,6 +71,7 @@ private:
     SDL_Renderer* renderer_ = nullptr;
     ChromeLayout layout_;
     bool focused_ = true;
+    float dpr_ = 1.0f;
     std::string error_;
 };
 

@@ -48,12 +48,26 @@ public:
     // so passing a huge radius yields a stadium/■circle rather than artifacts.
     void fill_rounded(Rect box, float radius, Color c);
 
+    // Filled rounded rectangle with a vertical gradient from `top` to `bottom`.
+    // Per-vertex color on the GPU, so it costs the same as a flat fill.
+    void fill_rounded_gradient(Rect box, float radius, Color top, Color bottom);
+
+    // A soft drop shadow for `box`: several expanding, fading rounded rects that
+    // approximate a blur. `spread` is how far it bleeds; `c` its darkest color.
+    // Draw it before the panel it sits under.
+    void shadow(Rect box, float radius, float spread, Color c);
+
     // Stroked rounded rectangle, `width` pixels thick, drawn inward from the
     // edge so the stroke stays within `box`. This is the window outline.
     void stroke_rounded(Rect box, float radius, float width, Color c);
 
     // A single straight line. Thin; for thick lines use a filled rect.
     void line(float x0, float y0, float x1, float y1, Color c);
+
+    // Constrain drawing to `r` (in points) until clear_clip(). Used to reveal a
+    // panel by an animating height. One clip at a time -- no nesting.
+    void set_clip(Rect r);
+    void clear_clip();
 
     // Debug text via SDL's built-in 8x8 font. A placeholder until libtruetype
     // arrives -- fixed size, ASCII only, but enough to label C1's window and

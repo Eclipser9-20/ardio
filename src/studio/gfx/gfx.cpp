@@ -17,6 +17,10 @@ SDL_FColor fcolor(Color c) {
 // (8-12px radii) without spending vertices no one can see.
 constexpr int kArcSegments = 6;
 
+// M_PI is not standard C++ and mingw omits it, so define what we need.
+constexpr float kPi = 3.14159265358979323846f;
+constexpr float kHalfPi = kPi * 0.5f;
+
 // Append the points of a rounded-rect perimeter, walking clockwise from the
 // top-left corner's start. Shared by fill (fan) and stroke (two offset rings),
 // so a filled panel and its outline trace the exact same path and cannot drift.
@@ -30,12 +34,11 @@ void rounded_perimeter(Rect b, float radius, std::vector<SDL_FPoint>& out) {
     const float cx[4] = {b.x + rad, b.right() - rad, b.right() - rad, b.x + rad};
     const float cy[4] = {b.y + rad, b.y + rad, b.bottom() - rad, b.bottom() - rad};
     // Start angle of each corner arc, in radians (screen space, y down).
-    const float start[4] = {static_cast<float>(M_PI), -static_cast<float>(M_PI_2), 0.0f,
-                            static_cast<float>(M_PI_2)};
+    const float start[4] = {kPi, -kHalfPi, 0.0f, kHalfPi};
 
     for (int corner = 0; corner < 4; ++corner) {
         for (int s = 0; s <= kArcSegments; ++s) {
-            float t = start[corner] + (static_cast<float>(M_PI_2) * s) / kArcSegments;
+            float t = start[corner] + (kHalfPi * s) / kArcSegments;
             out.push_back(SDL_FPoint{cx[corner] + std::cos(t) * rad, cy[corner] + std::sin(t) * rad});
         }
     }
@@ -88,6 +91,57 @@ void Gfx::fill_rounded(Rect box, float radius, Color c) {
     SDL_SetRenderDrawBlendMode(r_, SDL_BLENDMODE_BLEND);
     SDL_RenderGeometry(r_, nullptr, verts.data(), static_cast<int>(verts.size()), idx.data(),
                        static_cast<int>(idx.size()));
+}
+
+void Gfx::fill_rounded_gradient(Rect box, float radius, Color top, Color bottom) {
+    std::vector<SDL_FPoint> ring;
+    rounded_perimeter(box, radius, ring);
+    if (ring.size() < 3) return;
+
+    // Color a vertex by its vertical position within the box.
+    auto at = [&](float y) {
+        float t = box.h > 0 ? (y - box.y) / box.h : 0.0f;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        return fcolor(top.mix(bottom, t));
+    };
+
+    std::vector<SDL_Vertex> verts;
+    verts.reserve(ring.size() + 1);
+    SDL_Vertex center{};
+    center.position = SDL_FPoint{box.x + box.w * 0.5f, box.y + box.h * 0.5f};
+    center.color = at(center.position.y);
+    verts.push_back(center);
+    for (const auto& p : ring) {
+        SDL_Vertex v{};
+        v.position = p;
+        v.color = at(p.y);
+        verts.push_back(v);
+    }
+
+    std::vector<int> idx;
+    idx.reserve(ring.size() * 3);
+    const int n = static_cast<int>(ring.size());
+    for (int i = 0; i < n; ++i) {
+        idx.push_back(0);
+        idx.push_back(1 + i);
+        idx.push_back(1 + (i + 1) % n);
+    }
+    SDL_SetRenderDrawBlendMode(r_, SDL_BLENDMODE_BLEND);
+    SDL_RenderGeometry(r_, nullptr, verts.data(), static_cast<int>(verts.size()), idx.data(),
+                       static_cast<int>(idx.size()));
+}
+
+void Gfx::shadow(Rect box, float radius, float spread, Color c) {
+    // Stack a handful of expanding rounded rects, each fainter than the last,
+    // nudged down a touch so the shadow reads as cast from above. Cheap, and
+    // convincing at the small blur radii the UI uses.
+    const int layers = 6;
+    for (int i = layers; i >= 1; --i) {
+        float e = spread * i / layers;
+        float a = (c.a / 255.0f) * (1.0f - static_cast<float>(i) / (layers + 1)) * 0.6f;
+        Rect r{box.x - e, box.y - e + 2.0f, box.w + 2 * e, box.h + 2 * e};
+        fill_rounded(r, radius + e, c.with_alpha(a));
+    }
 }
 
 void Gfx::stroke_rounded(Rect box, float radius, float width, Color c) {
@@ -156,6 +210,16 @@ float Gfx::debug_text_width(std::string_view s, float scale) {
     // SDL's debug font is a fixed 8px cell per glyph.
     return static_cast<float>(s.size()) * 8.0f * scale;
 }
+
+void Gfx::set_clip(Rect r) {
+    // Coordinates are in points; the active render scale maps them to pixels,
+    // the same as every draw call, so the clip lines up with what we draw.
+    SDL_Rect c{static_cast<int>(r.x), static_cast<int>(r.y), static_cast<int>(r.w),
+               static_cast<int>(r.h)};
+    SDL_SetRenderClipRect(r_, &c);
+}
+
+void Gfx::clear_clip() { SDL_SetRenderClipRect(r_, nullptr); }
 
 void Gfx::output_size(int* w, int* h) const { SDL_GetCurrentRenderOutputSize(r_, w, h); }
 

@@ -45,6 +45,39 @@ target_include_directories(hike PUBLIC
 )
 set_target_properties(hike PROPERTIES OUTPUT_NAME hike)
 
+# -------------------------------------------------------------- libtruetype ---
+#
+# A dependency-free TrueType rasterizer, a library in its own right like libhike:
+# it turns a font file into glyph coverage bitmaps and knows nothing about SDL,
+# atlases, or Ardio Studio. Studio links it; anything else may too.
+
+add_library(truetype STATIC libtruetype/src/truetype.cpp)
+target_include_directories(truetype PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/libtruetype/include>
+    $<INSTALL_INTERFACE:include>
+)
+set_target_properties(truetype PROPERTIES OUTPUT_NAME truetype)
+
+# Its self-test loads a real font from the repo's fonts/ dir and rasterizes a
+# few glyphs. Kept separate from ardio_tests so the library tests on its own.
+add_executable(truetype_tests libtruetype/tests/test_truetype.cpp)
+target_link_libraries(truetype_tests PRIVATE truetype)
+target_compile_definitions(truetype_tests PRIVATE
+    TTF_TEST_FONT="${CMAKE_CURRENT_SOURCE_DIR}/fonts/JetBrainsMonoNerdFontMono-Regular.ttf")
+add_test(NAME truetype COMMAND truetype_tests)
+
+# ---------------------------------------------------- studio project backend ---
+#
+# The .ardioproj model is pure std (filesystem, no SDL), so its test builds and
+# runs on its own, independent of whether the GUI is enabled.
+
+add_executable(project_tests
+    src/studio/backend/test_project.cpp
+    src/studio/backend/project.cpp)
+target_include_directories(project_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(project_tests PRIVATE PROJECT_TEST_TMP="${CMAKE_BINARY_DIR}")
+add_test(NAME project COMMAND project_tests)
+
 # ---------------------------------------------------------------- libardio ---
 
 add_library(libardio STATIC
@@ -123,6 +156,54 @@ endif()
 
 add_executable(ardio src/cli/main.cpp)
 target_link_libraries(ardio PRIVATE libardio)
+
+# ------------------------------------------------------------ ardio-studio ---
+#
+# The GUI application: a separate binary that consumes libardio, never the other
+# way round. libardio compiles, flashes and emulates; Studio is one of its
+# clients, like the CLI. SDL3 is the one external dependency and it is optional
+# -- without it the core tool still builds, only the GUI is skipped.
+
+find_package(SDL3 QUIET CONFIG)
+if(SDL3_FOUND)
+    add_executable(ardio-studio
+        src/studio/main.cpp
+        src/studio/gfx/gfx.cpp
+        src/studio/shell/window.cpp
+        src/studio/shell/chrome.cpp
+        src/studio/fonts/font.cpp
+        src/studio/ui/ui.cpp
+        src/studio/menu/main_menu.cpp
+        src/studio/menu/file_browser.cpp
+        src/studio/theming/settings_view.cpp
+        src/studio/backend/jobs.cpp
+        src/studio/backend/project.cpp
+        src/studio/editor/buffer.cpp
+        src/studio/editor/editor.cpp
+        src/studio/editor/highlight.cpp
+        src/studio/editor/file_tree.cpp
+    )
+    target_include_directories(ardio-studio PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    # The GUI is drawn on demand, but the geometry, layout and glyph
+    # rasterization still want to be fast, so it is optimized regardless of the
+    # configured build type.
+    target_compile_options(ardio-studio PRIVATE -O3)
+    # Where the bundled fonts live in a dev tree; the installed app also looks
+    # next to itself (see the font locator).
+    target_compile_definitions(ardio-studio PRIVATE
+        ARDIO_FONTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fonts")
+    target_link_libraries(ardio-studio PRIVATE libardio truetype SDL3::SDL3)
+
+    # Ship the fonts alongside the binary so an installed Studio finds them.
+    include(GNUInstallDirs)
+    install(TARGETS ardio-studio RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(DIRECTORY fonts/ DESTINATION ${CMAKE_INSTALL_DATADIR}/ardio/fonts)
+    message(STATUS "ardio-studio: SDL3 found, GUI target enabled")
+else()
+    message(STATUS "ardio-studio: SDL3 not found, skipping GUI target "
+                   "(install SDL3 to build it)")
+endif()
 
 # ------------------------------------------------------------------- tests ---
 

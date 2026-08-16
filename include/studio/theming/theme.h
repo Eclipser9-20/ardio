@@ -20,32 +20,42 @@ namespace studio {
 // The named palette. Widgets refer to roles (accent, danger, surface) rather
 // than literal colors, so retheming is a matter of repainting these eight
 // fields and everything downstream follows.
+// VS Code "Dark Modern" palette, a notch darker overall: flat slate, muted, no
+// neon. Accent is used sparingly (buttons, active selection), never as a glow.
 struct Palette {
-    Color bg      = Color::hex(0x1a1b26);  // window base
-    Color surface = Color::hex(0x16161e);  // a panel sitting on the base
-    Color fg      = Color::hex(0xc0caf5);  // primary text
-    Color muted   = Color::hex(0x565f89);  // secondary text, disabled
-    Color accent  = Color::hex(0x7aa2f7);  // primary accent (the blue border)
-    Color accent2 = Color::hex(0xbb9af7);  // secondary accent (purple)
-    Color focus   = Color::hex(0x7dcfff);  // the bright cyan a focused edge takes
-    Color good    = Color::hex(0x9ece6a);  // running, success
-    Color warn    = Color::hex(0xe0af68);  // paused, caution
-    Color danger  = Color::hex(0xf7768e);  // error, stop
+    Color bg      = Color::hex(0x141414);  // editor background (darker)
+    Color bg2     = Color::hex(0x141414);  // flat -- no gradient
+    Color surface = Color::hex(0x1a1a1a);  // side panels, cards, lists
+    Color raised  = Color::hex(0x242424);  // hovered list row / card
+    Color border   = Color::hex(0x2b2b2b);  // panel dividers, window edge
+    Color border_focus = Color::hex(0x3a3a3a);  // window edge when focused
+    Color fg      = Color::hex(0xcccccc);  // primary text
+    Color muted   = Color::hex(0x7d7d7d);  // secondary text, disabled
+    Color accent  = Color::hex(0x0e639c);  // primary accent (button blue)
+    Color accent2 = Color::hex(0x0078d4);  // active/focus accent (brighter blue)
+    Color selection = Color::hex(0x04395e); // active list selection
+    Color good    = Color::hex(0x89d185);  // running, success
+    Color warn    = Color::hex(0xcca700);  // paused, caution
+    Color danger  = Color::hex(0xf14c4c);  // error, stop
+    Color shadow  = Color::hex(0x000000);  // drop-shadow base color
 };
 
 // The window frame and titlebar, straight from the look Splinner established:
 // a rounded outline that brightens on focus, and an opaque titlebar strip that
-// stands in for the system one so no platform's native controls ever show.
+// stands in for the system one. The window controls are our own -- subtle
+// monochrome glyphs on the right, not colored dots; this is an IDE, not a
+// browser toy, and nothing here is meant to read as a system traffic light.
 struct Chrome {
     float corner_radius   = 10.0f;  // the window's rounded corners
-    float border_width    = 2.0f;   // outline stroke, unfocused
-    float border_focused  = 3.0f;   // outline stroke, focused
-    float border_alpha    = 0.55f;  // outline opacity, unfocused
-    float border_focused_alpha = 0.95f;
-    float titlebar_height = 30.0f;
-    float titlebar_alpha  = 0.97f;  // strip is nearly opaque, a touch of depth
+    float border_width    = 1.5f;   // outline stroke, unfocused
+    float border_focused  = 2.0f;   // outline stroke, focused
+    float border_alpha    = 0.45f;  // outline opacity, unfocused
+    float border_focused_alpha = 0.90f;
+    float titlebar_height = 34.0f;
+    float titlebar_alpha  = 1.0f;   // strip is fully opaque; it is the chrome
     float titlebar_radius = 8.0f;   // top corners of the strip only
-    float control_size    = 12.0f;  // diameter of a window-control dot
+    float control_box     = 34.0f;  // hit box of a window control (square)
+    float control_glyph   = 10.0f;  // drawn size of the — / ✕ inside it
 
     // Custom slate chrome, or defer to the OS window frame. A user who prefers
     // their platform's real titlebar flips this and the borderless path and all
@@ -59,9 +69,9 @@ struct Chrome {
 struct Fonts {
     std::string ui_family   = "JetBrainsMono Nerd Font";
     std::string mono_family = "JetBrainsMono Nerd Font Mono";
-    float ui_size    = 13.0f;
-    float title_size = 12.0f;
-    float mono_size  = 13.0f;
+    float ui_size    = 16.0f;
+    float title_size = 15.0f;
+    float mono_size  = 15.0f;
 };
 
 // How the emulated board is drawn. Two rendering styles, switchable at runtime,
@@ -76,13 +86,25 @@ struct BoardView {
     float led_glow = 1.0f;  // 0 disables the bloom on lit LEDs, 1 is full
 };
 
-// Frame pacing. Uncapped-but-vsynced is the default; a user chasing 120+ turns
-// vsync off and sets a cap, or leaves it at 0 for truly uncapped.
+// Syntax-highlight colors for the editor, VS Code Dark+ by default. Like the
+// rest of the theme these are data, so a user can retint code to taste.
+struct Syntax {
+    Color deflt    = Color::hex(0xcccccc);  // plain text
+    Color keyword  = Color::hex(0x569cd6);  // const, class, static...
+    Color control  = Color::hex(0xc586c0);  // if, for, return...
+    Color type     = Color::hex(0x4ec9b0);  // int, void, uint8_t...
+    Color str       = Color::hex(0xce9178);  // "strings"
+    Color number   = Color::hex(0xb5cea8);  // 42, 0xFF, HIGH
+    Color comment  = Color::hex(0x6a9955);  // // and /* */
+    Color preproc  = Color::hex(0xc586c0);  // #include, #define
+    Color function = Color::hex(0xdcdcaa);  // name(
+};
+
+// The renderer's one real knob: which GPU backend to ask SDL for. This is not a
+// performance dial the user fiddles with -- the app draws only when something
+// changes and is idle otherwise -- it just names the platform API. Empty lets
+// SDL pick (Metal on macOS, D3D12/Vulkan on Windows/Linux).
 struct Render {
-    bool vsync = true;
-    int  fps_cap = 0;       // 0 = uncapped (only meaningful with vsync off)
-    // Preferred GPU backend by name ("metal", "direct3d12", "vulkan", "gpu"),
-    // or empty to let SDL choose. Honored at window creation.
     std::string backend = "";
 };
 
@@ -92,6 +114,7 @@ struct Theme {
     Fonts     fonts;
     BoardView board;
     Render    render;
+    Syntax    syntax;
 
     // The built-in default (TokyoNight Night). Equivalent to a default-
     // constructed Theme; named so intent reads clearly at call sites and so a

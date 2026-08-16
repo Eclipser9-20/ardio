@@ -28,10 +28,12 @@ SDL_HitTestResult SDLCALL hit_test(SDL_Window* w, const SDL_Point* pt, void* dat
 
     if (pt->y < L->titlebar_height) {
         const float x = static_cast<float>(pt->x), y = static_cast<float>(pt->y);
-        // The control dots stay clickable; everything else on the bar drags.
-        if (L->close_btn.contains(x, y) || L->min_btn.contains(x, y) ||
-            L->max_btn.contains(x, y))
+        // The controls and any registered toolbar regions stay clickable;
+        // everything else on the bar drags the window.
+        if (L->close_btn.contains(x, y) || L->min_btn.contains(x, y))
             return SDL_HITTEST_NORMAL;
+        for (int i = 0; i < L->exempt_count; ++i)
+            if (L->exempt[i].contains(x, y)) return SDL_HITTEST_NORMAL;
         return SDL_HITTEST_DRAGGABLE;
     }
     return SDL_HITTEST_NORMAL;
@@ -45,8 +47,12 @@ bool Window::open(const std::string& title, int w, int h, const Theme& theme) {
         return false;
     }
 
-    Uint32 flags = SDL_WINDOW_RESIZABLE;
-    if (theme.chrome.custom_chrome) flags |= SDL_WINDOW_BORDERLESS;
+    Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    // Borderless AND transparent: the window is a rectangle, but with a
+    // transparent surface we paint the slate body as a rounded rect and leave
+    // the corners genuinely cut, so the rounding is the window's shape rather
+    // than a rounded stroke sitting inside square corners.
+    if (theme.chrome.custom_chrome) flags |= SDL_WINDOW_BORDERLESS | SDL_WINDOW_TRANSPARENT;
 
     window_ = SDL_CreateWindow(title.c_str(), w, h, flags);
     if (!window_) {
@@ -64,16 +70,26 @@ bool Window::open(const std::string& title, int w, int h, const Theme& theme) {
         return false;
     }
 
+    // Real vsync, always on: presents sync to the display's actual refresh (120
+    // here), which is the correct pacing for the rare frames we draw. It is not
+    // a framerate cap and there is no toggle -- the app is event-driven and
+    // idle otherwise, so vsync only ever bounds a burst of redraws during a
+    // drag or an animation.
+    SDL_SetRenderVSync(renderer_, 1);
+
+    // High-DPI: the backbuffer is at the display's real pixel density. We draw
+    // in points and let a global render scale map to pixels, so shapes are
+    // rendered at native resolution (crisp) and mouse/hit-test math stays in
+    // one coordinate space. Text additionally rasterizes at point*dpr.
+    dpr_ = SDL_GetWindowPixelDensity(window_);
+    if (dpr_ <= 0) dpr_ = 1.0f;
+    SDL_SetRenderScale(renderer_, dpr_, dpr_);
+
     layout_.titlebar_height = theme.chrome.titlebar_height;
     if (theme.chrome.custom_chrome)
         SDL_SetWindowHitTest(window_, hit_test, &layout_);
 
-    apply_render_settings(theme);
     return true;
-}
-
-void Window::apply_render_settings(const Theme& theme) {
-    if (renderer_) SDL_SetRenderVSync(renderer_, theme.render.vsync ? 1 : SDL_RENDERER_VSYNC_DISABLED);
 }
 
 void Window::size_points(int* w, int* h) const { SDL_GetWindowSize(window_, w, h); }
