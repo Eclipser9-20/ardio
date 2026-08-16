@@ -1,7 +1,7 @@
 # ardio
 
 A command-line tool for building, flashing, monitoring, and (eventually) emulating
-Arduino boards.
+Arduino boards. Well a bit more than JUST a command line tool.
 
 `ardio` implements the bootloader protocols itself. Nothing goes over the serial wire
 that `ardio` did not construct — there is no `arduino-cli`, `avrdude`, `esptool`, or
