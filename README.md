@@ -22,7 +22,7 @@ See [Roadmap](#roadmap).
 ## Install
 
 ```sh
-git clone <this-repo> && cd ardio
+git clone https://raw.githubusercontent.com/Eclipser9-20/ardio/phase1-uploader/install.sh && cd ardio
 ./install.sh
 ```
 
